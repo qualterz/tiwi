@@ -1,0 +1,19 @@
+{
+  "name": "tiwi",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "typecheck": "bun check"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^7"
+  },
+  "dependencies": {
+    "mqtt": "^5.16.1",
+    "werift": "^0.27.0"
+  }
+}
