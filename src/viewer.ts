@@ -17,6 +17,10 @@ const fromBase64Url = (str: string) => {
 
 window.onhashchange = () => location.reload();
 
+videoEl.onerror = () => {
+  console.error("[Video] Playback error:", videoEl.error);
+};
+
 const token = location.hash.slice(1);
 
 if (token) {
@@ -50,6 +54,8 @@ if (token) {
 
   // 2. Setup RTCPeerConnection & bind tracks to HTML5 <video>
   const viewerId = crypto.randomUUID();
+  console.info("[Init] Stream:", { streamId, viewerId });
+
   const pc = new RTCPeerConnection({
     iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
   });
@@ -57,15 +63,48 @@ if (token) {
   videoEl.srcObject = mediaStream;
 
   pc.ontrack = (e) => {
+    console.info("[WebRTC] Track received:", e.track.kind);
     mediaStream.addTrack(e.track);
-    videoEl.play().catch(() => {});
+    videoEl
+      .play()
+      .catch((err) => console.warn("[Video] Autoplay blocked:", err));
   };
 
-  pc.onconnectionstatechange = () => {
+  pc.onicecandidate = (e) => {
+    if (e.candidate) {
+      console.debug("[ICE] Candidate:", e.candidate.candidate);
+    } else {
+      console.info("[ICE] Gathering complete");
+    }
+  };
+
+  pc.onicecandidateerror = (e) => {
+    const err = e as RTCPeerConnectionIceErrorEvent;
+    console.warn(
+      "[ICE] Candidate error:",
+      err.url,
+      err.errorCode,
+      err.errorText,
+    );
+  };
+
+  pc.oniceconnectionstatechange = () => {
+    console.info("[ICE] State:", pc.iceConnectionState);
+  };
+
+  pc.onconnectionstatechange = async () => {
+    const state = pc.connectionState;
+    console.info("[WebRTC] Connection state:", state);
     statusEl.textContent =
-      pc.connectionState === "connected"
+      state === "connected"
         ? "Live • Connected (Click unmute on player for audio)"
-        : `Connection: ${pc.connectionState}`;
+        : `Connection: ${state}`;
+
+    if (state === "failed" || state === "disconnected" || state === "closed") {
+      console.error("[WebRTC] Connection lost/failed. Stats:", [
+        ...(await pc.getStats()).values(),
+      ]);
+    }
   };
 
   pc.addTransceiver("video", { direction: "recvonly" });
@@ -74,12 +113,8 @@ if (token) {
 
   if (pc.iceGatheringState !== "complete") {
     await new Promise<void>((resolve) => {
-      const timeout = setTimeout(resolve, 1500);
       pc.onicegatheringstatechange = () => {
-        if (pc.iceGatheringState === "complete") {
-          clearTimeout(timeout);
-          resolve();
-        }
+        if (pc.iceGatheringState === "complete") resolve();
       };
     });
   }
@@ -88,9 +123,14 @@ if (token) {
   const client = mqtt.connect("wss://broker.emqx.io:8084/mqtt");
   const answerTopic = `stream/${streamId}/answer/${viewerId}`;
 
+  client.on("error", (err) => console.error("[MQTT] Error:", err));
+
   client.on("connect", async () => {
+    console.info("[MQTT] Connected, publishing offer...");
     statusEl.textContent = `Connecting to stream ${streamId.slice(0, 8)}...`;
-    client.subscribe(answerTopic);
+    client.subscribe(answerTopic, (err) => {
+      if (err) console.error("[MQTT] Subscribe failed:", err);
+    });
 
     const iv = crypto.getRandomValues(new Uint8Array(12));
     const cipher = await crypto.subtle.encrypt(
@@ -112,18 +152,26 @@ if (token) {
   });
 
   client.on("message", async (_topic, payload) => {
-    const { iv, data } = JSON.parse(payload.toString());
-    const decrypted = await crypto.subtle.decrypt(
-      { name: "AES-GCM", iv: fromBase64Url(iv) },
-      aesKey,
-      fromBase64Url(data),
-    );
-    const { sdp: answerSdp } = JSON.parse(new TextDecoder().decode(decrypted));
+    try {
+      const { iv, data } = JSON.parse(payload.toString());
+      const decrypted = await crypto.subtle.decrypt(
+        { name: "AES-GCM", iv: fromBase64Url(iv) },
+        aesKey,
+        fromBase64Url(data),
+      );
+      const { sdp: answerSdp } = JSON.parse(
+        new TextDecoder().decode(decrypted),
+      );
 
-    await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
-    client.end();
+      console.info("[MQTT] Answer received, setting remote description");
+      await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
+      client.end();
+    } catch (err) {
+      console.error("[MQTT] Failed to process answer:", err);
+    }
   });
 } else {
+  console.warn("[Init] Missing #<token> in URL hash");
   statusEl.textContent =
     "Invalid link: restart Bun and open the #<token> URL it prints.";
 }

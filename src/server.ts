@@ -123,7 +123,7 @@ Bun.serve({
               if (matched) {
                 activeVideoCodec = matched;
                 sharedVideoTrack.codec = matched;
-                console.log(
+                console.info(
                   `[OBS] Dynamically resolved video codec: ${matched.mimeType} (PT=${matched.payloadType})`,
                 );
               }
@@ -152,7 +152,7 @@ Bun.serve({
       if (videoTransceiver?.codecs[0]) {
         activeVideoCodec = videoTransceiver.codecs[0];
         sharedVideoTrack.codec = activeVideoCodec;
-        console.log(
+        console.info(
           `[OBS] Connected via WHIP (${activeVideoCodec.mimeType})! Streaming live...`,
         );
       }
@@ -170,9 +170,9 @@ Bun.serve({
   },
 });
 
-console.log("OBS WHIP Server: http://127.0.0.1:8080/whip");
-console.log(`Stream Public ID (HMAC): ${streamId}`);
-console.log(
+console.info("OBS WHIP Server: http://127.0.0.1:8080/whip");
+console.info(`Stream Public ID (HMAC): ${streamId}`);
+console.info(
   `\nShare this 1-click private link with peers:\nhttp://localhost:3000/#${token}\n`,
 );
 
@@ -181,14 +181,24 @@ const client = mqtt.connect("wss://broker.emqx.io:8084/mqtt");
 const offerTopic = `stream/${streamId}/offer`;
 
 client.on("connect", () => {
-  client.subscribe(offerTopic);
-  console.log("[MQTT] Connected and listening for peers...");
+  client.subscribe(offerTopic, (err) => {
+    if (err) console.error("[MQTT] Subscribe error:", err);
+  });
+  console.info("[MQTT] Connected and listening for peers...");
 });
+
+client.on("error", (err) => console.error("[MQTT] Error:", err));
 
 client.on("message", async (_topic, rawPayload) => {
   try {
     const { viewerId, iv, data } = JSON.parse(rawPayload.toString());
-    if (!viewerId || peers.has(viewerId) || peers.size >= 10) return;
+    if (!viewerId) return;
+    if (peers.has(viewerId) || peers.size >= 10) {
+      console.warn(
+        `[Peer ${viewerId.slice(0, 6)}] Rejected (duplicate or max peers ${peers.size}/10)`,
+      );
+      return;
+    }
 
     const decrypted = await crypto.subtle.decrypt(
       { name: "AES-GCM", iv: Buffer.from(iv, "base64url") },
@@ -198,7 +208,13 @@ client.on("message", async (_topic, rawPayload) => {
     const { ts, sdp: offerSdp } = JSON.parse(
       new TextDecoder().decode(decrypted),
     );
-    if (Math.abs(Date.now() - ts) > 30_000) return;
+    const skewMs = Date.now() - ts;
+    if (Math.abs(skewMs) > 30_000) {
+      console.warn(
+        `[Peer ${viewerId.slice(0, 6)}] Rejected offer due to clock skew (${skewMs}ms)`,
+      );
+      return;
+    }
 
     const pc = new RTCPeerConnection({
       codecs: {
@@ -211,8 +227,18 @@ client.on("message", async (_topic, rawPayload) => {
     pc.addTrack(sharedVideoTrack);
     pc.addTrack(sharedAudioTrack);
 
+    pc.onIceCandidate.subscribe((c) => {
+      if (c)
+        console.debug(
+          `[Peer ${viewerId.slice(0, 6)}] ICE candidate:`,
+          c.candidate,
+        );
+    });
+
     pc.connectionStateChange.subscribe((state) => {
-      console.log(`[Peer ${viewerId.slice(0, 6)}] ${state} (${peers.size}/10)`);
+      console.info(
+        `[Peer ${viewerId.slice(0, 6)}] ${state} (${peers.size}/10)`,
+      );
       if (state === "connected" && obsVideoReceiver && obsVideoSsrc) {
         obsVideoReceiver.sendRtcpPLI(obsVideoSsrc);
         setTimeout(() => obsVideoReceiver?.sendRtcpPLI(obsVideoSsrc!), 500);
@@ -232,12 +258,8 @@ client.on("message", async (_topic, rawPayload) => {
 
     if (pc.iceGatheringState !== "complete") {
       await new Promise<void>((resolve) => {
-        const timeout = setTimeout(resolve, 1500);
         pc.iceGatheringStateChange.subscribe((state) => {
-          if (state === "complete") {
-            clearTimeout(timeout);
-            resolve();
-          }
+          if (state === "complete") resolve();
         });
       });
     }
@@ -258,7 +280,7 @@ client.on("message", async (_topic, rawPayload) => {
         data: Buffer.from(ansCipher).toString("base64url"),
       }),
     );
-  } catch {
-    // Ignore unauthorized or malformed messages
+  } catch (err) {
+    console.warn("[MQTT] Ignored invalid or unauthorized offer:", err);
   }
 });
