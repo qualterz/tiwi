@@ -1,3 +1,4 @@
+import { parseArgs } from "util";
 import {
   RTCPeerConnection,
   MediaStreamTrack,
@@ -6,10 +7,17 @@ import {
 } from "werift";
 import mqtt from "mqtt";
 
-// 1. Generate secret token & derive public streamId via HMAC-SHA256 + AES-GCM key
-const token = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString(
-  "base64url",
-);
+// 1. Parse optional --token flag or generate a random secret token, then derive public streamId + AES-GCM key
+const { values } = parseArgs({
+  args: Bun.argv.slice(2),
+  options: {
+    token: { type: "string" },
+  },
+});
+
+const token =
+  values.token ||
+  Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
 const tokenBytes = new TextEncoder().encode(token);
 
 const hmacKey = await crypto.subtle.importKey(
