@@ -7,7 +7,7 @@ import {
   type RTCInboundRtpStreamStats,
 } from "werift";
 import mqtt from "mqtt";
-import type { CodecConfig, PeerMetrics } from "./peer-worker.ts";
+import type { CodecConfig, PeerMetrics } from "./worker.ts";
 
 const METRICS_INTERVAL_MS = 5000;
 const UDP_BUFFER_BYTES = 16 * 1024 * 1024;
@@ -158,7 +158,7 @@ const pendingStats = new Map<number, (sessions: PeerMetrics[]) => void>();
 let statsReqSeq = 0;
 
 const workerSlots: WorkerSlot[] = Array.from({ length: WORKER_COUNT }, () => {
-  const worker = new Worker(new URL("./peer-worker.ts", import.meta.url).href);
+  const worker = new Worker(new URL("./worker.ts", import.meta.url).href);
   const slot: WorkerSlot = { worker, peers: new Set() };
   worker.postMessage({
     type: "init",

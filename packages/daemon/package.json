@@ -1,0 +1,13 @@
+{
+  "name": "@tiwi/daemon",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun run src/index.ts",
+    "typecheck": "bun check"
+  },
+  "dependencies": {
+    "mqtt": "^5.16.1",
+    "werift": "^0.27.0"
+  }
+}
