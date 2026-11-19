@@ -2,22 +2,19 @@ import dgram from "dgram";
 import { parseArgs } from "util";
 import {
   RTCPeerConnection,
-  MediaStreamTrack,
   RTCRtpCodecParameters,
   type RTCRtpReceiver,
   type RTCInboundRtpStreamStats,
-  type RTCOutboundRtpStreamStats,
-  type RTCRemoteInboundRtpStreamStats,
-  type RTCIceCandidatePairStats,
-  type RtpPacket,
-  wrapRtx,
-  uint16Add,
 } from "werift";
 import mqtt from "mqtt";
+import type { CodecConfig, PeerMetrics } from "./peer-worker.ts";
 
 const METRICS_INTERVAL_MS = 5000;
 const UDP_BUFFER_BYTES = 16 * 1024 * 1024;
-const RTP_CACHE_SIZE = 4096;
+const WORKER_COUNT = Math.max(
+  1,
+  Math.min(4, navigator.hardwareConcurrency || 2),
+);
 const VALID_PROFILES = ["low-latency", "stable"] as const;
 type StreamProfile = (typeof VALID_PROFILES)[number];
 
@@ -128,26 +125,20 @@ const supportedCodecs = {
   ],
 };
 
-// 3. Shared outbound media tracks fed by OBS + dynamically resolved video codec
-let activeVideoCodec = supportedCodecs.video[0]!;
-const sharedVideoTrack = new MediaStreamTrack({
-  kind: "video",
-  codec: activeVideoCodec,
+const serializeCodec = (c: RTCRtpCodecParameters): CodecConfig => ({
+  mimeType: c.mimeType,
+  clockRate: c.clockRate,
+  rtcpFeedback: c.rtcpFeedback,
+  parameters: c.parameters,
 });
-const sharedAudioTrack = new MediaStreamTrack({
-  kind: "audio",
-  codec: supportedCodecs.audio[0],
-});
-const peers = new Map<string, RTCPeerConnection>();
-let uplinkCongested = false;
 
+// 3. Peer worker pool for multi-core SRTP fanout + OBS state
+let activeVideoCodec = supportedCodecs.video[0]!;
 let activeObsPc: RTCPeerConnection | null = null;
 let obsVideoReceiver: RTCRtpReceiver | null = null;
 let obsVideoSsrc: number | undefined;
 let lastPliSentAtMs = 0;
-const videoRtpHistory = isStable
-  ? new Array<RtpPacket | undefined>(RTP_CACHE_SIZE)
-  : null;
+let uplinkCongested = false;
 
 const requestObsKeyframe = (force = false) => {
   if (!obsVideoReceiver || obsVideoSsrc === undefined) return;
@@ -157,54 +148,94 @@ const requestObsKeyframe = (force = false) => {
   obsVideoReceiver.sendRtcpPLI(obsVideoSsrc);
 };
 
-type PeerMetrics = {
-  viewerId: string;
-  connectedAt: string;
-  disconnectedAt: string | null;
-  connectionState: string;
-  iceConnectionState: string;
-  wallClockSkewMs: number;
-  iceGatherDurationMs: number;
-  transport: {
-    localCandidate: string | null;
-    remoteCandidate: string | null;
-    candidateType: string | null;
-    protocol: string | null;
-    rttMs: number | null;
-    avgRttMs: number | null;
-    oneWayPingMs: number | null;
-    bytesSent: number;
-    packetsSent: number;
+type WorkerSlot = {
+  worker: Worker;
+  peers: Set<string>;
+};
+
+const peerToWorker = new Map<string, WorkerSlot>();
+const pendingStats = new Map<number, (sessions: PeerMetrics[]) => void>();
+let statsReqSeq = 0;
+
+const workerSlots: WorkerSlot[] = Array.from({ length: WORKER_COUNT }, () => {
+  const worker = new Worker(new URL("./peer-worker.ts", import.meta.url).href);
+  const slot: WorkerSlot = { worker, peers: new Set() };
+  worker.postMessage({
+    type: "init",
+    profile,
+    videoCodec: serializeCodec(activeVideoCodec),
+  });
+  worker.onmessage = async (event: MessageEvent) => {
+    const msg = event.data;
+    if (msg.type === "pli") {
+      requestObsKeyframe(msg.force);
+    } else if (msg.type === "state") {
+      const { viewerId, state, closed } = msg as {
+        viewerId: string;
+        state: string;
+        closed: boolean;
+      };
+      if (closed) {
+        slot.peers.delete(viewerId);
+        peerToWorker.delete(viewerId);
+        metrics.peers.totalFailedOrDisconnected++;
+        metrics.peers.activeCount = peerToWorker.size;
+      }
+      console.info(
+        `[Peer ${viewerId.slice(0, 6)}] ${state} (peers=${peerToWorker.size})`,
+      );
+    } else if (msg.type === "answer") {
+      const { viewerId, answerSdp } = msg as {
+        viewerId: string;
+        answerSdp: string;
+      };
+      const ansIv = crypto.getRandomValues(new Uint8Array(12));
+      const ansCipher = await crypto.subtle.encrypt(
+        { name: "AES-GCM", iv: ansIv },
+        aesKey,
+        new TextEncoder().encode(JSON.stringify({ sdp: answerSdp, profile })),
+      );
+      client.publish(
+        `stream/${streamId}/answer/${viewerId}`,
+        JSON.stringify({
+          iv: Buffer.from(ansIv).toString("base64url"),
+          data: Buffer.from(ansCipher).toString("base64url"),
+        }),
+      );
+    } else if (msg.type === "offerError") {
+      const { viewerId, error } = msg as { viewerId: string; error: string };
+      slot.peers.delete(viewerId);
+      peerToWorker.delete(viewerId);
+      metrics.peers.activeCount = peerToWorker.size;
+      console.warn(
+        `[Peer ${viewerId.slice(0, 6)}] Offer handling failed:`,
+        error,
+      );
+    } else if (msg.type === "stats") {
+      const resolve = pendingStats.get(msg.reqId);
+      if (resolve) {
+        pendingStats.delete(msg.reqId);
+        resolve(msg.sessions);
+      }
+    }
   };
-  video: {
-    ssrc: number | null;
-    kbps: number;
-    peakKbps: number;
-    avgKbps: number;
-    pps: number;
-    packetsSent: number;
-    bytesSent: number;
-    retransmittedPacketsSent: number;
-    nackCount: number;
-    pliCount: number;
-    firCount: number;
-    remotePacketsLost: number;
-    remoteFractionLost: number;
-    remoteRttMs: number | null;
-    remoteAvgRttMs: number | null;
-  };
-  audio: {
-    ssrc: number | null;
-    kbps: number;
-    peakKbps: number;
-    avgKbps: number;
-    pps: number;
-    packetsSent: number;
-    bytesSent: number;
-    remotePacketsLost: number;
-    remoteRttMs: number | null;
-    remoteAvgRttMs: number | null;
-  };
+  return slot;
+});
+
+const broadcastCodecToWorkers = (codec: RTCRtpCodecParameters) => {
+  const serialized = serializeCodec(codec);
+  for (const slot of workerSlots) {
+    slot.worker.postMessage({ type: "codec", videoCodec: serialized });
+  }
+};
+
+const requestWorkerStats = (slot: WorkerSlot) => {
+  if (slot.peers.size === 0) return Promise.resolve<PeerMetrics[]>([]);
+  const reqId = ++statsReqSeq;
+  return new Promise<PeerMetrics[]>((resolve) => {
+    pendingStats.set(reqId, resolve);
+    slot.worker.postMessage({ type: "getStats", reqId });
+  });
 };
 
 const serverStartedAtMs = performance.now();
@@ -286,7 +317,7 @@ const scheduleStats = () => {
       metrics.uptimeSec = Math.round(
         (performance.now() - serverStartedAtMs) / 1000,
       );
-      metrics.peers.activeCount = peers.size;
+      metrics.peers.activeCount = peerToWorker.size;
 
       if (activeObsPc && activeObsPc.connectionState !== "closed") {
         metrics.obs.connectionState = activeObsPc.connectionState;
@@ -322,115 +353,15 @@ const scheduleStats = () => {
         }
       }
 
-      for (const [viewerId, pc] of peers) {
-        if (pc.connectionState === "closed") continue;
-        const pm = metrics.peers.sessions[viewerId];
-        if (!pm) continue;
-        pm.connectionState = pc.connectionState;
-        pm.iceConnectionState = pc.iceConnectionState;
-
-        const report = await pc.getStats();
-        for (const s of report.values()) {
-          if (s.type === "outbound-rtp") {
-            const r = s as RTCOutboundRtpStreamStats;
-            const bytes = r.bytesSent ?? 0;
-            const packets = r.packetsSent ?? 0;
-            const { kbps, pps, avgKbps } = computeRates(
-              `${viewerId}:${r.id}`,
-              r.timestamp,
-              bytes,
-              packets,
-            );
-            if (r.kind === "video") {
-              pm.video.ssrc = r.ssrc;
-              pm.video.kbps = kbps;
-              pm.video.peakKbps = Math.max(pm.video.peakKbps, kbps);
-              pm.video.avgKbps = avgKbps;
-              pm.video.pps = pps;
-              pm.video.packetsSent = packets;
-              pm.video.bytesSent = bytes;
-              pm.video.retransmittedPacketsSent =
-                r.retransmittedPacketsSent ?? 0;
-              pm.video.nackCount = r.nackCount ?? 0;
-              pm.video.pliCount = r.pliCount ?? 0;
-              pm.video.firCount = r.firCount ?? 0;
-            } else if (r.kind === "audio") {
-              pm.audio.ssrc = r.ssrc;
-              pm.audio.kbps = kbps;
-              pm.audio.peakKbps = Math.max(pm.audio.peakKbps, kbps);
-              pm.audio.avgKbps = avgKbps;
-              pm.audio.pps = pps;
-              pm.audio.packetsSent = packets;
-              pm.audio.bytesSent = bytes;
-            }
-          } else if (s.type === "remote-inbound-rtp") {
-            const r = s as RTCRemoteInboundRtpStreamStats;
-            const rttMs =
-              r.roundTripTime != null
-                ? Math.round(r.roundTripTime * 1000)
-                : null;
-            const measurements = r.roundTripTimeMeasurements ?? 0;
-            const avgRttMs =
-              measurements > 0 && r.totalRoundTripTime != null
-                ? Math.round((r.totalRoundTripTime / measurements) * 1000)
-                : rttMs;
-            if (r.kind === "video") {
-              pm.video.remotePacketsLost = r.packetsLost ?? 0;
-              pm.video.remoteFractionLost = Number(
-                (r.fractionLost ?? 0).toFixed(4),
-              );
-              pm.video.remoteRttMs = rttMs;
-              pm.video.remoteAvgRttMs = avgRttMs;
-            } else if (r.kind === "audio") {
-              pm.audio.remotePacketsLost = r.packetsLost ?? 0;
-              pm.audio.remoteRttMs = rttMs;
-              pm.audio.remoteAvgRttMs = avgRttMs;
-            }
-          } else if (
-            s.type === "candidate-pair" &&
-            ((s as RTCIceCandidatePairStats).nominated ||
-              (s as RTCIceCandidatePairStats).state === "succeeded")
-          ) {
-            const pair = s as RTCIceCandidatePairStats;
-            const local = report.get(pair.localCandidateId) as
-              Record<string, unknown> | undefined;
-            const remote = report.get(pair.remoteCandidateId) as
-              Record<string, unknown> | undefined;
-            const rttMs =
-              pair.currentRoundTripTime != null
-                ? Math.round(pair.currentRoundTripTime * 1000)
-                : null;
-            const measurements = pair.roundTripTimeMeasurements ?? 0;
-            const avgRttMs =
-              measurements > 0 && pair.totalRoundTripTime != null
-                ? Math.round((pair.totalRoundTripTime / measurements) * 1000)
-                : rttMs;
-            pm.transport.localCandidate = local
-              ? `${local.address}:${local.port} (${local.candidateType})`
-              : null;
-            pm.transport.remoteCandidate = remote
-              ? `${remote.address}:${remote.port} (${remote.candidateType})`
-              : null;
-            pm.transport.candidateType =
-              (local?.candidateType as string | undefined) ?? null;
-            pm.transport.protocol =
-              (local?.protocol as string | undefined) ?? null;
-            pm.transport.rttMs = rttMs;
-            pm.transport.avgRttMs = avgRttMs;
-            pm.transport.oneWayPingMs =
-              rttMs != null ? Math.round(rttMs / 2) : null;
-            pm.transport.bytesSent = pair.bytesSent ?? 0;
-            pm.transport.packetsSent = pair.packetsSent ?? 0;
-          }
-        }
-      }
+      const activeSessions = (
+        await Promise.all(workerSlots.map(requestWorkerStats))
+      ).flat();
 
       let connectedPeers = 0;
       let congestedPeers = 0;
-      for (const [viewerId, pc] of peers) {
-        if (pc.connectionState !== "connected") continue;
-        const pm = metrics.peers.sessions[viewerId];
-        if (!pm) continue;
+      for (const pm of activeSessions) {
+        metrics.peers.sessions[pm.viewerId] = pm;
+        if (pm.connectionState !== "connected") continue;
         connectedPeers++;
         const rtt = pm.transport.rttMs ?? pm.video.remoteRttMs;
         const avgRtt = pm.transport.avgRttMs ?? pm.video.remoteAvgRttMs;
@@ -454,16 +385,15 @@ const scheduleStats = () => {
         );
       }
 
-      if (activeObsPc || peers.size > 0) {
+      if (activeObsPc || peerToWorker.size > 0) {
         const o = metrics.obs;
         const lines = [
-          `[Metrics up=${metrics.uptimeSec}s profile=${profile} peers=${metrics.peers.activeCount}${uplinkCongested ? " UPLINK_CONGESTED" : ""} (accepted=${metrics.peers.totalAccepted} rejected=${metrics.peers.totalRejected} dropped=${metrics.peers.totalFailedOrDisconnected})]`,
+          `[Metrics up=${metrics.uptimeSec}s profile=${profile} workers=${WORKER_COUNT} peers=${metrics.peers.activeCount}${uplinkCongested ? " UPLINK_CONGESTED" : ""} (accepted=${metrics.peers.totalAccepted} rejected=${metrics.peers.totalRejected} dropped=${metrics.peers.totalFailedOrDisconnected})]`,
           `  OBS [${o.connectionState}] ${o.codec} (conns=${o.connectedCount})`,
           `    video ssrc=${o.video.ssrc ?? "-"} rate=${o.video.kbps}kbps (avg=${o.video.avgKbps} peak=${o.video.peakKbps}) ${o.video.pps}pps | rx=${o.video.packetsReceived}pkts (${(o.video.bytesReceived / 1048576).toFixed(2)}MB) lost=${o.video.packetsLost} jitter=${o.video.jitterMs}ms nack=${o.video.nackCount} pli=${o.video.pliCount}`,
           `    audio ssrc=${o.audio.ssrc ?? "-"} rate=${o.audio.kbps}kbps (avg=${o.audio.avgKbps} peak=${o.audio.peakKbps}) ${o.audio.pps}pps | rx=${o.audio.packetsReceived}pkts (${(o.audio.bytesReceived / 1048576).toFixed(2)}MB) lost=${o.audio.packetsLost} jitter=${o.audio.jitterMs}ms`,
         ];
-        for (const pm of Object.values(metrics.peers.sessions)) {
-          if (!peers.has(pm.viewerId)) continue;
+        for (const pm of activeSessions) {
           const rtt = pm.transport.rttMs ?? pm.video.remoteRttMs;
           const avgRtt = pm.transport.avgRttMs ?? pm.video.remoteAvgRttMs;
           const ping =
@@ -531,22 +461,31 @@ Bun.serve({
               );
               if (matched) {
                 activeVideoCodec = matched;
-                sharedVideoTrack.codec = matched;
+                broadcastCodecToWorkers(matched);
                 console.info(
                   `[OBS] Dynamically resolved video codec: ${matched.mimeType} (PT=${matched.payloadType})`,
                 );
               }
             }
-            if (videoRtpHistory) {
-              videoRtpHistory[rtp.header.sequenceNumber % RTP_CACHE_SIZE] = rtp;
+            if (peerToWorker.size === 0) return;
+            const data = rtp.serialize();
+            for (const slot of workerSlots) {
+              if (slot.peers.size > 0) {
+                slot.worker.postMessage({ type: "rtp", kind: "video", data });
+              }
             }
-            sharedVideoTrack.writeRtp(rtp);
           });
         }
 
         if (track.kind === "audio") {
           track.onReceiveRtp.subscribe((rtp) => {
-            sharedAudioTrack.writeRtp(rtp);
+            if (peerToWorker.size === 0) return;
+            const data = rtp.serialize();
+            for (const slot of workerSlots) {
+              if (slot.peers.size > 0) {
+                slot.worker.postMessage({ type: "rtp", kind: "audio", data });
+              }
+            }
           });
         }
       });
@@ -563,7 +502,7 @@ Bun.serve({
 
       if (videoTransceiver?.codecs[0]) {
         activeVideoCodec = videoTransceiver.codecs[0];
-        sharedVideoTrack.codec = activeVideoCodec;
+        broadcastCodecToWorkers(activeVideoCodec);
         console.info(
           `[OBS] Connected via WHIP (${activeVideoCodec.mimeType})! Streaming live...`,
         );
@@ -583,7 +522,7 @@ Bun.serve({
 });
 
 console.info("OBS WHIP Server: http://127.0.0.1:8080/whip");
-console.info(`Profile: ${profile}`);
+console.info(`Profile: ${profile} (workers=${WORKER_COUNT})`);
 console.info(`Stream Public ID (HMAC): ${streamId}`);
 console.info(
   `\nShare this 1-click private link with peers:\nhttp://localhost:3000/#${token}\n`,
@@ -606,10 +545,10 @@ client.on("message", async (_topic, rawPayload) => {
   try {
     const { viewerId, iv, data } = JSON.parse(rawPayload.toString());
     if (!viewerId) return;
-    if (peers.has(viewerId) || uplinkCongested) {
+    if (peerToWorker.has(viewerId) || uplinkCongested) {
       metrics.peers.totalRejected++;
       console.warn(
-        `[Peer ${viewerId.slice(0, 6)}] Rejected (${peers.has(viewerId) ? "duplicate" : "host uplink congested"})`,
+        `[Peer ${viewerId.slice(0, 6)}] Rejected (${peerToWorker.has(viewerId) ? "duplicate" : "host uplink congested"})`,
       );
       return;
     }
@@ -632,199 +571,21 @@ client.on("message", async (_topic, rawPayload) => {
       );
     }
 
-    const pc = new RTCPeerConnection({
-      codecs: {
-        video: isStable
-          ? [
-              new RTCRtpCodecParameters({
-                mimeType: activeVideoCodec.mimeType,
-                clockRate: activeVideoCodec.clockRate,
-                rtcpFeedback: activeVideoCodec.rtcpFeedback,
-                parameters: activeVideoCodec.parameters,
-              }),
-              new RTCRtpCodecParameters({
-                mimeType: "video/rtx",
-                clockRate: 90000,
-              }),
-            ]
-          : [activeVideoCodec],
-        audio: supportedCodecs.audio,
-      },
-      iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
-    });
-    peers.set(viewerId, pc);
+    const slot = workerSlots.reduce((min, cur) =>
+      cur.peers.size < min.peers.size ? cur : min,
+    );
+    slot.peers.add(viewerId);
+    peerToWorker.set(viewerId, slot);
     metrics.peers.totalAccepted++;
-    metrics.peers.activeCount = peers.size;
-    const peerMetrics: PeerMetrics = {
+    metrics.peers.activeCount = peerToWorker.size;
+
+    slot.worker.postMessage({
+      type: "offer",
       viewerId,
-      connectedAt: new Date().toISOString(),
-      disconnectedAt: null,
-      connectionState: pc.connectionState,
-      iceConnectionState: pc.iceConnectionState,
-      wallClockSkewMs: skewMs,
-      iceGatherDurationMs: 0,
-      transport: {
-        localCandidate: null,
-        remoteCandidate: null,
-        candidateType: null,
-        protocol: null,
-        rttMs: null,
-        avgRttMs: null,
-        oneWayPingMs: null,
-        bytesSent: 0,
-        packetsSent: 0,
-      },
-      video: {
-        ssrc: null,
-        kbps: 0,
-        peakKbps: 0,
-        avgKbps: 0,
-        pps: 0,
-        packetsSent: 0,
-        bytesSent: 0,
-        retransmittedPacketsSent: 0,
-        nackCount: 0,
-        pliCount: 0,
-        firCount: 0,
-        remotePacketsLost: 0,
-        remoteFractionLost: 0,
-        remoteRttMs: null,
-        remoteAvgRttMs: null,
-      },
-      audio: {
-        ssrc: null,
-        kbps: 0,
-        peakKbps: 0,
-        avgKbps: 0,
-        pps: 0,
-        packetsSent: 0,
-        bytesSent: 0,
-        remotePacketsLost: 0,
-        remoteRttMs: null,
-        remoteAvgRttMs: null,
-      },
-    };
-    metrics.peers.sessions[viewerId] = peerMetrics;
-
-    const videoSender = pc.addTrack(sharedVideoTrack);
-    pc.addTrack(sharedAudioTrack);
-
-    if (videoRtpHistory) {
-      videoSender.onGenericNack.subscribe(async (feedback) => {
-        const sender = videoSender as unknown as {
-          rtpCache: (RtpPacket | undefined)[];
-          rtxPayloadType?: number;
-          rtxSequenceNumber: number;
-          rtxSsrc: number;
-          ssrc: number;
-          codec?: { payloadType: number };
-          dispatchOutgoing: (
-            fn: () => Promise<void>,
-            meta: { kind: string; bytes: number },
-          ) => Promise<void>;
-          sendRtpInternal: (
-            pkt: RtpPacket,
-            opts: { injectProbePadding: boolean; isRetransmission: boolean },
-          ) => Promise<void>;
-        };
-        for (const seqNum of feedback.lost) {
-          const inSmallCache = sender.rtpCache[seqNum % 128];
-          if (inSmallCache && inSmallCache.header.sequenceNumber === seqNum) {
-            continue;
-          }
-          const cached = videoRtpHistory[seqNum % RTP_CACHE_SIZE];
-          if (!cached || cached.header.sequenceNumber !== seqNum) continue;
-          let pkt = cached.clone();
-          pkt.header.ssrc = sender.ssrc;
-          if (sender.codec) pkt.header.payloadType = sender.codec.payloadType;
-          if (sender.rtxPayloadType != null) {
-            pkt = wrapRtx(
-              pkt,
-              sender.rtxPayloadType,
-              sender.rtxSequenceNumber,
-              sender.rtxSsrc,
-            );
-            sender.rtxSequenceNumber = uint16Add(sender.rtxSequenceNumber, 1);
-          }
-          await sender.dispatchOutgoing(
-            () =>
-              sender.sendRtpInternal(pkt, {
-                injectProbePadding: false,
-                isRetransmission: true,
-              }),
-            { kind: "rtx", bytes: pkt.payload.length + 24 },
-          );
-        }
-      });
-    }
-
-    videoSender.onKeyFrameRequest.subscribe(() => {
-      requestObsKeyframe();
+      offerSdp,
+      skewMs,
+      videoCodec: serializeCodec(activeVideoCodec),
     });
-
-    pc.onIceCandidate.subscribe((c) => {
-      if (c)
-        console.debug(
-          `[Peer ${viewerId.slice(0, 6)}] ICE candidate:`,
-          c.candidate,
-        );
-    });
-
-    pc.connectionStateChange.subscribe((state) => {
-      peerMetrics.connectionState = state;
-      peerMetrics.iceConnectionState = pc.iceConnectionState;
-      console.info(
-        `[Peer ${viewerId.slice(0, 6)}] ${state} (peers=${peers.size})`,
-      );
-      if (state === "connected") {
-        requestObsKeyframe(true);
-        setTimeout(() => requestObsKeyframe(true), 500);
-      }
-      if (
-        state === "closed" ||
-        state === "failed" ||
-        state === "disconnected"
-      ) {
-        if (peers.delete(viewerId)) {
-          peerMetrics.disconnectedAt ??= new Date().toISOString();
-          metrics.peers.totalFailedOrDisconnected++;
-          metrics.peers.activeCount = peers.size;
-          pc.close();
-        }
-      }
-    });
-
-    const iceGatherStartMs = performance.now();
-    await pc.setRemoteDescription({ type: "offer", sdp: offerSdp });
-    await pc.setLocalDescription(await pc.createAnswer());
-
-    if (pc.iceGatheringState !== "complete") {
-      await new Promise<void>((resolve) => {
-        pc.iceGatheringStateChange.subscribe((state) => {
-          if (state === "complete") resolve();
-        });
-      });
-    }
-    peerMetrics.iceGatherDurationMs = Math.round(
-      performance.now() - iceGatherStartMs,
-    );
-
-    const ansIv = crypto.getRandomValues(new Uint8Array(12));
-    const ansCipher = await crypto.subtle.encrypt(
-      { name: "AES-GCM", iv: ansIv },
-      aesKey,
-      new TextEncoder().encode(
-        JSON.stringify({ sdp: pc.localDescription!.sdp, profile }),
-      ),
-    );
-
-    client.publish(
-      `stream/${streamId}/answer/${viewerId}`,
-      JSON.stringify({
-        iv: Buffer.from(ansIv).toString("base64url"),
-        data: Buffer.from(ansCipher).toString("base64url"),
-      }),
-    );
   } catch (err) {
     console.warn("[MQTT] Ignored invalid or unauthorized offer:", err);
   }
