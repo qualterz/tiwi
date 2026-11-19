@@ -9,12 +9,17 @@ import {
   type RTCOutboundRtpStreamStats,
   type RTCRemoteInboundRtpStreamStats,
   type RTCIceCandidatePairStats,
+  type RtpPacket,
+  wrapRtx,
+  uint16Add,
 } from "werift";
 import mqtt from "mqtt";
 
 const METRICS_INTERVAL_MS = 5000;
 const UDP_BUFFER_BYTES = 16 * 1024 * 1024;
-const PLI_COOLDOWN_MS = 500;
+const RTP_CACHE_SIZE = 4096;
+const VALID_PROFILES = ["low-latency", "stable"] as const;
+type StreamProfile = (typeof VALID_PROFILES)[number];
 
 // Enlarge OS UDP socket buffers (default 64KB on Windows overflows during 30-55Mbps keyframe bursts)
 const origCreateSocket = dgram.createSocket;
@@ -29,13 +34,25 @@ dgram.createSocket = ((...args: Parameters<typeof dgram.createSocket>) => {
   return sock;
 }) as typeof dgram.createSocket;
 
-// 1. Parse optional --token flag or generate a random secret token, then derive public streamId + AES-GCM key
+// 1. Parse optional --token and --profile flags, then derive public streamId + AES-GCM key
 const { values } = parseArgs({
   args: Bun.argv.slice(2),
   options: {
     token: { type: "string" },
+    profile: { type: "string" },
   },
 });
+
+const rawProfile = values.profile ?? "stable";
+if (!VALID_PROFILES.includes(rawProfile as StreamProfile)) {
+  console.error(
+    `Invalid --profile "${rawProfile}". Valid profiles: ${VALID_PROFILES.join(", ")}`,
+  );
+  process.exit(1);
+}
+const profile = rawProfile as StreamProfile;
+const isStable = profile === "stable";
+const PLI_COOLDOWN_MS = isStable ? 1000 : 500;
 
 const token =
   values.token ||
@@ -128,6 +145,9 @@ let activeObsPc: RTCPeerConnection | null = null;
 let obsVideoReceiver: RTCRtpReceiver | null = null;
 let obsVideoSsrc: number | undefined;
 let lastPliSentAtMs = 0;
+const videoRtpHistory = isStable
+  ? new Array<RtpPacket | undefined>(RTP_CACHE_SIZE)
+  : null;
 
 const requestObsKeyframe = (force = false) => {
   if (!obsVideoReceiver || obsVideoSsrc === undefined) return;
@@ -437,7 +457,7 @@ const scheduleStats = () => {
       if (activeObsPc || peers.size > 0) {
         const o = metrics.obs;
         const lines = [
-          `[Metrics up=${metrics.uptimeSec}s peers=${metrics.peers.activeCount}${uplinkCongested ? " UPLINK_CONGESTED" : ""} (accepted=${metrics.peers.totalAccepted} rejected=${metrics.peers.totalRejected} dropped=${metrics.peers.totalFailedOrDisconnected})]`,
+          `[Metrics up=${metrics.uptimeSec}s profile=${profile} peers=${metrics.peers.activeCount}${uplinkCongested ? " UPLINK_CONGESTED" : ""} (accepted=${metrics.peers.totalAccepted} rejected=${metrics.peers.totalRejected} dropped=${metrics.peers.totalFailedOrDisconnected})]`,
           `  OBS [${o.connectionState}] ${o.codec} (conns=${o.connectedCount})`,
           `    video ssrc=${o.video.ssrc ?? "-"} rate=${o.video.kbps}kbps (avg=${o.video.avgKbps} peak=${o.video.peakKbps}) ${o.video.pps}pps | rx=${o.video.packetsReceived}pkts (${(o.video.bytesReceived / 1048576).toFixed(2)}MB) lost=${o.video.packetsLost} jitter=${o.video.jitterMs}ms nack=${o.video.nackCount} pli=${o.video.pliCount}`,
           `    audio ssrc=${o.audio.ssrc ?? "-"} rate=${o.audio.kbps}kbps (avg=${o.audio.avgKbps} peak=${o.audio.peakKbps}) ${o.audio.pps}pps | rx=${o.audio.packetsReceived}pkts (${(o.audio.bytesReceived / 1048576).toFixed(2)}MB) lost=${o.audio.packetsLost} jitter=${o.audio.jitterMs}ms`,
@@ -517,6 +537,9 @@ Bun.serve({
                 );
               }
             }
+            if (videoRtpHistory) {
+              videoRtpHistory[rtp.header.sequenceNumber % RTP_CACHE_SIZE] = rtp;
+            }
             sharedVideoTrack.writeRtp(rtp);
           });
         }
@@ -560,6 +583,7 @@ Bun.serve({
 });
 
 console.info("OBS WHIP Server: http://127.0.0.1:8080/whip");
+console.info(`Profile: ${profile}`);
 console.info(`Stream Public ID (HMAC): ${streamId}`);
 console.info(
   `\nShare this 1-click private link with peers:\nhttp://localhost:3000/#${token}\n`,
@@ -610,7 +634,20 @@ client.on("message", async (_topic, rawPayload) => {
 
     const pc = new RTCPeerConnection({
       codecs: {
-        video: [activeVideoCodec],
+        video: isStable
+          ? [
+              new RTCRtpCodecParameters({
+                mimeType: activeVideoCodec.mimeType,
+                clockRate: activeVideoCodec.clockRate,
+                rtcpFeedback: activeVideoCodec.rtcpFeedback,
+                parameters: activeVideoCodec.parameters,
+              }),
+              new RTCRtpCodecParameters({
+                mimeType: "video/rtx",
+                clockRate: 90000,
+              }),
+            ]
+          : [activeVideoCodec],
         audio: supportedCodecs.audio,
       },
       iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
@@ -672,6 +709,55 @@ client.on("message", async (_topic, rawPayload) => {
     const videoSender = pc.addTrack(sharedVideoTrack);
     pc.addTrack(sharedAudioTrack);
 
+    if (videoRtpHistory) {
+      videoSender.onGenericNack.subscribe(async (feedback) => {
+        const sender = videoSender as unknown as {
+          rtpCache: (RtpPacket | undefined)[];
+          rtxPayloadType?: number;
+          rtxSequenceNumber: number;
+          rtxSsrc: number;
+          ssrc: number;
+          codec?: { payloadType: number };
+          dispatchOutgoing: (
+            fn: () => Promise<void>,
+            meta: { kind: string; bytes: number },
+          ) => Promise<void>;
+          sendRtpInternal: (
+            pkt: RtpPacket,
+            opts: { injectProbePadding: boolean; isRetransmission: boolean },
+          ) => Promise<void>;
+        };
+        for (const seqNum of feedback.lost) {
+          const inSmallCache = sender.rtpCache[seqNum % 128];
+          if (inSmallCache && inSmallCache.header.sequenceNumber === seqNum) {
+            continue;
+          }
+          const cached = videoRtpHistory[seqNum % RTP_CACHE_SIZE];
+          if (!cached || cached.header.sequenceNumber !== seqNum) continue;
+          let pkt = cached.clone();
+          pkt.header.ssrc = sender.ssrc;
+          if (sender.codec) pkt.header.payloadType = sender.codec.payloadType;
+          if (sender.rtxPayloadType != null) {
+            pkt = wrapRtx(
+              pkt,
+              sender.rtxPayloadType,
+              sender.rtxSequenceNumber,
+              sender.rtxSsrc,
+            );
+            sender.rtxSequenceNumber = uint16Add(sender.rtxSequenceNumber, 1);
+          }
+          await sender.dispatchOutgoing(
+            () =>
+              sender.sendRtpInternal(pkt, {
+                injectProbePadding: false,
+                isRetransmission: true,
+              }),
+            { kind: "rtx", bytes: pkt.payload.length + 24 },
+          );
+        }
+      });
+    }
+
     videoSender.onKeyFrameRequest.subscribe(() => {
       requestObsKeyframe();
     });
@@ -728,7 +814,7 @@ client.on("message", async (_topic, rawPayload) => {
       { name: "AES-GCM", iv: ansIv },
       aesKey,
       new TextEncoder().encode(
-        JSON.stringify({ sdp: pc.localDescription!.sdp }),
+        JSON.stringify({ sdp: pc.localDescription!.sdp, profile }),
       ),
     );
 

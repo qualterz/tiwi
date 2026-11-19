@@ -64,8 +64,15 @@ if (token) {
   const mediaStream = new MediaStream();
   videoEl.srcObject = mediaStream;
 
+  let activeProfile = "stable";
+
   pc.ontrack = (e) => {
     console.info("[WebRTC] Track received:", e.track.kind);
+    if (activeProfile === "stable" && "jitterBufferTarget" in e.receiver) {
+      (
+        e.receiver as RTCRtpReceiver & { jitterBufferTarget: number }
+      ).jitterBufferTarget = 300;
+    }
     mediaStream.addTrack(e.track);
     videoEl
       .play()
@@ -509,7 +516,7 @@ if (token) {
     const t = metrics.transport;
     console.info(
       [
-        `${label} up=${metrics.uptimeSec}s [${metrics.connectionState}/${metrics.iceConnectionState}] rtt=${t.currentRttMs ?? "-"}ms (avg=${t.avgRttMs ?? "-"}ms ping=${t.oneWayPingMs ?? "-"}ms) ${t.protocol ?? "-"} ${t.localCandidate ?? "-"} -> ${t.remoteCandidate ?? "-"}`,
+        `${label} up=${metrics.uptimeSec}s profile=${activeProfile} [${metrics.connectionState}/${metrics.iceConnectionState}] rtt=${t.currentRttMs ?? "-"}ms (avg=${t.avgRttMs ?? "-"}ms ping=${t.oneWayPingMs ?? "-"}ms) ${t.protocol ?? "-"} ${t.localCandidate ?? "-"} -> ${t.remoteCandidate ?? "-"}`,
         `  video ${v.codec ?? "-"} (${v.decoderImplementation ?? "-"}${v.powerEfficientDecoder != null ? ` hw=${v.powerEfficientDecoder}` : ""}) ${v.width}x${v.height}@${v.fps}fps | rate=${v.kbps}kbps (avg=${v.avgKbps} peak=${v.peakKbps}) ${v.pps}pps | e2e=${v.latency.estimatedEndToEndMs}ms (jb=${v.latency.jitterBufferMs}ms target=${v.latency.jitterBufferTargetMs}ms dec=${v.latency.decodeMs}ms proc=${v.latency.processingMs}ms jitter=${v.latency.jitterMs}ms) | dec=${v.framesDecoded} key=${v.keyFramesDecoded} drop=${v.framesDropped} lost=${v.packetsLost} rtx=${v.retransmittedPacketsReceived} freeze=${v.freezeCount} (${v.totalFreezesDurationSec}s) nack=${v.nackCount} pli=${v.pliCount}`,
         `  audio ${a.codec ?? "-"} | rate=${a.kbps}kbps ${a.pps}pps | e2e=${a.latency.estimatedEndToEndMs}ms (jb=${a.latency.jitterBufferMs}ms jitter=${a.latency.jitterMs}ms) | lost=${a.packetsLost}`,
       ].join("\n"),
@@ -549,7 +556,7 @@ if (token) {
     console.info("[WebRTC] Connection state:", state);
     statusEl.textContent =
       state === "connected"
-        ? "Live • Connected (Click unmute on player for audio)"
+        ? `Live • Connected (${activeProfile}) — Click unmute on player for audio`
         : `Connection: ${state}`;
 
     if (state === "connected") {
@@ -624,12 +631,15 @@ if (token) {
         aesKey,
         fromBase64Url(data),
       );
-      const { sdp: answerSdp } = JSON.parse(
+      const { sdp: answerSdp, profile } = JSON.parse(
         new TextDecoder().decode(decrypted),
       );
+      activeProfile = profile ?? "stable";
 
       metrics.signaling.answerReceivedAt = new Date().toISOString();
-      console.info("[MQTT] Answer received, setting remote description");
+      console.info(
+        `[MQTT] Answer received (profile=${activeProfile}), setting remote description`,
+      );
       await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
       client.end();
     } catch (err) {
