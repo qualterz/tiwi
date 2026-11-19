@@ -122,6 +122,7 @@ const sharedAudioTrack = new MediaStreamTrack({
   codec: supportedCodecs.audio[0],
 });
 const peers = new Map<string, RTCPeerConnection>();
+let uplinkCongested = false;
 
 let activeObsPc: RTCPeerConnection | null = null;
 let obsVideoReceiver: RTCRtpReceiver | null = null;
@@ -404,10 +405,39 @@ const scheduleStats = () => {
         }
       }
 
+      let connectedPeers = 0;
+      let congestedPeers = 0;
+      for (const [viewerId, pc] of peers) {
+        if (pc.connectionState !== "connected") continue;
+        const pm = metrics.peers.sessions[viewerId];
+        if (!pm) continue;
+        connectedPeers++;
+        const rtt = pm.transport.rttMs ?? pm.video.remoteRttMs;
+        const avgRtt = pm.transport.avgRttMs ?? pm.video.remoteAvgRttMs;
+        const rttSpiked =
+          rtt != null &&
+          avgRtt != null &&
+          rtt >= avgRtt * 1.5 &&
+          rtt - avgRtt >= 30;
+        if (pm.video.remoteFractionLost >= 0.05 || rttSpiked) {
+          congestedPeers++;
+        }
+      }
+      const nextCongested =
+        connectedPeers >= 2 && congestedPeers >= Math.ceil(connectedPeers / 2);
+      if (nextCongested !== uplinkCongested) {
+        uplinkCongested = nextCongested;
+        console.warn(
+          uplinkCongested
+            ? `[Uplink] Saturated (${congestedPeers}/${connectedPeers} peers congested) — pausing new peer joins`
+            : `[Uplink] Recovered — accepting new peers`,
+        );
+      }
+
       if (activeObsPc || peers.size > 0) {
         const o = metrics.obs;
         const lines = [
-          `[Metrics up=${metrics.uptimeSec}s peers=${metrics.peers.activeCount}/10 (accepted=${metrics.peers.totalAccepted} rejected=${metrics.peers.totalRejected} dropped=${metrics.peers.totalFailedOrDisconnected})]`,
+          `[Metrics up=${metrics.uptimeSec}s peers=${metrics.peers.activeCount}${uplinkCongested ? " UPLINK_CONGESTED" : ""} (accepted=${metrics.peers.totalAccepted} rejected=${metrics.peers.totalRejected} dropped=${metrics.peers.totalFailedOrDisconnected})]`,
           `  OBS [${o.connectionState}] ${o.codec} (conns=${o.connectedCount})`,
           `    video ssrc=${o.video.ssrc ?? "-"} rate=${o.video.kbps}kbps (avg=${o.video.avgKbps} peak=${o.video.peakKbps}) ${o.video.pps}pps | rx=${o.video.packetsReceived}pkts (${(o.video.bytesReceived / 1048576).toFixed(2)}MB) lost=${o.video.packetsLost} jitter=${o.video.jitterMs}ms nack=${o.video.nackCount} pli=${o.video.pliCount}`,
           `    audio ssrc=${o.audio.ssrc ?? "-"} rate=${o.audio.kbps}kbps (avg=${o.audio.avgKbps} peak=${o.audio.peakKbps}) ${o.audio.pps}pps | rx=${o.audio.packetsReceived}pkts (${(o.audio.bytesReceived / 1048576).toFixed(2)}MB) lost=${o.audio.packetsLost} jitter=${o.audio.jitterMs}ms`,
@@ -552,10 +582,10 @@ client.on("message", async (_topic, rawPayload) => {
   try {
     const { viewerId, iv, data } = JSON.parse(rawPayload.toString());
     if (!viewerId) return;
-    if (peers.has(viewerId) || peers.size >= 10) {
+    if (peers.has(viewerId) || uplinkCongested) {
       metrics.peers.totalRejected++;
       console.warn(
-        `[Peer ${viewerId.slice(0, 6)}] Rejected (duplicate or max peers ${peers.size}/10)`,
+        `[Peer ${viewerId.slice(0, 6)}] Rejected (${peers.has(viewerId) ? "duplicate" : "host uplink congested"})`,
       );
       return;
     }
@@ -658,7 +688,7 @@ client.on("message", async (_topic, rawPayload) => {
       peerMetrics.connectionState = state;
       peerMetrics.iceConnectionState = pc.iceConnectionState;
       console.info(
-        `[Peer ${viewerId.slice(0, 6)}] ${state} (${peers.size}/10)`,
+        `[Peer ${viewerId.slice(0, 6)}] ${state} (peers=${peers.size})`,
       );
       if (state === "connected") {
         requestObsKeyframe(true);
@@ -669,11 +699,12 @@ client.on("message", async (_topic, rawPayload) => {
         state === "failed" ||
         state === "disconnected"
       ) {
-        peerMetrics.disconnectedAt ??= new Date().toISOString();
-        metrics.peers.totalFailedOrDisconnected++;
-        pc.close();
-        peers.delete(viewerId);
-        metrics.peers.activeCount = peers.size;
+        if (peers.delete(viewerId)) {
+          peerMetrics.disconnectedAt ??= new Date().toISOString();
+          metrics.peers.totalFailedOrDisconnected++;
+          metrics.peers.activeCount = peers.size;
+          pc.close();
+        }
       }
     });
 
