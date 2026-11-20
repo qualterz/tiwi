@@ -318,10 +318,10 @@ self.onmessage = async (event: MessageEvent) => {
 
       pc.onIceCandidate.subscribe((c) => {
         if (c)
-          console.debug(
-            `[Peer ${viewerId.slice(0, 6)}] ICE candidate:`,
-            c.candidate,
-          );
+          self.postMessage({
+            type: "log",
+            msg: `[Peer ${viewerId.slice(0, 6)}] ICE candidate: ${c.candidate}`,
+          });
       });
 
       pc.connectionStateChange.subscribe((state) => {

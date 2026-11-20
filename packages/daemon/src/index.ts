@@ -213,10 +213,12 @@ const workerSlots: WorkerSlot[] = Array.from({ length: WORKER_COUNT }, () => {
       slot.peers.delete(viewerId);
       peerToWorker.delete(viewerId);
       metrics.peers.activeCount = peerToWorker.size;
-      console.warn(
-        `[Peer ${viewerId.slice(0, 6)}] Offer handling failed:`,
-        error,
+      logEvent(
+        `[Peer ${viewerId.slice(0, 6)}] Offer handling failed: ${error}`,
+        "warn",
       );
+    } else if (msg.type === "log") {
+      logEvent(msg.msg);
     } else if (msg.type === "stats") {
       const resolve = pendingStats.get(msg.reqId);
       if (resolve) {
@@ -463,10 +465,11 @@ const scheduleStats = () => {
         connectedPeers >= 2 && congestedPeers >= Math.ceil(connectedPeers / 2);
       if (nextCongested !== uplinkCongested) {
         uplinkCongested = nextCongested;
-        console.warn(
+        logEvent(
           uplinkCongested
             ? `[Uplink] Saturated (${congestedPeers}/${connectedPeers} peers congested) — pausing new peer joins`
             : `[Uplink] Recovered — accepting new peers`,
+          "warn",
         );
       }
 
@@ -534,7 +537,7 @@ Bun.serve({
 
       obsPc.connectionStateChange.subscribe((state) => {
         metrics.obs.connectionState = state;
-        console.info(`[OBS] Connection state: ${state}`);
+        logEvent(`[OBS] Connection state: ${state}`);
         if (
           (state === "closed" ||
             state === "failed" ||
@@ -562,7 +565,7 @@ Bun.serve({
               if (matched) {
                 activeVideoCodec = matched;
                 broadcastCodecToWorkers(matched);
-                console.info(
+                logEvent(
                   `[OBS] Dynamically resolved video codec: ${matched.mimeType} (PT=${matched.payloadType})`,
                 );
               }
@@ -603,7 +606,7 @@ Bun.serve({
       if (videoTransceiver?.codecs[0]) {
         activeVideoCodec = videoTransceiver.codecs[0];
         broadcastCodecToWorkers(activeVideoCodec);
-        console.info(
+        logEvent(
           `[OBS] Connected via WHIP (${activeVideoCodec.mimeType})! Streaming live...`,
         );
       }
@@ -667,12 +670,12 @@ const offerTopic = `stream/${streamId}/offer`;
 
 client.on("connect", () => {
   client.subscribe(offerTopic, (err) => {
-    if (err) console.error("[MQTT] Subscribe error:", err);
+    if (err) logEvent(`[MQTT] Subscribe error: ${err}`, "error");
   });
   logEvent("mqtt connected and listening");
 });
 
-client.on("error", (err) => console.error("[MQTT] Error:", err));
+client.on("error", (err) => logEvent(`[MQTT] Error: ${err}`, "error"));
 
 client.on("message", async (_topic, rawPayload) => {
   try {
@@ -680,8 +683,9 @@ client.on("message", async (_topic, rawPayload) => {
     if (!viewerId) return;
     if (peerToWorker.has(viewerId) || uplinkCongested) {
       metrics.peers.totalRejected++;
-      console.warn(
+      logEvent(
         `[Peer ${viewerId.slice(0, 6)}] Rejected (${peerToWorker.has(viewerId) ? "duplicate" : "host uplink congested"})`,
+        "warn",
       );
       return;
     }
@@ -695,12 +699,13 @@ client.on("message", async (_topic, rawPayload) => {
       new TextDecoder().decode(decrypted),
     );
     const skewMs = Date.now() - ts;
-    console.info(
+    logEvent(
       `[Peer ${viewerId.slice(0, 6)}] Offer authenticated (wall-clock skew: ${skewMs}ms)`,
     );
     if (Math.abs(skewMs) > 30_000) {
-      console.warn(
+      logEvent(
         `[Peer ${viewerId.slice(0, 6)}] Large wall-clock skew (${skewMs}ms) — rely on RTP packetsSent/packetsReceived & SSRC to correlate logs`,
+        "warn",
       );
     }
 
@@ -720,6 +725,6 @@ client.on("message", async (_topic, rawPayload) => {
       videoCodec: serializeCodec(activeVideoCodec),
     });
   } catch (err) {
-    console.warn("[MQTT] Ignored invalid or unauthorized offer:", err);
+    logEvent(`[MQTT] Ignored invalid or unauthorized offer: ${err}`, "warn");
   }
 });
