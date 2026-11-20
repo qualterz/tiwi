@@ -71,7 +71,6 @@ export async function startViewer(
         activePc.close();
         activePc = null;
       }
-      videoEl.srcObject = null;
       setStatus(reason);
     };
 
@@ -83,6 +82,7 @@ export async function startViewer(
     };
 
     const connect = async () => {
+    setStatus("Connecting...");
     // 2. Setup RTCPeerConnection & bind tracks to HTML5 <video>
     const viewerId = crypto.randomUUID();
     console.info("[Init] Stream:", { streamId, viewerId });
@@ -92,11 +92,13 @@ export async function startViewer(
     });
     activePc = pc;
     const mediaStream = new MediaStream();
-    videoEl.srcObject = mediaStream;
 
     pc.ontrack = (e) => {
       console.info("[WebRTC] Track received:", e.track.kind);
       mediaStream.addTrack(e.track);
+      if (videoEl.srcObject !== mediaStream) {
+        videoEl.srcObject = mediaStream;
+      }
       videoEl
         .play()
         .catch((err) => console.warn("[Video] Autoplay blocked:", err));
@@ -582,7 +584,7 @@ export async function startViewer(
       console.info("[WebRTC] Connection state:", state);
       setStatus(
         state === "connected"
-          ? `Live • Connected — Click unmute on player for audio`
+          ? "Live"
           : `Connection: ${state}`,
       );
 
@@ -630,7 +632,7 @@ export async function startViewer(
     client.on("connect", async () => {
       metrics.signaling.mqttConnectedAt = new Date().toISOString();
       console.info("[MQTT] Connected, publishing offer...");
-      setStatus(`Connecting to stream ${streamId.slice(0, 8)}...`);
+      setStatus("Connecting...");
       client.subscribe(answerTopic, (err) => {
         if (err) console.error("[MQTT] Subscribe failed:", err);
       });
