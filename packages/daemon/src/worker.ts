@@ -113,6 +113,28 @@ const sharedAudioTrack = new MediaStreamTrack({
 
 const peers = new Map<string, RTCPeerConnection>();
 const peerMetricsMap = new Map<string, PeerMetrics>();
+const handshakeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+const HANDSHAKE_TIMEOUT_MS = 15_000;
+const ICE_GATHER_TIMEOUT_MS = 5_000;
+
+const cleanupPeer = (viewerId: string, state: string) => {
+  const timer = handshakeTimers.get(viewerId);
+  if (timer) {
+    clearTimeout(timer);
+    handshakeTimers.delete(viewerId);
+  }
+  const pc = peers.get(viewerId);
+  if (!pc) return;
+  peers.delete(viewerId);
+  const pm = peerMetricsMap.get(viewerId);
+  if (pm) {
+    pm.disconnectedAt ??= new Date().toISOString();
+    peerMetricsMap.delete(viewerId);
+  }
+  pc.close();
+  self.postMessage({ type: "state", viewerId, state, closed: true });
+};
 let videoRtpHistory: (RtpPacket | undefined)[] | null = null;
 
 const prevRtp = new Map<
@@ -208,6 +230,10 @@ self.onmessage = async (event: MessageEvent) => {
       });
 
       peers.set(viewerId, pc);
+      handshakeTimers.set(
+        viewerId,
+        setTimeout(() => cleanupPeer(viewerId, "timeout"), HANDSHAKE_TIMEOUT_MS),
+      );
       const pm: PeerMetrics = {
         viewerId,
         connectedAt: new Date().toISOString(),
@@ -328,23 +354,33 @@ self.onmessage = async (event: MessageEvent) => {
         pm.connectionState = state;
         pm.iceConnectionState = pc.iceConnectionState;
         if (state === "connected") {
+          const timer = handshakeTimers.get(viewerId);
+          if (timer) {
+            clearTimeout(timer);
+            handshakeTimers.delete(viewerId);
+          }
           self.postMessage({ type: "pli", force: true });
           setTimeout(() => self.postMessage({ type: "pli", force: true }), 500);
         }
         const closed =
           state === "closed" || state === "failed" || state === "disconnected";
         if (closed) {
-          pm.disconnectedAt ??= new Date().toISOString();
-          pc.close();
-          peers.delete(viewerId);
-          peerMetricsMap.delete(viewerId);
+          cleanupPeer(viewerId, state);
+          return;
         }
         self.postMessage({
           type: "state",
           viewerId,
           state,
-          closed,
+          closed: false,
         });
+      });
+
+      pc.iceConnectionStateChange.subscribe((state) => {
+        pm.iceConnectionState = state;
+        if (state === "failed" || state === "closed") {
+          cleanupPeer(viewerId, `ice-${state}`);
+        }
       });
 
       const iceGatherStartMs = performance.now();
@@ -353,8 +389,12 @@ self.onmessage = async (event: MessageEvent) => {
 
       if (pc.iceGatheringState !== "complete") {
         await new Promise<void>((resolve) => {
+          const gatherTimer = setTimeout(resolve, ICE_GATHER_TIMEOUT_MS);
           pc.iceGatheringStateChange.subscribe((state) => {
-            if (state === "complete") resolve();
+            if (state === "complete") {
+              clearTimeout(gatherTimer);
+              resolve();
+            }
           });
         });
       }
@@ -366,8 +406,7 @@ self.onmessage = async (event: MessageEvent) => {
         answerSdp: pc.localDescription!.sdp,
       });
     } catch (err) {
-      peers.delete(viewerId);
-      peerMetricsMap.delete(viewerId);
+      cleanupPeer(viewerId, "offerError");
       self.postMessage({
         type: "offerError",
         viewerId,
@@ -378,9 +417,13 @@ self.onmessage = async (event: MessageEvent) => {
   }
 
   if (msg.type === "getStats") {
-    const entries = [...peers.entries()].filter(
-      ([, pc]) => pc.connectionState !== "closed",
-    );
+    for (const [viewerId, pc] of peers.entries()) {
+      const s = pc.connectionState;
+      if (s === "closed" || s === "failed" || s === "disconnected") {
+        cleanupPeer(viewerId, s);
+      }
+    }
+    const entries = [...peers.entries()];
     const sessions = await Promise.all(
       entries.map(async ([viewerId, pc]) => {
         const pm = peerMetricsMap.get(viewerId);

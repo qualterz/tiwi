@@ -172,8 +172,9 @@ const workerSlots: WorkerSlot[] = Array.from({ length: WORKER_COUNT }, () => {
       };
       if (closed) {
         slot.peers.delete(viewerId);
-        peerToWorker.delete(viewerId);
-        metrics.peers.totalFailedOrDisconnected++;
+        if (peerToWorker.delete(viewerId)) {
+          metrics.peers.totalFailedOrDisconnected++;
+        }
         metrics.peers.activeCount = peerToWorker.size;
       }
       logEvent(
