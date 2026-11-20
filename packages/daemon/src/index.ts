@@ -9,6 +9,7 @@ import {
 import mqtt from "mqtt";
 import type { CodecConfig, PeerMetrics } from "./worker.ts";
 
+const DEFAULT_PORT = 2000;
 const METRICS_INTERVAL_MS = 5000;
 const UDP_BUFFER_BYTES = 16 * 1024 * 1024;
 const WORKER_COUNT = Math.max(
@@ -31,14 +32,17 @@ dgram.createSocket = ((...args: Parameters<typeof dgram.createSocket>) => {
   return sock;
 }) as typeof dgram.createSocket;
 
-// 1. Parse optional --token and --profile flags, then derive public streamId + AES-GCM key
+// 1. Parse optional --token, --profile, and --port flags, then derive public streamId + AES-GCM key
 const { values } = parseArgs({
   args: Bun.argv.slice(2),
   options: {
     token: { type: "string" },
     profile: { type: "string" },
+    port: { type: "string" },
   },
 });
+
+const port = Number(values.port) || DEFAULT_PORT;
 
 const rawProfile = values.profile ?? "stable";
 if (!VALID_PROFILES.includes(rawProfile as StreamProfile)) {
@@ -311,6 +315,17 @@ const computeRates = (
   return { kbps, pps, avgKbps };
 };
 
+const wsClients = new Set<Bun.ServerWebSocket<undefined>>();
+let lastActiveSessions: PeerMetrics[] = [];
+
+const broadcastWs = (payload: unknown) => {
+  if (wsClients.size === 0) return;
+  const text = JSON.stringify(payload);
+  for (const ws of wsClients) {
+    ws.send(text);
+  }
+};
+
 const scheduleStats = () => {
   setTimeout(
     async () => {
@@ -356,6 +371,7 @@ const scheduleStats = () => {
       const activeSessions = (
         await Promise.all(workerSlots.map(requestWorkerStats))
       ).flat();
+      lastActiveSessions = activeSessions;
 
       let connectedPeers = 0;
       let congestedPeers = 0;
@@ -408,6 +424,14 @@ const scheduleStats = () => {
         console.info(lines.join("\n"));
       }
 
+      broadcastWs({
+        type: "metrics",
+        profile,
+        uplinkCongested,
+        metrics,
+        activeSessions,
+      });
+
       scheduleStats();
     },
     METRICS_INTERVAL_MS - (Date.now() % METRICS_INTERVAL_MS),
@@ -415,12 +439,17 @@ const scheduleStats = () => {
 };
 scheduleStats();
 
-// 4. Start local WHIP server for OBS (http://127.0.0.1:8080/whip)
+// 4. Start local WHIP + WebSocket server (http://127.0.0.1:2000)
 Bun.serve({
-  port: 8080,
+  port,
   hostname: "127.0.0.1",
-  async fetch(req) {
+  async fetch(req, server) {
     const url = new URL(req.url);
+
+    if (url.pathname === "/ws") {
+      if (server.upgrade(req)) return undefined;
+      return new Response("WebSocket upgrade failed", { status: 400 });
+    }
 
     if (req.method === "POST" && url.pathname === "/whip") {
       if (activeObsPc) {
@@ -519,9 +548,30 @@ Bun.serve({
 
     return new Response("Not Found", { status: 404 });
   },
+  websocket: {
+    open(ws) {
+      wsClients.add(ws);
+      ws.send(
+        JSON.stringify({
+          type: "state",
+          profile,
+          token,
+          streamId,
+          uplinkCongested,
+          metrics,
+          activeSessions: lastActiveSessions,
+        }),
+      );
+    },
+    message() {},
+    close(ws) {
+      wsClients.delete(ws);
+    },
+  },
 });
 
-console.info("OBS WHIP Server: http://127.0.0.1:8080/whip");
+console.info(`OBS WHIP Server: http://127.0.0.1:${port}/whip`);
+console.info(`Dashboard WS:    ws://127.0.0.1:${port}/ws`);
 console.info(`Profile: ${profile} (workers=${WORKER_COUNT})`);
 console.info(`Stream Public ID (HMAC): ${streamId}`);
 console.info(
