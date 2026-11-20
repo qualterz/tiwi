@@ -6,6 +6,7 @@ export default defineConfig({
   base: "./",
   plugins: [solidPlugin(), tailwindcss()],
   server: {
+    host: true,
     port: 3000,
   },
 });

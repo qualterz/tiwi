@@ -55,6 +55,34 @@ export async function startViewer(
       ["encrypt", "decrypt"],
     );
 
+    let activePc: RTCPeerConnection | null = null;
+    let activeClient: mqtt.MqttClient | null = null;
+    let activeStatsTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const disconnect = (reason: string) => {
+      clearTimeout(activeStatsTimer);
+      activeStatsTimer = undefined;
+      if (activeClient) {
+        activeClient.end();
+        activeClient = null;
+      }
+      if (activePc) {
+        activePc.onconnectionstatechange = null;
+        activePc.close();
+        activePc = null;
+      }
+      videoEl.srcObject = null;
+      setStatus(reason);
+    };
+
+    videoEl.onpause = () => {
+      if (activePc) disconnect("Paused");
+    };
+    videoEl.onplay = () => {
+      if (!activePc) void connect();
+    };
+
+    const connect = async () => {
     // 2. Setup RTCPeerConnection & bind tracks to HTML5 <video>
     const viewerId = crypto.randomUUID();
     console.info("[Init] Stream:", { streamId, viewerId });
@@ -62,6 +90,7 @@ export async function startViewer(
     const pc = new RTCPeerConnection({
       iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
     });
+    activePc = pc;
     const mediaStream = new MediaStream();
     videoEl.srcObject = mediaStream;
 
@@ -600,6 +629,7 @@ export async function startViewer(
 
     // 3. Exchange encrypted Offer/Answer over public MQTT
     const client = mqtt.connect("wss://broker.emqx.io:8084/mqtt");
+    activeClient = client;
     const answerTopic = `stream/${streamId}/answer/${viewerId}`;
 
     client.on("error", (err) => console.error("[MQTT] Error:", err));
@@ -655,6 +685,9 @@ export async function startViewer(
         console.error("[MQTT] Failed to process answer:", err);
       }
     });
+    };
+
+    void connect();
   } else {
     console.warn("[Init] Missing #<token> in URL hash");
     setStatus(
