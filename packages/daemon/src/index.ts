@@ -16,8 +16,6 @@ const WORKER_COUNT = Math.max(
   1,
   Math.min(4, navigator.hardwareConcurrency || 2),
 );
-const VALID_PROFILES = ["low-latency", "buffered"] as const;
-type StreamProfile = (typeof VALID_PROFILES)[number];
 
 // Enlarge OS UDP socket buffers (default 64KB on Windows overflows during 30-55Mbps keyframe bursts)
 const origCreateSocket = dgram.createSocket;
@@ -32,12 +30,12 @@ dgram.createSocket = ((...args: Parameters<typeof dgram.createSocket>) => {
   return sock;
 }) as typeof dgram.createSocket;
 
-// 1. Parse optional --token, --profile, --port, and --verbose flags, then derive public streamId + AES-GCM key
+// 1. Parse optional --token, --rtx, --port, and --verbose flags, then derive public streamId + AES-GCM key
 const { values } = parseArgs({
   args: Bun.argv.slice(2),
   options: {
     token: { type: "string" },
-    profile: { type: "string" },
+    rtx: { type: "boolean" },
     port: { type: "string" },
     verbose: { type: "boolean" },
   },
@@ -45,17 +43,8 @@ const { values } = parseArgs({
 
 const port = Number(values.port) || DEFAULT_PORT;
 const useTui = Boolean(process.stdout.isTTY && !values.verbose);
-
-const rawProfile = values.profile ?? "buffered";
-if (!VALID_PROFILES.includes(rawProfile as StreamProfile)) {
-  console.error(
-    `Invalid --profile "${rawProfile}". Valid profiles: ${VALID_PROFILES.join(", ")}`,
-  );
-  process.exit(1);
-}
-const profile = rawProfile as StreamProfile;
-const isBuffered = profile === "buffered";
-const PLI_COOLDOWN_MS = isBuffered ? 1000 : 500;
+const rtx = Boolean(values.rtx);
+const PLI_COOLDOWN_MS = rtx ? 1000 : 500;
 
 const token =
   values.token ||
@@ -168,7 +157,7 @@ const workerSlots: WorkerSlot[] = Array.from({ length: WORKER_COUNT }, () => {
   const slot: WorkerSlot = { worker, peers: new Set() };
   worker.postMessage({
     type: "init",
-    profile,
+    rtx,
     videoCodec: serializeCodec(activeVideoCodec),
   });
   worker.onmessage = async (event: MessageEvent) => {
@@ -199,7 +188,7 @@ const workerSlots: WorkerSlot[] = Array.from({ length: WORKER_COUNT }, () => {
       const ansCipher = await crypto.subtle.encrypt(
         { name: "AES-GCM", iv: ansIv },
         aesKey,
-        new TextEncoder().encode(JSON.stringify({ sdp: answerSdp, profile })),
+        new TextEncoder().encode(JSON.stringify({ sdp: answerSdp })),
       );
       client.publish(
         `stream/${streamId}/answer/${viewerId}`,
@@ -362,7 +351,7 @@ const renderStatusLine = () => {
     losses.length > 0 ? `${percentile(losses, 99)!.toFixed(1)}%` : "0.0%";
   const inRate = formatBitrate(metrics.obs.video.kbps + metrics.obs.audio.kbps);
   const outRate = formatBitrate(outSumKbps);
-  const line = `tiwi ${profile} · ${status} · ${metrics.peers.activeCount} peers · in ${inRate} · out ${outRate} · rtt ${rttP99} · loss ${lossP99} · up ${formatUptime(metrics.uptimeSec)}`;
+  const line = `tiwi · ${status} · ${metrics.peers.activeCount} peers · in ${inRate} · out ${outRate} · rtt ${rttP99} · loss ${lossP99} · up ${formatUptime(metrics.uptimeSec)}`;
   process.stdout.write(`\r\x1b[2K${line}`);
 };
 
@@ -478,7 +467,7 @@ const scheduleStats = () => {
       } else if (activeObsPc || peerToWorker.size > 0) {
         const o = metrics.obs;
         const lines = [
-          `[Metrics up=${metrics.uptimeSec}s profile=${profile} workers=${WORKER_COUNT} peers=${metrics.peers.activeCount}${uplinkCongested ? " UPLINK_CONGESTED" : ""} (accepted=${metrics.peers.totalAccepted} rejected=${metrics.peers.totalRejected} dropped=${metrics.peers.totalFailedOrDisconnected})]`,
+          `[Metrics up=${metrics.uptimeSec}s rtx=${rtx} workers=${WORKER_COUNT} peers=${metrics.peers.activeCount}${uplinkCongested ? " UPLINK_CONGESTED" : ""} (accepted=${metrics.peers.totalAccepted} rejected=${metrics.peers.totalRejected} dropped=${metrics.peers.totalFailedOrDisconnected})]`,
           `  OBS [${o.connectionState}] ${o.codec} (conns=${o.connectedCount})`,
           `    video ssrc=${o.video.ssrc ?? "-"} rate=${o.video.kbps}kbps (avg=${o.video.avgKbps} peak=${o.video.peakKbps}) ${o.video.pps}pps | rx=${o.video.packetsReceived}pkts (${(o.video.bytesReceived / 1048576).toFixed(2)}MB) lost=${o.video.packetsLost} jitter=${o.video.jitterMs}ms nack=${o.video.nackCount} pli=${o.video.pliCount}`,
           `    audio ssrc=${o.audio.ssrc ?? "-"} rate=${o.audio.kbps}kbps (avg=${o.audio.avgKbps} peak=${o.audio.peakKbps}) ${o.audio.pps}pps | rx=${o.audio.packetsReceived}pkts (${(o.audio.bytesReceived / 1048576).toFixed(2)}MB) lost=${o.audio.packetsLost} jitter=${o.audio.jitterMs}ms`,
@@ -500,7 +489,7 @@ const scheduleStats = () => {
 
       broadcastWs({
         type: "metrics",
-        profile,
+        rtx,
         uplinkCongested,
         metrics,
         activeSessions,
@@ -628,7 +617,7 @@ Bun.serve({
       ws.send(
         JSON.stringify({
           type: "state",
-          profile,
+          rtx,
           token,
           streamId,
           uplinkCongested,
@@ -657,7 +646,7 @@ if (useTui) {
 } else {
   console.info(`OBS WHIP Server: http://127.0.0.1:${port}/whip`);
   console.info(`Dashboard WS:    ws://127.0.0.1:${port}/ws`);
-  console.info(`Profile: ${profile} (workers=${WORKER_COUNT})`);
+  console.info(`RTX: ${rtx ? "on" : "off"} (workers=${WORKER_COUNT})`);
   console.info(`Stream Public ID (HMAC): ${streamId}`);
   console.info(
     `\nShare this 1-click private link with peers:\n${viewerBaseUrl}/#${token}\n`,

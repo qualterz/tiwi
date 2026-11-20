@@ -97,7 +97,7 @@ const toCodecParam = (c: CodecConfig) =>
     parameters: c.parameters,
   });
 
-let isStable = true;
+let rtxEnabled = false;
 let activeVideoCodec = new RTCRtpCodecParameters({
   mimeType: "video/AV1",
   clockRate: 90000,
@@ -148,8 +148,8 @@ self.onmessage = async (event: MessageEvent) => {
   const msg = event.data;
 
   if (msg.type === "init") {
-    isStable = msg.profile === "stable";
-    videoRtpHistory = isStable
+    rtxEnabled = Boolean(msg.rtx);
+    videoRtpHistory = rtxEnabled
       ? new Array<RtpPacket | undefined>(RTP_CACHE_SIZE)
       : null;
     if (msg.videoCodec) {
@@ -193,7 +193,7 @@ self.onmessage = async (event: MessageEvent) => {
       const pc = new RTCPeerConnection({
         bandwidthEstimator: "none",
         codecs: {
-          video: isStable
+          video: rtxEnabled
             ? [
                 toCodecParam(videoCodec),
                 new RTCRtpCodecParameters({
