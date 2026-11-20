@@ -342,14 +342,6 @@ self.onmessage = async (event: MessageEvent) => {
         self.postMessage({ type: "pli", force: false });
       });
 
-      pc.onIceCandidate.subscribe((c) => {
-        if (c)
-          self.postMessage({
-            type: "log",
-            msg: `[Peer ${viewerId.slice(0, 6)}] ICE candidate: ${c.candidate}`,
-          });
-      });
-
       pc.connectionStateChange.subscribe((state) => {
         pm.connectionState = state;
         pm.iceConnectionState = pc.iceConnectionState;
