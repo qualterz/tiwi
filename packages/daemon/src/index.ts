@@ -16,7 +16,7 @@ const WORKER_COUNT = Math.max(
   1,
   Math.min(4, navigator.hardwareConcurrency || 2),
 );
-const VALID_PROFILES = ["low-latency", "stable"] as const;
+const VALID_PROFILES = ["low-latency", "buffered"] as const;
 type StreamProfile = (typeof VALID_PROFILES)[number];
 
 // Enlarge OS UDP socket buffers (default 64KB on Windows overflows during 30-55Mbps keyframe bursts)
@@ -32,19 +32,21 @@ dgram.createSocket = ((...args: Parameters<typeof dgram.createSocket>) => {
   return sock;
 }) as typeof dgram.createSocket;
 
-// 1. Parse optional --token, --profile, and --port flags, then derive public streamId + AES-GCM key
+// 1. Parse optional --token, --profile, --port, and --verbose flags, then derive public streamId + AES-GCM key
 const { values } = parseArgs({
   args: Bun.argv.slice(2),
   options: {
     token: { type: "string" },
     profile: { type: "string" },
     port: { type: "string" },
+    verbose: { type: "boolean" },
   },
 });
 
 const port = Number(values.port) || DEFAULT_PORT;
+const useTui = Boolean(process.stdout.isTTY && !values.verbose);
 
-const rawProfile = values.profile ?? "stable";
+const rawProfile = values.profile ?? "buffered";
 if (!VALID_PROFILES.includes(rawProfile as StreamProfile)) {
   console.error(
     `Invalid --profile "${rawProfile}". Valid profiles: ${VALID_PROFILES.join(", ")}`,
@@ -52,8 +54,8 @@ if (!VALID_PROFILES.includes(rawProfile as StreamProfile)) {
   process.exit(1);
 }
 const profile = rawProfile as StreamProfile;
-const isStable = profile === "stable";
-const PLI_COOLDOWN_MS = isStable ? 1000 : 500;
+const isBuffered = profile === "buffered";
+const PLI_COOLDOWN_MS = isBuffered ? 1000 : 500;
 
 const token =
   values.token ||
@@ -185,8 +187,8 @@ const workerSlots: WorkerSlot[] = Array.from({ length: WORKER_COUNT }, () => {
         metrics.peers.totalFailedOrDisconnected++;
         metrics.peers.activeCount = peerToWorker.size;
       }
-      console.info(
-        `[Peer ${viewerId.slice(0, 6)}] ${state} (peers=${peerToWorker.size})`,
+      logEvent(
+        `peer ${viewerId.slice(0, 6)} ${state} (${peerToWorker.size} active)`,
       );
     } else if (msg.type === "answer") {
       const { viewerId, answerSdp } = msg as {
@@ -318,6 +320,73 @@ const computeRates = (
 const wsClients = new Set<Bun.ServerWebSocket<undefined>>();
 let lastActiveSessions: PeerMetrics[] = [];
 
+const formatUptime = (sec: number) => {
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+};
+
+const formatBitrate = (kbps: number) =>
+  kbps >= 1000 ? `${(kbps / 1000).toFixed(1)} Mbps` : `${kbps} kbps`;
+
+const percentile = (sorted: number[], p: number) => {
+  if (sorted.length === 0) return null;
+  const idx = Math.min(
+    sorted.length - 1,
+    Math.ceil((p / 100) * sorted.length) - 1,
+  );
+  return sorted[idx]!;
+};
+
+const renderStatusLine = () => {
+  if (!useTui) return;
+  const status = uplinkCongested ? "congested" : "running";
+  let outSumKbps = 0;
+  const rtts: number[] = [];
+  const losses: number[] = [];
+  for (const pm of lastActiveSessions) {
+    outSumKbps += pm.video.kbps + pm.audio.kbps;
+    if (pm.connectionState !== "connected") continue;
+    const rtt = pm.transport.rttMs ?? pm.video.remoteRttMs;
+    if (rtt != null) rtts.push(rtt);
+    losses.push(pm.video.remoteFractionLost * 100);
+  }
+  rtts.sort((a, b) => a - b);
+  losses.sort((a, b) => a - b);
+
+  const rttP99 = rtts.length > 0 ? `${percentile(rtts, 99)}ms` : "0ms";
+  const lossP99 =
+    losses.length > 0 ? `${percentile(losses, 99)!.toFixed(1)}%` : "0.0%";
+  const inRate = formatBitrate(metrics.obs.video.kbps + metrics.obs.audio.kbps);
+  const outRate = formatBitrate(outSumKbps);
+  const line = `tiwi ${profile} · ${status} · ${metrics.peers.activeCount} peers · in ${inRate} · out ${outRate} · rtt ${rttP99} · loss ${lossP99} · up ${formatUptime(metrics.uptimeSec)}`;
+  process.stdout.write(`\r\x1b[2K${line}`);
+};
+
+if (useTui) {
+  setInterval(() => {
+    metrics.uptimeSec = Math.round(
+      (performance.now() - serverStartedAtMs) / 1000,
+    );
+    renderStatusLine();
+  }, 1000);
+}
+
+const logEvent = (
+  msg: string,
+  level: "info" | "warn" | "error" = "info",
+) => {
+  if (!useTui) {
+    console[level](msg);
+    return;
+  }
+  if (level === "info") return;
+  process.stdout.write("\r\x1b[2K");
+  console[level](msg);
+  renderStatusLine();
+};
+
 const broadcastWs = (payload: unknown) => {
   if (wsClients.size === 0) return;
   const text = JSON.stringify(payload);
@@ -401,7 +470,9 @@ const scheduleStats = () => {
         );
       }
 
-      if (activeObsPc || peerToWorker.size > 0) {
+      if (useTui) {
+        renderStatusLine();
+      } else if (activeObsPc || peerToWorker.size > 0) {
         const o = metrics.obs;
         const lines = [
           `[Metrics up=${metrics.uptimeSec}s profile=${profile} workers=${WORKER_COUNT} peers=${metrics.peers.activeCount}${uplinkCongested ? " UPLINK_CONGESTED" : ""} (accepted=${metrics.peers.totalAccepted} rejected=${metrics.peers.totalRejected} dropped=${metrics.peers.totalFailedOrDisconnected})]`,
@@ -570,13 +641,20 @@ Bun.serve({
   },
 });
 
-console.info(`OBS WHIP Server: http://127.0.0.1:${port}/whip`);
-console.info(`Dashboard WS:    ws://127.0.0.1:${port}/ws`);
-console.info(`Profile: ${profile} (workers=${WORKER_COUNT})`);
-console.info(`Stream Public ID (HMAC): ${streamId}`);
-console.info(
-  `\nShare this 1-click private link with peers:\nhttp://localhost:3000/#${token}\n`,
-);
+if (useTui) {
+  console.info(
+    `\nhttp://127.0.0.1:${port}/\nhttp://127.0.0.1:${port}/whip\nhttp://127.0.0.1:3000/#${token}\n`,
+  );
+  renderStatusLine();
+} else {
+  console.info(`OBS WHIP Server: http://127.0.0.1:${port}/whip`);
+  console.info(`Dashboard WS:    ws://127.0.0.1:${port}/ws`);
+  console.info(`Profile: ${profile} (workers=${WORKER_COUNT})`);
+  console.info(`Stream Public ID (HMAC): ${streamId}`);
+  console.info(
+    `\nShare this 1-click private link with peers:\nhttp://127.0.0.1:3000/#${token}\n`,
+  );
+}
 
 // 5. Listen for encrypted peer Offers over public MQTT
 const client = mqtt.connect("wss://broker.emqx.io:8084/mqtt");
@@ -586,7 +664,7 @@ client.on("connect", () => {
   client.subscribe(offerTopic, (err) => {
     if (err) console.error("[MQTT] Subscribe error:", err);
   });
-  console.info("[MQTT] Connected and listening for peers...");
+  logEvent("mqtt connected and listening");
 });
 
 client.on("error", (err) => console.error("[MQTT] Error:", err));
