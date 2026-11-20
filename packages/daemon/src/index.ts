@@ -641,9 +641,14 @@ Bun.serve({
   },
 });
 
+const viewerBaseUrl =
+  process.env.NODE_ENV === "production"
+    ? "https://qualterz.github.io/tiwi"
+    : "http://127.0.0.1:3000";
+
 if (useTui) {
   console.info(
-    `\nhttp://127.0.0.1:${port}/\nhttp://127.0.0.1:${port}/whip\nhttp://127.0.0.1:3000/#${token}\n`,
+    `\nhttp://127.0.0.1:${port}/\nhttp://127.0.0.1:${port}/whip\n${viewerBaseUrl}/#${token}\n`,
   );
   renderStatusLine();
 } else {
@@ -652,7 +657,7 @@ if (useTui) {
   console.info(`Profile: ${profile} (workers=${WORKER_COUNT})`);
   console.info(`Stream Public ID (HMAC): ${streamId}`);
   console.info(
-    `\nShare this 1-click private link with peers:\nhttp://127.0.0.1:3000/#${token}\n`,
+    `\nShare this 1-click private link with peers:\n${viewerBaseUrl}/#${token}\n`,
   );
 }
 
