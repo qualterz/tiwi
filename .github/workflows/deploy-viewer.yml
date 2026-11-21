@@ -3,6 +3,9 @@ name: Deploy Viewer
 on:
   push:
     branches: [main]
+    paths:
+      - "packages/viewer/**"
+      - ".github/workflows/deploy-viewer.yml"
   workflow_dispatch:
 
 permissions:
