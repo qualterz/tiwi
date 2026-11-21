@@ -139,15 +139,16 @@ jobs:
       - name: Build npm bundle
         run: bun run packages/daemon/scripts/build.ts npm --version ${{ needs.prepare.outputs.version }} --commit ${{ needs.prepare.outputs.commit }}
 
-      - name: Stamp version and publish to npm
+      - name: Stamp version and stage publish to npm
         working-directory: packages/daemon
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
+          npm install -g npm@latest
           bun -e '
             const fs = require("fs");
             const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
             pkg.version = process.env.VERSION;
             fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
           '
-          npm publish --provenance --access public
+          npm stage publish --provenance --access public
