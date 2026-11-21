@@ -1,4 +1,7 @@
 import dgram from "dgram";
+import fs from "fs";
+import os from "os";
+import path from "path";
 import { parseArgs } from "util";
 import {
   RTCPeerConnection,
@@ -30,18 +33,78 @@ dgram.createSocket = ((...args: Parameters<typeof dgram.createSocket>) => {
   return sock;
 }) as typeof dgram.createSocket;
 
-// 1. Parse optional --token, --rtx, --port, and --verbose flags, then derive public streamId + AES-GCM key
+// 1. Parse CLI flags and load/persist config.json (CLI > config.json > defaults)
 const { values } = parseArgs({
   args: Bun.argv.slice(2),
   options: {
+    help: { type: "boolean", short: "h" },
+    config: { type: "string" },
     token: { type: "string" },
     rtx: { type: "boolean" },
     port: { type: "string" },
     verbose: { type: "boolean" },
   },
+  allowNegative: true,
 });
 
-const port = Number(values.port) || DEFAULT_PORT;
+if (values.help) {
+  console.log(`Usage: tiwi [options]
+
+Options:
+  --config <path>   Path to config.json
+  --token <token>   Override stream token for this run
+  --port <port>     Local WHIP/WS server port (default: ${DEFAULT_PORT})
+  --rtx / --no-rtx  Enable or disable RTP retransmission (default: on)
+  --verbose         Log full output instead of status line
+  -h, --help        Show this help message`);
+  process.exit(0);
+}
+
+const exeConfigPath = path.join(path.dirname(process.execPath), "config.json");
+const appDataDir =
+  process.platform === "win32"
+    ? path.join(
+        process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"),
+        "tiwi",
+      )
+    : path.join(
+        process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"),
+        "tiwi",
+      );
+
+const configPath = values.config
+  ? path.resolve(values.config)
+  : fs.existsSync(exeConfigPath)
+    ? exeConfigPath
+    : path.join(appDataDir, "config.json");
+
+type DaemonConfig = {
+  token?: string;
+  port?: number;
+  rtx?: boolean;
+};
+
+let fileConfig: DaemonConfig = {};
+if (fs.existsSync(configPath)) {
+  const raw = fs.readFileSync(configPath, "utf8").trim();
+  if (raw) {
+    fileConfig = JSON.parse(raw) as DaemonConfig;
+  }
+}
+
+if (!fileConfig.token) {
+  fileConfig = {
+    token: Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString(
+      "base64url",
+    ),
+    port: fileConfig.port ?? DEFAULT_PORT,
+    rtx: fileConfig.rtx ?? true,
+  };
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  fs.writeFileSync(configPath, JSON.stringify(fileConfig, null, 2) + "\n");
+}
+
+const port = Number(values.port ?? fileConfig.port) || DEFAULT_PORT;
 const useTui = Boolean(process.stdout.isTTY && !values.verbose);
 if (useTui) {
   console.log =
@@ -51,12 +114,10 @@ if (useTui) {
     console.error =
       () => {};
 }
-const rtx = Boolean(values.rtx);
+const rtx = values.rtx ?? fileConfig.rtx ?? true;
 const PLI_COOLDOWN_MS = rtx ? 1000 : 500;
 
-const token =
-  values.token ||
-  Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
+const token = values.token || fileConfig.token!;
 const tokenBytes = new TextEncoder().encode(token);
 
 const hmacKey = await crypto.subtle.importKey(
@@ -336,7 +397,6 @@ const percentile = (sorted: number[], p: number) => {
 
 const renderStatusLine = () => {
   if (!useTui) return;
-  const status = uplinkCongested ? "congested" : "running";
   let outSumKbps = 0;
   const rtts: number[] = [];
   const losses: number[] = [];
@@ -355,7 +415,7 @@ const renderStatusLine = () => {
     losses.length > 0 ? `${percentile(losses, 99)!.toFixed(1)}%` : "0.0%";
   const inRate = formatBitrate(metrics.obs.video.kbps + metrics.obs.audio.kbps);
   const outRate = formatBitrate(outSumKbps);
-  const line = `tiwi · ${status} · ${metrics.peers.activeCount} peers · in ${inRate} · out ${outRate} · rtt ${rttP99} · loss ${lossP99} · up ${formatUptime(metrics.uptimeSec)}`;
+  const line = `${metrics.peers.activeCount} peers · in ${inRate} · out ${outRate} · rtt ${rttP99} · loss ${lossP99} · up ${formatUptime(metrics.uptimeSec)}`;
   process.stdout.write(`\r\x1b[2K${line}`);
 };
 
@@ -614,9 +674,9 @@ Bun.serve({
 });
 
 const viewerBaseUrl =
-  process.env.NODE_ENV === "production"
-    ? "https://qualterz.github.io/tiwi"
-    : "http://127.0.0.1:3000";
+  process.env.NODE_ENV === "development"
+    ? "http://127.0.0.1:3000"
+    : "https://qualterz.github.io/tiwi";
 
 if (useTui) {
   process.stdout.write(
@@ -627,10 +687,11 @@ if (useTui) {
   console.info(
     [
       `[Daemon] ready (port=${port}, rtx=${rtx ? "on" : "off"}, workers=${WORKER_COUNT})`,
+      `  Config:    ${configPath}`,
       `  Dashboard: http://127.0.0.1:${port}/`,
       `  WHIP:      http://127.0.0.1:${port}/whip`,
-      `  Viewer:    ${viewerBaseUrl}/#${token}`,
       `  WebSocket: ws://127.0.0.1:${port}/ws`,
+      `  Viewer:    ${viewerBaseUrl}/#${token}`,
       `  Stream ID: ${streamId}`,
     ].join("\n"),
   );
