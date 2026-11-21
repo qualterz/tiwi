@@ -21,8 +21,11 @@
     <StandardDirectory Id="ProgramMenuFolder" />
 
     <ComponentGroup Id="ProductComponents">
-      <Component Id="TiwiExecutable" Directory="INSTALLFOLDER" Guid="*">
-        <File Id="TiwiExe" Source="$(var.ExePath)" Name="tiwi.exe" KeyPath="yes" />
+      <Component Id="TiwiExecutable" Directory="INSTALLFOLDER" Guid="4E2A9C1B-7F5D-4B8E-A1C3-6D9F2E4B7A10">
+        <File Id="TiwiExe" Source="$(var.ExePath)" Name="tiwi.exe" />
+        <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
+        <RemoveFolder Id="RemoveProgramsFolder" Directory="ProgramsFolder" On="uninstall" />
+        <RegistryValue Root="HKCU" Key="Software\Tiwi" Name="Installed" Type="integer" Value="1" KeyPath="yes" />
       </Component>
 
       <Component Id="TiwiPath" Directory="INSTALLFOLDER" Guid="2A7B5C9E-4D1F-4A8B-9E3C-1F6A8D4B2E90">

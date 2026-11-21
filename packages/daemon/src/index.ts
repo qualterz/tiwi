@@ -14,7 +14,7 @@ import type { CodecConfig, PeerMetrics } from "./worker.ts";
 
 if (typeof Bun === "undefined") {
   console.error(
-    "tiwi requires Bun (https://bun.sh). Run with: bunx tiwi",
+    "tiwi requires Bun (https://bun.sh). Run with: bunx @qualterz/tiwi",
   );
   process.exit(1);
 }
@@ -170,9 +170,12 @@ if (positionals[0] === "update") {
   console.log(`Updating tiwi ${VERSION} -> ${latest.version}...`);
 
   if (BUILD_CHANNEL === "npm") {
-    const proc = Bun.spawnSync([process.execPath, "add", "-g", "tiwi@latest"], {
-      stdio: ["inherit", "inherit", "inherit"],
-    });
+    const proc = Bun.spawnSync(
+      [process.execPath, "add", "-g", "@qualterz/tiwi@latest"],
+      {
+        stdio: ["inherit", "inherit", "inherit"],
+      },
+    );
     process.exit(proc.exitCode);
   }
 

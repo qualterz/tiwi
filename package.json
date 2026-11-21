@@ -6,7 +6,7 @@
   ],
   "scripts": {
     "dev": "bun run --filter '*' dev",
-    "dev:daemon": "bun run --filter tiwi dev",
+    "dev:daemon": "bun run --filter @qualterz/tiwi dev",
     "dev:dashboard": "bun run --filter @tiwi/dashboard dev",
     "dev:viewer": "bun run --filter @tiwi/viewer dev",
     "build": "bun run --filter '*' build",

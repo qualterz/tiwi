@@ -77,8 +77,11 @@ jobs:
       - name: Build Windows MSI
         shell: pwsh
         run: |
-          dotnet tool install --global wix --version 5.*
+          if (-not (Get-Command wix -ErrorAction SilentlyContinue)) {
+            dotnet tool install --global wix --version 5.*
+          }
           wix build packages/daemon/installer/tiwi.wxs `
+            -arch x64 `
             -d Version=${{ needs.prepare.outputs.version }} `
             -d ExePath=packages/daemon/dist/tiwi.exe `
             -o release/tiwi-windows-x64.msi
@@ -122,13 +125,15 @@ jobs:
   publish-npm:
     needs: [prepare, release]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
+          node-version: 24
 
       - run: bun install --frozen-lockfile
       - name: Build npm bundle
@@ -137,7 +142,6 @@ jobs:
       - name: Stamp version and publish to npm
         working-directory: packages/daemon
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           bun -e '
@@ -146,4 +150,4 @@ jobs:
             pkg.version = process.env.VERSION;
             fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
           '
-          npm publish --access public
+          npm publish --provenance --access public

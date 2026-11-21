@@ -30,6 +30,7 @@ const gitSha = () => {
 const version = values.version || "0.0.0-dev";
 const commit = values.commit || gitSha();
 
+fs.rmSync(distDir, { recursive: true, force: true });
 fs.mkdirSync(distDir, { recursive: true });
 
 if (mode === "npm") {
