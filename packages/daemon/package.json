@@ -1,7 +1,7 @@
 {
   "name": "@qualterz/tiwi",
   "version": "0.0.0",
-  "description": "Local WHIP-to-WebRTC streaming daemon for Tiwi",
+  "description": "Zero-infrastructure peer-to-peer live streaming daemon",
   "type": "module",
   "bin": {
     "tiwi": "dist/index.js"

@@ -83,7 +83,7 @@ if (mode === "npm") {
       "--define",
       `__TIWI_BUILD__="exe"`,
       "--windows-title=Tiwi",
-      "--windows-description=Tiwi streaming daemon",
+      "--windows-description=Zero-infrastructure peer-to-peer live streaming daemon",
       `--windows-version=${winVersion}`,
     ],
     { cwd: daemonDir, stdio: ["inherit", "inherit", "inherit"] },
