@@ -869,7 +869,7 @@ Bun.serve({
 });
 
 const viewerBaseUrl =
-  process.env.NODE_ENV === "development"
+  BUILD_CHANNEL === "dev"
     ? "http://127.0.0.1:3000"
     : "https://qualterz.github.io/tiwi";
 
