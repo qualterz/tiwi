@@ -308,6 +308,7 @@ if (useTui) {
     console.debug =
     console.error =
       () => {};
+  process.emitWarning = () => {};
 }
 const rtx = values.rtx ?? fileConfig.rtx ?? true;
 const PLI_COOLDOWN_MS = rtx ? 1000 : 500;
