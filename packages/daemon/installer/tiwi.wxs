@@ -1,0 +1,55 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="Tiwi"
+    Manufacturer="qualterz"
+    Version="$(var.Version)"
+    UpgradeCode="6F8E4C2A-9B1D-4E7F-A3C5-8D2B1E4F9A6C"
+    Scope="perUser">
+
+    <MajorUpgrade
+      DowngradeErrorMessage="A newer version of Tiwi is already installed."
+      Schedule="afterInstallInitialize" />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="Tiwi" />
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder" />
+
+    <ComponentGroup Id="ProductComponents">
+      <Component Id="TiwiExecutable" Directory="INSTALLFOLDER" Guid="*">
+        <File Id="TiwiExe" Source="$(var.ExePath)" Name="tiwi.exe" KeyPath="yes" />
+      </Component>
+
+      <Component Id="TiwiPath" Directory="INSTALLFOLDER" Guid="2A7B5C9E-4D1F-4A8B-9E3C-1F6A8D4B2E90">
+        <RegistryValue Root="HKCU" Key="Software\Tiwi" Name="PathAdded" Type="integer" Value="1" KeyPath="yes" />
+        <Environment
+          Id="PATH"
+          Name="PATH"
+          Value="[INSTALLFOLDER]"
+          Permanent="no"
+          Part="last"
+          Action="set"
+          System="no" />
+      </Component>
+
+      <Component Id="StartMenuShortcut" Directory="ProgramMenuFolder" Guid="9C4E1A7D-3B8F-4C2E-8A5D-7E1B9C4F6A20">
+        <Shortcut
+          Id="TiwiStartMenuShortcut"
+          Name="Tiwi"
+          Description="Start Tiwi streaming daemon"
+          Target="[INSTALLFOLDER]tiwi.exe"
+          WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue Root="HKCU" Key="Software\Tiwi" Name="ShortcutInstalled" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="MainFeature" Title="Tiwi" Level="1">
+      <ComponentGroupRef Id="ProductComponents" />
+    </Feature>
+  </Package>
+</Wix>

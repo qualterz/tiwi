@@ -1,9 +1,27 @@
 {
-  "name": "@tiwi/daemon",
-  "private": true,
+  "name": "tiwi",
+  "version": "0.0.0",
+  "description": "Local WHIP-to-WebRTC streaming daemon for Tiwi",
   "type": "module",
+  "bin": {
+    "tiwi": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "bun": ">=1.2.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/qualterz/tiwi.git",
+    "directory": "packages/daemon"
+  },
+  "homepage": "https://github.com/qualterz/tiwi",
   "scripts": {
     "dev": "bun run src/index.ts",
+    "build": "bun run scripts/build.ts npm",
+    "build:exe": "bun run scripts/build.ts exe",
     "typecheck": "bun check"
   },
   "dependencies": {

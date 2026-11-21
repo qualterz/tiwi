@@ -1,0 +1,149 @@
+name: Release Daemon
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g. 0.0.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-daemon
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      commit: ${{ steps.meta.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - id: meta
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+            VERSION="${VERSION#v}"
+            TAG="v${VERSION}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+            VERSION="${TAG#v}"
+          fi
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Version must be X.Y.Z (got: $VERSION)" >&2
+            exit 1
+          fi
+          COMMIT="$(git rev-parse --short HEAD)"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "commit=${COMMIT}" >> "$GITHUB_OUTPUT"
+
+  build-windows:
+    needs: prepare
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+
+      - name: Compile tiwi.exe
+        run: bun run packages/daemon/scripts/build.ts exe --version ${{ needs.prepare.outputs.version }} --commit ${{ needs.prepare.outputs.commit }}
+
+      - name: Smoke test tiwi.exe
+        run: |
+          .\packages\daemon\dist\tiwi.exe --version
+          .\packages\daemon\dist\tiwi.exe --help
+
+      - name: Package portable ZIP
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release, portable | Out-Null
+          Copy-Item packages/daemon/dist/tiwi.exe portable/tiwi.exe
+          Set-Content -Path portable/config.json -Value "{}" -NoNewline
+          Compress-Archive -Path portable/tiwi.exe, portable/config.json -DestinationPath release/tiwi-windows-x64-portable.zip -Force
+
+      - name: Build Windows MSI
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.*
+          wix build packages/daemon/installer/tiwi.wxs `
+            -d Version=${{ needs.prepare.outputs.version }} `
+            -d ExePath=packages/daemon/dist/tiwi.exe `
+            -o release/tiwi-windows-x64.msi
+
+      - name: Generate SHA256SUMS.txt
+        shell: pwsh
+        run: |
+          $files = @("tiwi-windows-x64.msi", "tiwi-windows-x64-portable.zip")
+          $lines = foreach ($f in $files) {
+            $hash = (Get-FileHash -Algorithm SHA256 -Path "release/$f").Hash.ToLower()
+            "$hash  $f"
+          }
+          Set-Content -Path release/SHA256SUMS.txt -Value ($lines -join "`n") -Encoding ascii
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: release/
+
+  release:
+    needs: [prepare, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-release
+          path: release/
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ needs.prepare.outputs.tag }}" \
+            release/tiwi-windows-x64.msi \
+            release/tiwi-windows-x64-portable.zip \
+            release/SHA256SUMS.txt \
+            --title "tiwi ${{ needs.prepare.outputs.tag }}" \
+            --generate-notes
+
+  publish-npm:
+    needs: [prepare, release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - run: bun install --frozen-lockfile
+      - name: Build npm bundle
+        run: bun run packages/daemon/scripts/build.ts npm --version ${{ needs.prepare.outputs.version }} --commit ${{ needs.prepare.outputs.commit }}
+
+      - name: Stamp version and publish to npm
+        working-directory: packages/daemon
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          bun -e '
+            const fs = require("fs");
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            pkg.version = process.env.VERSION;
+            fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
+          '
+          npm publish --access public

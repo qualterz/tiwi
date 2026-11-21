@@ -12,6 +12,24 @@ import {
 import mqtt from "mqtt";
 import type { CodecConfig, PeerMetrics } from "./worker.ts";
 
+if (typeof Bun === "undefined") {
+  console.error(
+    "tiwi requires Bun (https://bun.sh). Run with: bunx tiwi",
+  );
+  process.exit(1);
+}
+
+declare const __TIWI_VERSION__: string | undefined;
+declare const __TIWI_COMMIT__: string | undefined;
+declare const __TIWI_BUILD__: "dev" | "npm" | "exe" | undefined;
+
+const VERSION =
+  typeof __TIWI_VERSION__ !== "undefined" ? __TIWI_VERSION__ : "0.0.0-dev";
+const COMMIT = typeof __TIWI_COMMIT__ !== "undefined" ? __TIWI_COMMIT__ : "dev";
+const BUILD_CHANNEL =
+  typeof __TIWI_BUILD__ !== "undefined" ? __TIWI_BUILD__ : "dev";
+const REPO = "qualterz/tiwi";
+
 const DEFAULT_PORT = 2000;
 const METRICS_INTERVAL_MS = 5000;
 const UDP_BUFFER_BYTES = 16 * 1024 * 1024;
@@ -19,6 +37,13 @@ const WORKER_COUNT = Math.max(
   1,
   Math.min(4, navigator.hardwareConcurrency || 2),
 );
+
+// Clean up leftover binary from a previous portable self-update on Windows
+if (BUILD_CHANNEL === "exe" && process.platform === "win32") {
+  try {
+    fs.rmSync(`${process.execPath}.old`, { force: true });
+  } catch {}
+}
 
 // Enlarge OS UDP socket buffers (default 64KB on Windows overflows during 30-55Mbps keyframe bursts)
 const origCreateSocket = dgram.createSocket;
@@ -33,34 +58,201 @@ dgram.createSocket = ((...args: Parameters<typeof dgram.createSocket>) => {
   return sock;
 }) as typeof dgram.createSocket;
 
-// 1. Parse CLI flags and load/persist config.json (CLI > config.json > defaults)
-const { values } = parseArgs({
+// 1. Parse CLI flags and handle subcommands/meta flags
+const { values, positionals } = parseArgs({
   args: Bun.argv.slice(2),
   options: {
     help: { type: "boolean", short: "h" },
+    version: { type: "boolean", short: "v" },
     config: { type: "string" },
     token: { type: "string" },
     rtx: { type: "boolean" },
     port: { type: "string" },
     verbose: { type: "boolean" },
+    "update-check": { type: "boolean" },
   },
   allowNegative: true,
+  allowPositionals: true,
 });
 
 if (values.help) {
-  console.log(`Usage: tiwi [options]
+  console.log(`Usage: tiwi [command] [options]
+
+Commands:
+  update              Update tiwi to the latest release
 
 Options:
-  --config <path>   Path to config.json
-  --token <token>   Override stream token for this run
-  --port <port>     Local WHIP/WS server port (default: ${DEFAULT_PORT})
-  --rtx / --no-rtx  Enable or disable RTP retransmission (default: on)
-  --verbose         Log full output instead of status line
-  -h, --help        Show this help message`);
+  --config <path>     Path to config.json
+  --token <token>     Override stream token for this run
+  --port <port>       Local WHIP/WS server port (default: ${DEFAULT_PORT})
+  --rtx / --no-rtx    Enable or disable RTP retransmission (default: on)
+  --no-update-check   Skip checking for updates on startup
+  --verbose           Log full output instead of status line
+  -v, --version       Show version
+  -h, --help          Show this help message`);
+  process.exit(0);
+}
+
+if (values.version) {
+  console.log(`tiwi ${VERSION} (${COMMIT})`);
   process.exit(0);
 }
 
 const exeConfigPath = path.join(path.dirname(process.execPath), "config.json");
+
+const isNewerVersion = (latest: string, current: string) => {
+  const a = latest.split(".").map(Number);
+  const b = current.split(".").map(Number);
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const diff = (a[i] ?? 0) - (b[i] ?? 0);
+    if (diff !== 0) return diff > 0;
+  }
+  return false;
+};
+
+const fetchLatestRelease = async (timeoutMs = 3000) => {
+  const res = await fetch(`https://github.com/${REPO}/releases/latest`, {
+    redirect: "manual",
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  const loc = res.headers.get("location");
+  const tag = loc?.match(/\/releases\/tag\/([^/?#]+)$/)?.[1];
+  if (!tag) return null;
+  return { tag, version: tag.replace(/^v/, "") };
+};
+
+const verifySha256 = (data: Uint8Array, sumsText: string, filename: string) => {
+  const line = sumsText
+    .split(/\r?\n/)
+    .find(
+      (l) =>
+        l.trim().endsWith(` ${filename}`) || l.trim().endsWith(`*${filename}`),
+    );
+  if (!line) throw new Error(`Checksum entry not found for ${filename}`);
+  const expected = line.trim().split(/\s+/)[0]!.toLowerCase();
+  const actual = new Bun.CryptoHasher("sha256")
+    .update(data)
+    .digest("hex")
+    .toLowerCase();
+  if (actual !== expected) {
+    throw new Error(
+      `Checksum mismatch for ${filename} (expected ${expected}, got ${actual})`,
+    );
+  }
+};
+
+if (positionals[0] === "update") {
+  if (BUILD_CHANNEL === "dev") {
+    console.log("Running from source (dev) — update via git pull.");
+    process.exit(0);
+  }
+
+  let latest: { tag: string; version: string } | null = null;
+  try {
+    latest = await fetchLatestRelease(10_000);
+  } catch (err) {
+    console.error(
+      `Failed to check for updates: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    process.exit(1);
+  }
+
+  if (!latest) {
+    console.error("No published releases found.");
+    process.exit(1);
+  }
+
+  if (!isNewerVersion(latest.version, VERSION)) {
+    console.log(`tiwi is already up to date (${VERSION}).`);
+    process.exit(0);
+  }
+
+  console.log(`Updating tiwi ${VERSION} -> ${latest.version}...`);
+
+  if (BUILD_CHANNEL === "npm") {
+    const proc = Bun.spawnSync([process.execPath, "add", "-g", "tiwi@latest"], {
+      stdio: ["inherit", "inherit", "inherit"],
+    });
+    process.exit(proc.exitCode);
+  }
+
+  if (process.platform !== "win32") {
+    console.error(
+      `Self-update is only supported for Windows binaries or Bun/npm installs.`,
+    );
+    process.exit(1);
+  }
+
+  const baseUrl = `https://github.com/${REPO}/releases/download/${latest.tag}`;
+  const sumsRes = await fetch(`${baseUrl}/SHA256SUMS.txt`, {
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!sumsRes.ok) {
+    console.error(`Failed to download SHA256SUMS.txt (${sumsRes.status})`);
+    process.exit(1);
+  }
+  const sumsText = await sumsRes.text();
+
+  const isPortable = fs.existsSync(exeConfigPath);
+  const asset = isPortable
+    ? "tiwi-windows-x64-portable.zip"
+    : "tiwi-windows-x64.msi";
+  const assetRes = await fetch(`${baseUrl}/${asset}`, {
+    signal: AbortSignal.timeout(120_000),
+  });
+  if (!assetRes.ok) {
+    console.error(`Failed to download ${asset} (${assetRes.status})`);
+    process.exit(1);
+  }
+  const assetBytes = new Uint8Array(await assetRes.arrayBuffer());
+  verifySha256(assetBytes, sumsText, asset);
+
+  if (isPortable) {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "tiwi-update-"));
+    try {
+      const zipPath = path.join(tmpDir, asset);
+      fs.writeFileSync(zipPath, assetBytes);
+      const extract = Bun.spawnSync(
+        ["tar", "-xf", zipPath, "-C", tmpDir, "tiwi.exe"],
+        { stdio: ["ignore", "pipe", "pipe"] },
+      );
+      if (extract.exitCode !== 0) {
+        throw new Error(
+          `Failed to extract tiwi.exe: ${extract.stderr.toString().trim()}`,
+        );
+      }
+      const newExe = path.join(tmpDir, "tiwi.exe");
+      const oldExe = `${process.execPath}.old`;
+      fs.rmSync(oldExe, { force: true });
+      fs.renameSync(process.execPath, oldExe);
+      try {
+        fs.copyFileSync(newExe, process.execPath);
+      } catch (err) {
+        fs.renameSync(oldExe, process.execPath);
+        throw err;
+      }
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+    console.log(
+      `Updated tiwi to ${latest.version}. Restart tiwi to use the new version.`,
+    );
+    process.exit(0);
+  } else {
+    const msiPath = path.join(
+      os.tmpdir(),
+      `tiwi-${latest.version}-windows-x64.msi`,
+    );
+    fs.writeFileSync(msiPath, assetBytes);
+    const child = Bun.spawn(["msiexec", "/i", msiPath, "/passive"], {
+      stdio: ["ignore", "ignore", "ignore"],
+    });
+    child.unref();
+    console.log(`Launching installer for tiwi ${latest.version}...`);
+    process.exit(0);
+  }
+}
+
 const appDataDir =
   process.platform === "win32"
     ? path.join(
@@ -686,7 +878,7 @@ if (useTui) {
 } else {
   console.info(
     [
-      `[Daemon] ready (port=${port}, rtx=${rtx ? "on" : "off"}, workers=${WORKER_COUNT})`,
+      `[Daemon] ready (version=${VERSION}, port=${port}, rtx=${rtx ? "on" : "off"}, workers=${WORKER_COUNT})`,
       `  Config:    ${configPath}`,
       `  Dashboard: http://127.0.0.1:${port}/`,
       `  WHIP:      http://127.0.0.1:${port}/whip`,
@@ -695,6 +887,29 @@ if (useTui) {
       `  Stream ID: ${streamId}`,
     ].join("\n"),
   );
+}
+
+// Non-blocking startup update check
+if (
+  BUILD_CHANNEL !== "dev" &&
+  values["update-check"] !== false &&
+  process.env.TIWI_NO_UPDATE_CHECK !== "1"
+) {
+  fetchLatestRelease()
+    .then((latest) => {
+      if (!latest || !isNewerVersion(latest.version, VERSION)) return;
+      if (useTui) {
+        process.stdout.write(
+          `\r\x1b[2KUpdate available: ${VERSION} -> ${latest.version} (run 'tiwi update')\n\n`,
+        );
+        renderStatusLine();
+      } else {
+        console.info(
+          `[Update] ${VERSION} -> ${latest.version} available (run 'tiwi update')`,
+        );
+      }
+    })
+    .catch(() => {});
 }
 
 // 5. Listen for encrypted peer Offers over public MQTT
