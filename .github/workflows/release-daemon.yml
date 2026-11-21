@@ -119,7 +119,7 @@ jobs:
             release/tiwi-windows-x64.msi \
             release/tiwi-windows-x64-portable.zip \
             release/SHA256SUMS.txt \
-            --title "tiwi ${{ needs.prepare.outputs.tag }}" \
+            --title "Tiwi ${{ needs.prepare.outputs.tag }}" \
             --generate-notes
 
   publish-npm:
