@@ -741,7 +741,8 @@ const scheduleStats = () => {
 scheduleStats();
 
 // 4. Start local WHIP + WebSocket server (http://127.0.0.1:2000)
-Bun.serve({
+try {
+  Bun.serve({
   port,
   hostname: "127.0.0.1",
   async fetch(req, server) {
@@ -866,7 +867,16 @@ Bun.serve({
       wsClients.delete(ws);
     },
   },
-});
+  });
+} catch (err) {
+  if ((err as { code?: string })?.code === "EADDRINUSE") {
+    process.stderr.write(
+      `Error: Port ${port} is already in use. Is another tiwi instance running? (Use --port <port> to pick another)\n`,
+    );
+    process.exit(1);
+  }
+  throw err;
+}
 
 const viewerBaseUrl =
   BUILD_CHANNEL === "dev"
