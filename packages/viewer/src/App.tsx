@@ -2,7 +2,11 @@
 import playFilledIcon from "@carbon/icons/es/play--filled--alt/16.js";
 import { createSignal, For, onCleanup, onMount } from "solid-js";
 import { Dynamic } from "solid-js/web";
-import { startViewer } from "./viewer.ts";
+import {
+  startViewer,
+  type ViewerController,
+  type ViewerState,
+} from "./viewer.ts";
 
 interface CarbonIconDescriptor {
   attrs: Record<string, string | number>;
@@ -25,9 +29,11 @@ function CarbonIcon(props: { icon: CarbonIconDescriptor; class?: string }) {
 }
 
 export default function App() {
-  const [status, setStatus] = createSignal("Initializing...");
+  const [viewerState, setViewerState] = createSignal<ViewerState>("connecting");
   const [loading, setLoading] = createSignal(true);
-  const [paused, setPaused] = createSignal(true);
+  const [videoPaused, setVideoPaused] = createSignal(true);
+  const paused = () =>
+    viewerState() === "paused" || (viewerState() === "live" && videoPaused());
   const [muted, setMuted] = createSignal(true);
   const [volume, setVolume] = createSignal(1);
   const [fullscreen, setFullscreen] = createSignal(false);
@@ -35,6 +41,7 @@ export default function App() {
   const [touchControls, setTouchControls] = createSignal(false);
   let containerRef!: HTMLDivElement;
   let videoRef!: HTMLVideoElement;
+  let viewer: ViewerController | undefined;
   let clickTimer: ReturnType<typeof setTimeout> | undefined;
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
   let touchTimer: ReturnType<typeof setTimeout> | undefined;
@@ -75,10 +82,10 @@ export default function App() {
   };
 
   const togglePlay = () => {
-    if (videoRef.paused) {
-      void videoRef.play();
+    if (paused()) {
+      viewer?.play();
     } else {
-      videoRef.pause();
+      viewer?.pause();
     }
   };
 
@@ -111,8 +118,7 @@ export default function App() {
   };
 
   onMount(() => {
-    void startViewer(videoRef, setStatus);
-    void videoRef.play().catch(() => {});
+    viewer = startViewer(videoRef, setViewerState);
     const onFullscreenChange = () => {
       const isFs = Boolean(document.fullscreenElement);
       setFullscreen(isFs);
@@ -133,6 +139,7 @@ export default function App() {
     };
     document.addEventListener("fullscreenchange", onFullscreenChange);
     onCleanup(() => {
+      viewer?.destroy();
       clearTimeout(idleTimer);
       clearTimeout(touchTimer);
       clearTimeout(clickTimer);
@@ -157,13 +164,14 @@ export default function App() {
           onClick={onVideoClick}
           onDblClick={onVideoDblClick}
           onPlay={() => {
-            setPaused(false);
+            setVideoPaused(false);
             setLoading(true);
           }}
           onPlaying={() => setLoading(false)}
           onWaiting={() => setLoading(true)}
           onPause={() => {
-            setPaused(true);
+            if (!videoRef.paused) return;
+            setVideoPaused(true);
             setLoading(false);
           }}
           onVolumeChange={() => {
@@ -177,7 +185,8 @@ export default function App() {
 
         <div
           class={`vhs-scanlines pointer-events-none absolute inset-0 transition-opacity duration-300 ease-out ${
-            loading() || (status() !== "Live" && status() !== "Paused")
+            (!paused() && loading()) ||
+            (viewerState() !== "live" && viewerState() !== "paused")
               ? "opacity-100"
               : "opacity-0"
           }`}

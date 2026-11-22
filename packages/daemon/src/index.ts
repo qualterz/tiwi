@@ -475,6 +475,7 @@ const workerSlots: WorkerSlot[] = Array.from({ length: WORKER_COUNT }, () => {
         aesKey,
         new TextEncoder().encode(JSON.stringify({ sdp: answerSdp })),
       );
+      if (!client?.connected || client.disconnecting) return;
       client.publish(
         `stream/${streamId}/answer/${viewerId}`,
         JSON.stringify({
@@ -504,6 +505,25 @@ const broadcastCodecToWorkers = (codec: RTCRtpCodecParameters) => {
   for (const slot of workerSlots) {
     slot.worker.postMessage({ type: "codec", videoCodec: serialized });
   }
+};
+
+const publishEvent = async (type: "start" | "stop") => {
+  if (!client?.connected || client.disconnecting) return;
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const cipher = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    aesKey,
+    new TextEncoder().encode(JSON.stringify({ type })),
+  );
+  if (!client.connected || client.disconnecting) return;
+  client.publish(
+    eventsTopic,
+    JSON.stringify({
+      iv: Buffer.from(iv).toString("base64url"),
+      data: Buffer.from(cipher).toString("base64url"),
+    }),
+  );
+  console.info(`[MQTT] published event ${type}`);
 };
 
 const requestWorkerStats = (slot: WorkerSlot) => {
@@ -700,106 +720,115 @@ const broadcastWs = (payload: unknown) => {
 const scheduleStats = () => {
   setTimeout(
     async () => {
-      metrics.uptimeSec = Math.round(
-        (performance.now() - serverStartedAtMs) / 1000,
-      );
-      metrics.peers.activeCount = peerToWorker.size;
+      try {
+        metrics.uptimeSec = Math.round(
+          (performance.now() - serverStartedAtMs) / 1000,
+        );
+        metrics.peers.activeCount = peerToWorker.size;
 
-      if (activeObsPc && activeObsPc.connectionState !== "closed") {
-        metrics.obs.connectionState = activeObsPc.connectionState;
-        metrics.obs.codec = activeVideoCodec.mimeType;
-        const report = await activeObsPc.getStats();
-        for (const s of report.values()) {
-          if (s.type === "inbound-rtp") {
-            const r = s as RTCInboundRtpStreamStats;
-            const bytes = r.bytesReceived ?? 0;
-            const packets = r.packetsReceived ?? 0;
-            const { kbps, pps, avgKbps } = computeRates(
-              `obs:${r.id}`,
-              r.timestamp,
-              bytes,
-              packets,
-            );
-            const target =
-              r.kind === "video" ? metrics.obs.video : metrics.obs.audio;
-            target.ssrc = r.ssrc;
-            target.kbps = kbps;
-            target.peakKbps = Math.max(target.peakKbps, kbps);
-            target.avgKbps = avgKbps;
-            target.pps = pps;
-            target.packetsReceived = packets;
-            target.bytesReceived = bytes;
-            target.packetsLost = r.packetsLost ?? 0;
-            target.jitterMs = Math.round((r.jitter ?? 0) * 1000);
-            if (r.kind === "video") {
-              metrics.obs.video.nackCount = r.nackCount ?? 0;
-              metrics.obs.video.pliCount = r.pliCount ?? 0;
+        if (activeObsPc && activeObsPc.connectionState !== "closed") {
+          metrics.obs.connectionState = activeObsPc.connectionState;
+          metrics.obs.codec = activeVideoCodec.mimeType;
+          const report = await activeObsPc.getStats();
+          for (const s of report.values()) {
+            if (s.type === "inbound-rtp") {
+              const r = s as RTCInboundRtpStreamStats;
+              const bytes = r.bytesReceived ?? 0;
+              const packets = r.packetsReceived ?? 0;
+              const { kbps, pps, avgKbps } = computeRates(
+                `obs:${r.id}`,
+                r.timestamp,
+                bytes,
+                packets,
+              );
+              const target =
+                r.kind === "video" ? metrics.obs.video : metrics.obs.audio;
+              target.ssrc = r.ssrc;
+              target.kbps = kbps;
+              target.peakKbps = Math.max(target.peakKbps, kbps);
+              target.avgKbps = avgKbps;
+              target.pps = pps;
+              target.packetsReceived = packets;
+              target.bytesReceived = bytes;
+              target.packetsLost = r.packetsLost ?? 0;
+              target.jitterMs = Math.round((r.jitter ?? 0) * 1000);
+              if (r.kind === "video") {
+                metrics.obs.video.nackCount = r.nackCount ?? 0;
+                metrics.obs.video.pliCount = r.pliCount ?? 0;
+              }
             }
           }
+        } else {
+          metrics.obs.video.kbps = 0;
+          metrics.obs.video.pps = 0;
+          metrics.obs.audio.kbps = 0;
+          metrics.obs.audio.pps = 0;
         }
-      }
 
-      const activeSessions = (
-        await Promise.all(workerSlots.map(requestWorkerStats))
-      ).flat();
-      lastActiveSessions = activeSessions;
+        const activeSessions = (
+          await Promise.all(workerSlots.map(requestWorkerStats))
+        ).flat();
+        lastActiveSessions = activeSessions;
 
-      let connectedPeers = 0;
-      let congestedPeers = 0;
-      for (const pm of activeSessions) {
-        metrics.peers.sessions[pm.viewerId] = pm;
-        if (pm.connectionState !== "connected") continue;
-        connectedPeers++;
-        if (pm.video.remoteFractionLost >= 0.05 || isPeerRttSpiked(pm)) {
-          congestedPeers++;
-        }
-      }
-      const nextCongested =
-        connectedPeers >= 2 && congestedPeers > connectedPeers / 2;
-      if (nextCongested !== uplinkCongested) {
-        uplinkCongested = nextCongested;
-        console.warn(
-          uplinkCongested
-            ? `[Uplink] saturated (${congestedPeers}/${connectedPeers} peers congested) — pausing new peer joins`
-            : `[Uplink] recovered — accepting new peers`,
-        );
-      }
-
-      if (useTui) {
-        renderStatusLine();
-      } else if (activeObsPc || peerToWorker.size > 0) {
-        const o = metrics.obs;
-        const lines = [
-          `[Metrics] up=${metrics.uptimeSec}s rtx=${rtx ? "on" : "off"} workers=${WORKER_COUNT} peers=${metrics.peers.activeCount} (ok=${metrics.peers.totalAccepted} rej=${metrics.peers.totalRejected} drop=${metrics.peers.totalFailedOrDisconnected})${uplinkCongested ? " [CONGESTED]" : ""}`,
-          `  WHIP [${o.connectionState}] ${o.codec} | vid ${o.video.kbps}kbps (${o.video.pps}pps, lost=${o.video.packetsLost}, jit=${o.video.jitterMs}ms, nack=${o.video.nackCount}, pli=${o.video.pliCount}) | aud ${o.audio.kbps}kbps (${o.audio.pps}pps, lost=${o.audio.packetsLost})`,
-        ];
+        let connectedPeers = 0;
+        let congestedPeers = 0;
         for (const pm of activeSessions) {
-          const rtt = pm.transport.rttMs ?? pm.video.remoteRttMs;
-          const minRtt =
-            pm.transport.rttMs != null
-              ? pm.transport.minRttMs
-              : pm.video.remoteMinRttMs;
-          const avgRtt =
-            pm.transport.rttMs != null
-              ? pm.transport.avgRttMs
-              : pm.video.remoteAvgRttMs;
-          lines.push(
-            `  Peer ${pm.viewerId.slice(0, 6)} [${pm.connectionState}/${pm.iceConnectionState}] rtt=${rtt ?? "-"}ms (min=${minRtt ?? "-"}ms avg=${avgRtt ?? "-"}ms) ${pm.transport.protocol ?? "-"} ${pm.transport.localCandidate ?? "-"} -> ${pm.transport.remoteCandidate ?? "-"}`,
-            `    vid ${pm.video.kbps}kbps (${pm.video.pps}pps, lost=${pm.video.remotePacketsLost}/${(pm.video.remoteFractionLost * 100).toFixed(1)}%, rtx=${pm.video.retransmittedPacketsSent}, nack=${pm.video.nackCount}, pli=${pm.video.pliCount}) | aud ${pm.audio.kbps}kbps (${pm.audio.pps}pps, lost=${pm.audio.remotePacketsLost})`,
+          metrics.peers.sessions[pm.viewerId] = pm;
+          if (pm.connectionState !== "connected") continue;
+          connectedPeers++;
+          if (pm.video.remoteFractionLost >= 0.05 || isPeerRttSpiked(pm)) {
+            congestedPeers++;
+          }
+        }
+        const nextCongested =
+          connectedPeers >= 2 && congestedPeers > connectedPeers / 2;
+        if (nextCongested !== uplinkCongested) {
+          uplinkCongested = nextCongested;
+          console.warn(
+            uplinkCongested
+              ? `[Uplink] saturated (${congestedPeers}/${connectedPeers} peers congested) — pausing new peer joins`
+              : `[Uplink] recovered — accepting new peers`,
           );
         }
-        console.info(lines.join("\n"));
+
+        if (useTui) {
+          renderStatusLine();
+        } else if (activeObsPc || peerToWorker.size > 0) {
+          const o = metrics.obs;
+          const lines = [
+            `[Metrics] up=${metrics.uptimeSec}s rtx=${rtx ? "on" : "off"} workers=${WORKER_COUNT} peers=${metrics.peers.activeCount} (ok=${metrics.peers.totalAccepted} rej=${metrics.peers.totalRejected} drop=${metrics.peers.totalFailedOrDisconnected})${uplinkCongested ? " [CONGESTED]" : ""}`,
+            `  WHIP [${o.connectionState}] ${o.codec} | vid ${o.video.kbps}kbps (${o.video.pps}pps, lost=${o.video.packetsLost}, jit=${o.video.jitterMs}ms, nack=${o.video.nackCount}, pli=${o.video.pliCount}) | aud ${o.audio.kbps}kbps (${o.audio.pps}pps, lost=${o.audio.packetsLost})`,
+          ];
+          for (const pm of activeSessions) {
+            const rtt = pm.transport.rttMs ?? pm.video.remoteRttMs;
+            const minRtt =
+              pm.transport.rttMs != null
+                ? pm.transport.minRttMs
+                : pm.video.remoteMinRttMs;
+            const avgRtt =
+              pm.transport.rttMs != null
+                ? pm.transport.avgRttMs
+                : pm.video.remoteAvgRttMs;
+            lines.push(
+              `  Peer ${pm.viewerId.slice(0, 6)} [${pm.connectionState}/${pm.iceConnectionState}] rtt=${rtt ?? "-"}ms (min=${minRtt ?? "-"}ms avg=${avgRtt ?? "-"}ms) ${pm.transport.protocol ?? "-"} ${pm.transport.localCandidate ?? "-"} -> ${pm.transport.remoteCandidate ?? "-"}`,
+              `    vid ${pm.video.kbps}kbps (${pm.video.pps}pps, lost=${pm.video.remotePacketsLost}/${(pm.video.remoteFractionLost * 100).toFixed(1)}%, rtx=${pm.video.retransmittedPacketsSent}, nack=${pm.video.nackCount}, pli=${pm.video.pliCount}) | aud ${pm.audio.kbps}kbps (${pm.audio.pps}pps, lost=${pm.audio.remotePacketsLost})`,
+            );
+          }
+          console.info(lines.join("\n"));
+        }
+
+        broadcastWs({
+          type: "metrics",
+          rtx,
+          uplinkCongested,
+          metrics,
+          activeSessions,
+        });
+      } catch (err) {
+        console.error("[Metrics] stats loop error:", err);
+      } finally {
+        scheduleStats();
       }
-
-      broadcastWs({
-        type: "metrics",
-        rtx,
-        uplinkCongested,
-        metrics,
-        activeSessions,
-      });
-
-      scheduleStats();
     },
     METRICS_INTERVAL_MS - (Date.now() % METRICS_INTERVAL_MS),
   );
@@ -829,9 +858,14 @@ try {
         metrics.obs.lastConnectedAt = new Date().toISOString();
         metrics.obs.connectionState = obsPc.connectionState;
 
+        let obsWasConnected = false;
         obsPc.connectionStateChange.subscribe((state) => {
           metrics.obs.connectionState = state;
           console.info(`[WHIP] ${state}`);
+          if (state === "connected" && activeObsPc === obsPc) {
+            obsWasConnected = true;
+            void publishEvent("start");
+          }
           if (
             (state === "closed" ||
               state === "failed" ||
@@ -839,6 +873,19 @@ try {
             activeObsPc === obsPc
           ) {
             activeObsPc = null;
+            obsVideoReceiver = null;
+            obsVideoSsrc = undefined;
+            for (const slot of workerSlots) {
+              slot.worker.postMessage({
+                type: "closeAll",
+                reason: `whip-${state}`,
+                notify: true,
+              });
+            }
+            if (obsWasConnected) {
+              obsWasConnected = false;
+              void publishEvent("stop");
+            }
           }
         });
 
@@ -857,8 +904,14 @@ try {
                   (c) => c.payloadType === rtp.header.payloadType,
                 );
                 if (matched) {
+                  const codecChanged =
+                    matched.mimeType !== activeVideoCodec.mimeType ||
+                    matched.parameters !== activeVideoCodec.parameters;
                   activeVideoCodec = matched;
-                  broadcastCodecToWorkers(matched);
+                  if (codecChanged) {
+                    broadcastCodecToWorkers(matched);
+                    void publishEvent("start");
+                  }
                   console.info(
                     `[WHIP] codec ${matched.mimeType} (pt=${matched.payloadType})`,
                   );
@@ -909,6 +962,13 @@ try {
             "Location": "/whip/session",
           },
         });
+      }
+
+      if (req.method === "DELETE" && url.pathname === "/whip/session") {
+        if (activeObsPc) {
+          await activeObsPc.close();
+        }
+        return new Response(null, { status: 200 });
       }
 
       return new Response("Not Found", { status: 404 });
@@ -1002,20 +1062,32 @@ if (
 // 5. Listen for encrypted peer Offers over public MQTT
 const client = mqtt.connect("wss://broker.emqx.io:8084/mqtt");
 const offerTopic = `stream/${streamId}/offer`;
+const eventsTopic = `stream/${streamId}/events`;
 
 client.on("connect", () => {
   client.subscribe(offerTopic, (err) => {
-    if (err) console.error(`[MQTT] subscribe error: ${err}`);
+    if (err) {
+      console.error(`[MQTT] subscribe error: ${err}`);
+      return;
+    }
+    console.info("[MQTT] connected");
+    if (activeObsPc?.connectionState === "connected") {
+      void publishEvent("start");
+    }
   });
-  console.info("[MQTT] connected");
 });
 
+client.on("offline", () => console.warn("[MQTT] offline"));
 client.on("error", (err) => console.error(`[MQTT] error: ${err}`));
 
 client.on("message", async (_topic, rawPayload) => {
   try {
     const { viewerId, iv, data } = JSON.parse(rawPayload.toString());
     if (!viewerId) return;
+    if (!activeObsPc || activeObsPc.connectionState !== "connected") {
+      metrics.peers.totalRejected++;
+      return;
+    }
     const inKbps = metrics.obs.video.kbps + metrics.obs.audio.kbps;
     const rejectReason = peerToWorker.has(viewerId)
       ? "duplicate"
@@ -1068,3 +1140,30 @@ client.on("message", async (_topic, rawPayload) => {
     console.warn(`[MQTT] ignored invalid offer: ${err}`);
   }
 });
+
+let shuttingDown = false;
+const shutdown = async (signal: string) => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.info(
+    `[Daemon] shutting down (${signal}, closing ${peerToWorker.size} active peers)`,
+  );
+  setTimeout(() => process.exit(0), 500).unref();
+  const wasLive = activeObsPc?.connectionState === "connected";
+  for (const slot of workerSlots) {
+    slot.worker.postMessage({ type: "closeAll" });
+  }
+  if (activeObsPc) {
+    const obsPc = activeObsPc;
+    activeObsPc = null;
+    obsVideoReceiver = null;
+    obsVideoSsrc = undefined;
+    await obsPc.close().catch(() => {});
+  }
+  if (wasLive) {
+    await publishEvent("stop");
+  }
+  client.end(false, () => process.exit(0));
+};
+process.on("SIGINT", () => void shutdown("SIGINT"));
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
