@@ -185,8 +185,10 @@ export default function App() {
 
         <div
           class={`vhs-scanlines pointer-events-none absolute inset-0 transition-opacity duration-300 ease-out ${
-            (!paused() && loading()) ||
-            (viewerState() !== "live" && viewerState() !== "paused")
+            viewerState() === "waiting" ||
+            viewerState() === "connecting" ||
+            viewerState() === "disconnected" ||
+            (viewerState() === "live" && !paused() && loading())
               ? "opacity-100"
               : "opacity-0"
           }`}
