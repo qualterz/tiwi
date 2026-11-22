@@ -14,7 +14,8 @@
     "build:viewer": "bun run --filter @tiwi/viewer build",
     "typecheck": "bun run --filter '*' typecheck",
     "format": "prettier --write . --ignore-path .gitignore",
-    "format:check": "prettier --check . --ignore-path .gitignore"
+    "format:check": "prettier --check . --ignore-path .gitignore",
+    "prepare": "git config core.hooksPath .githooks"
   },
   "devDependencies": {
     "@types/bun": "latest",
