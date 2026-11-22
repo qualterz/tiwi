@@ -116,6 +116,7 @@ const sharedAudioTrack = new MediaStreamTrack({
 const peers = new Map<string, RTCPeerConnection>();
 const peerMetricsMap = new Map<string, PeerMetrics>();
 const handshakeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const prevVideoLoss = new Map<string, { lost: number; sent: number }>();
 
 const HANDSHAKE_TIMEOUT_MS = 15_000;
 const ICE_GATHER_TIMEOUT_MS = 5_000;
@@ -129,6 +130,7 @@ const cleanupPeer = (viewerId: string, state: string) => {
   const pc = peers.get(viewerId);
   if (!pc) return;
   peers.delete(viewerId);
+  prevVideoLoss.delete(viewerId);
   const pm = peerMetricsMap.get(viewerId);
   if (pm) {
     pm.disconnectedAt ??= new Date().toISOString();
@@ -234,7 +236,10 @@ self.onmessage = async (event: MessageEvent) => {
       peers.set(viewerId, pc);
       handshakeTimers.set(
         viewerId,
-        setTimeout(() => cleanupPeer(viewerId, "timeout"), HANDSHAKE_TIMEOUT_MS),
+        setTimeout(
+          () => cleanupPeer(viewerId, "timeout"),
+          HANDSHAKE_TIMEOUT_MS,
+        ),
       );
       const pm: PeerMetrics = {
         viewerId,
@@ -383,6 +388,14 @@ self.onmessage = async (event: MessageEvent) => {
       await pc.setRemoteDescription({ type: "offer", sdp: offerSdp });
       await pc.setLocalDescription(await pc.createAnswer());
 
+      for (const dtls of pc.dtlsTransports) {
+        dtls.onStateChange.subscribe((state) => {
+          if (state === "closed" || state === "failed") {
+            cleanupPeer(viewerId, `dtls-${state}`);
+          }
+        });
+      }
+
       if (pc.iceGatheringState !== "complete") {
         await new Promise<void>((resolve) => {
           const gatherTimer = setTimeout(resolve, ICE_GATHER_TIMEOUT_MS);
@@ -417,6 +430,11 @@ self.onmessage = async (event: MessageEvent) => {
       const s = pc.connectionState;
       if (s === "closed" || s === "failed" || s === "disconnected") {
         cleanupPeer(viewerId, s);
+      } else {
+        const closedDtls = pc.dtlsTransports.find(
+          (d) => d.state === "closed" || d.state === "failed",
+        );
+        if (closedDtls) cleanupPeer(viewerId, `dtls-${closedDtls.state}`);
       }
     }
     const entries = [...peers.entries()];
@@ -428,6 +446,10 @@ self.onmessage = async (event: MessageEvent) => {
         pm.iceConnectionState = pc.iceConnectionState;
 
         const report = await pc.getStats();
+        let selectedPairId: string | undefined;
+        let fallbackPair: RTCIceCandidatePairStats | undefined;
+        let rawFractionLost: number | null = null;
+        let hasRemoteVideo = false;
         for (const s of report.values()) {
           if (s.type === "outbound-rtp") {
             const r = s as RTCOutboundRtpStreamStats;
@@ -463,6 +485,9 @@ self.onmessage = async (event: MessageEvent) => {
             }
           } else if (s.type === "remote-inbound-rtp") {
             const r = s as RTCRemoteInboundRtpStreamStats;
+            const rawLost = r.packetsLost ?? 0;
+            const packetsLost =
+              rawLost >= 0x800000 ? rawLost - 0x1000000 : rawLost;
             const rttMs =
               r.roundTripTime != null
                 ? Math.round(r.roundTripTime * 1000)
@@ -473,10 +498,9 @@ self.onmessage = async (event: MessageEvent) => {
                 ? Math.round((r.totalRoundTripTime / measurements) * 1000)
                 : rttMs;
             if (r.kind === "video") {
-              pm.video.remotePacketsLost = r.packetsLost ?? 0;
-              pm.video.remoteFractionLost = Number(
-                (r.fractionLost ?? 0).toFixed(4),
-              );
+              pm.video.remotePacketsLost = packetsLost;
+              rawFractionLost = r.fractionLost ?? 0;
+              hasRemoteVideo = true;
               pm.video.remoteRttMs = rttMs;
               pm.video.remoteAvgRttMs = avgRttMs;
               if (rttMs != null) {
@@ -486,52 +510,80 @@ self.onmessage = async (event: MessageEvent) => {
                     : Math.min(pm.video.remoteMinRttMs, rttMs);
               }
             } else if (r.kind === "audio") {
-              pm.audio.remotePacketsLost = r.packetsLost ?? 0;
+              pm.audio.remotePacketsLost = packetsLost;
               pm.audio.remoteRttMs = rttMs;
               pm.audio.remoteAvgRttMs = avgRttMs;
             }
-          } else if (
-            s.type === "candidate-pair" &&
-            ((s as RTCIceCandidatePairStats).nominated ||
-              (s as RTCIceCandidatePairStats).state === "succeeded")
-          ) {
+          } else if (s.type === "transport") {
+            const id = (s as { selectedCandidatePairId?: string })
+              .selectedCandidatePairId;
+            if (id) selectedPairId = id;
+          } else if (s.type === "candidate-pair") {
             const pair = s as RTCIceCandidatePairStats;
-            const local = report.get(pair.localCandidateId) as
-              Record<string, unknown> | undefined;
-            const remote = report.get(pair.remoteCandidateId) as
-              Record<string, unknown> | undefined;
-            const rttMs =
-              pair.currentRoundTripTime != null
-                ? Math.round(pair.currentRoundTripTime * 1000)
-                : null;
-            const measurements = pair.roundTripTimeMeasurements ?? 0;
-            const avgRttMs =
-              measurements > 0 && pair.totalRoundTripTime != null
-                ? Math.round((pair.totalRoundTripTime / measurements) * 1000)
-                : rttMs;
-            pm.transport.localCandidate = local
-              ? `${local.address}:${local.port} (${local.candidateType})`
-              : null;
-            pm.transport.remoteCandidate = remote
-              ? `${remote.address}:${remote.port} (${remote.candidateType})`
-              : null;
-            pm.transport.candidateType =
-              (local?.candidateType as string | undefined) ?? null;
-            pm.transport.protocol =
-              (local?.protocol as string | undefined) ?? null;
-            pm.transport.rttMs = rttMs;
-            pm.transport.avgRttMs = avgRttMs;
-            if (rttMs != null) {
-              pm.transport.minRttMs =
-                pm.transport.minRttMs == null
-                  ? rttMs
-                  : Math.min(pm.transport.minRttMs, rttMs);
+            if (
+              !fallbackPair?.nominated &&
+              (pair.nominated || (!fallbackPair && pair.state === "succeeded"))
+            ) {
+              fallbackPair = pair;
             }
-            pm.transport.oneWayPingMs =
-              rttMs != null ? Math.round(rttMs / 2) : null;
-            pm.transport.bytesSent = pair.bytesSent ?? 0;
-            pm.transport.packetsSent = pair.packetsSent ?? 0;
           }
+        }
+
+        if (hasRemoteVideo) {
+          const prev = prevVideoLoss.get(viewerId);
+          const curLost = pm.video.remotePacketsLost;
+          const curSent = pm.video.packetsSent;
+          let frac = rawFractionLost ?? 0;
+          if (prev) {
+            const dLost = Math.max(0, curLost - prev.lost);
+            const dSent = curSent - prev.sent;
+            frac = dSent > 0 ? Math.min(1, dLost / dSent) : 0;
+          }
+          prevVideoLoss.set(viewerId, { lost: curLost, sent: curSent });
+          pm.video.remoteFractionLost = Number(frac.toFixed(4));
+        }
+
+        const pair =
+          (selectedPairId
+            ? (report.get(selectedPairId) as
+                RTCIceCandidatePairStats | undefined)
+            : undefined) ?? fallbackPair;
+        if (pair) {
+          const local = report.get(pair.localCandidateId) as
+            Record<string, unknown> | undefined;
+          const remote = report.get(pair.remoteCandidateId) as
+            Record<string, unknown> | undefined;
+          const rttMs =
+            pair.currentRoundTripTime != null
+              ? Math.round(pair.currentRoundTripTime * 1000)
+              : null;
+          const measurements = pair.roundTripTimeMeasurements ?? 0;
+          const avgRttMs =
+            measurements > 0 && pair.totalRoundTripTime != null
+              ? Math.round((pair.totalRoundTripTime / measurements) * 1000)
+              : rttMs;
+          pm.transport.localCandidate = local
+            ? `${local.address}:${local.port} (${local.candidateType})`
+            : null;
+          pm.transport.remoteCandidate = remote
+            ? `${remote.address}:${remote.port} (${remote.candidateType})`
+            : null;
+          pm.transport.candidateType =
+            (local?.candidateType as string | undefined) ?? null;
+          pm.transport.protocol =
+            (local?.protocol as string | undefined) ?? null;
+          pm.transport.rttMs = rttMs;
+          pm.transport.avgRttMs = avgRttMs;
+          if (rttMs != null) {
+            pm.transport.minRttMs =
+              pm.transport.minRttMs == null
+                ? rttMs
+                : Math.min(pm.transport.minRttMs, rttMs);
+          }
+          pm.transport.oneWayPingMs =
+            rttMs != null ? Math.round(rttMs / 2) : null;
+          pm.transport.bytesSent = pair.bytesSent ?? 0;
+          pm.transport.packetsSent = pair.packetsSent ?? 0;
         }
         return pm;
       }),
