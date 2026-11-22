@@ -62,13 +62,15 @@ dgram.createSocket = ((...args: Parameters<typeof dgram.createSocket>) => {
 const { values, positionals } = parseArgs({
   args: Bun.argv.slice(2),
   options: {
-    help: { type: "boolean", short: "h" },
-    version: { type: "boolean", short: "v" },
-    config: { type: "string" },
-    token: { type: "string" },
-    rtx: { type: "boolean" },
-    port: { type: "string" },
-    verbose: { type: "boolean" },
+    "help": { type: "boolean", short: "h" },
+    "version": { type: "boolean", short: "v" },
+    "config": { type: "string" },
+    "token": { type: "string" },
+    "rtx": { type: "boolean" },
+    "port": { type: "string" },
+    "max-peers": { type: "string" },
+    "max-uplink": { type: "string" },
+    "verbose": { type: "boolean" },
     "update-check": { type: "boolean" },
   },
   allowNegative: true,
@@ -86,6 +88,8 @@ Options:
   --token <token>     Override stream token for this run
   --port <port>       Local WHIP/WS server port (default: ${DEFAULT_PORT})
   --rtx / --no-rtx    Enable or disable RTP retransmission (default: on)
+  --max-peers <n>     Max concurrent viewers (default: 0, unlimited)
+  --max-uplink <mbps> Max total upload bitrate in Mbps (default: 0, unlimited)
   --no-update-check   Skip checking for updates on startup
   --verbose           Log full output instead of status line
   -v, --version       Show version
@@ -277,6 +281,8 @@ type DaemonConfig = {
   token?: string;
   port?: number;
   rtx?: boolean;
+  maxPeers?: number;
+  maxUplinkMbps?: number;
 };
 
 let fileConfig: DaemonConfig = {};
@@ -294,12 +300,25 @@ if (!fileConfig.token) {
     ),
     port: fileConfig.port ?? DEFAULT_PORT,
     rtx: fileConfig.rtx ?? true,
+    maxPeers: fileConfig.maxPeers ?? 0,
+    maxUplinkMbps: fileConfig.maxUplinkMbps ?? 0,
   };
   fs.mkdirSync(path.dirname(configPath), { recursive: true });
   fs.writeFileSync(configPath, JSON.stringify(fileConfig, null, 2) + "\n");
 }
 
 const port = Number(values.port ?? fileConfig.port) || DEFAULT_PORT;
+const parseLimit = (raw: string | number | undefined) => {
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+};
+const maxPeers = Math.floor(
+  parseLimit(values["max-peers"] ?? fileConfig.maxPeers),
+);
+const maxUplinkMbps = parseLimit(
+  values["max-uplink"] ?? fileConfig.maxUplinkMbps,
+);
+const maxUplinkKbps = maxUplinkMbps * 1000;
 const useTui = Boolean(process.stdout.isTTY && !values.verbose);
 if (useTui) {
   console.log =
@@ -591,9 +610,31 @@ const percentile = (sorted: number[], p: number) => {
   return sorted[idx]!;
 };
 
+const isPeerRttSpiked = (pm: PeerMetrics) => {
+  const rtt = pm.transport.rttMs ?? pm.video.remoteRttMs;
+  const baseRtt =
+    pm.transport.rttMs != null
+      ? pm.transport.minRttMs
+      : pm.video.remoteMinRttMs;
+  return (
+    rtt != null &&
+    baseRtt != null &&
+    rtt >= baseRtt * 1.5 &&
+    rtt - baseRtt >= 30
+  );
+};
+
+const paint = (text: string, color: "red" | "yellow" | null) =>
+  color === "red"
+    ? `\x1b[31m${text}\x1b[0m`
+    : color === "yellow"
+      ? `\x1b[33m${text}\x1b[0m`
+      : text;
+
 const renderStatusLine = () => {
   if (!useTui) return;
   let outSumKbps = 0;
+  let anyRttSpiked = false;
   const rtts: number[] = [];
   const losses: number[] = [];
   for (const pm of lastActiveSessions) {
@@ -601,17 +642,41 @@ const renderStatusLine = () => {
     if (pm.connectionState !== "connected") continue;
     const rtt = pm.transport.rttMs ?? pm.video.remoteRttMs;
     if (rtt != null) rtts.push(rtt);
+    if (isPeerRttSpiked(pm)) anyRttSpiked = true;
     losses.push(pm.video.remoteFractionLost * 100);
   }
   rtts.sort((a, b) => a - b);
   losses.sort((a, b) => a - b);
 
-  const rttP99 = rtts.length > 0 ? `${percentile(rtts, 99)}ms` : "0ms";
-  const lossP99 =
-    losses.length > 0 ? `${percentile(losses, 99)!.toFixed(1)}%` : "0.0%";
+  const rttP99Val = percentile(rtts, 99);
+  const lossP99Val = percentile(losses, 99) ?? 0;
+  const rttP99 = rttP99Val != null ? `${rttP99Val}ms` : "0ms";
+  const lossP99 = `${lossP99Val.toFixed(1)}%`;
   const inRate = formatBitrate(metrics.obs.video.kbps + metrics.obs.audio.kbps);
   const outRate = formatBitrate(outSumKbps);
-  const line = `${metrics.peers.activeCount} peers · in ${inRate} · out ${outRate} · rtt ${rttP99} · loss ${lossP99} · up ${formatUptime(metrics.uptimeSec)}`;
+
+  const peersText = paint(
+    `${metrics.peers.activeCount} peers`,
+    maxPeers > 0 && metrics.peers.activeCount >= maxPeers ? "yellow" : null,
+  );
+  const outText = paint(
+    `out ${outRate}`,
+    uplinkCongested
+      ? "red"
+      : maxUplinkKbps > 0 && outSumKbps >= maxUplinkKbps * 0.85
+        ? "yellow"
+        : null,
+  );
+  const rttText = paint(
+    `rtt ${rttP99}`,
+    anyRttSpiked ? (uplinkCongested ? "red" : "yellow") : null,
+  );
+  const lossText = paint(
+    `loss ${lossP99}`,
+    lossP99Val >= 5 ? "red" : lossP99Val >= 1 ? "yellow" : null,
+  );
+
+  const line = `${peersText} · in ${inRate} · ${outText} · ${rttText} · ${lossText} · up ${formatUptime(metrics.uptimeSec)}`;
   process.stdout.write(`\r\x1b[2K${line}`);
 };
 
@@ -685,14 +750,7 @@ const scheduleStats = () => {
         metrics.peers.sessions[pm.viewerId] = pm;
         if (pm.connectionState !== "connected") continue;
         connectedPeers++;
-        const rtt = pm.transport.rttMs ?? pm.video.remoteRttMs;
-        const avgRtt = pm.transport.avgRttMs ?? pm.video.remoteAvgRttMs;
-        const rttSpiked =
-          rtt != null &&
-          avgRtt != null &&
-          rtt >= avgRtt * 1.5 &&
-          rtt - avgRtt >= 30;
-        if (pm.video.remoteFractionLost >= 0.05 || rttSpiked) {
+        if (pm.video.remoteFractionLost >= 0.05 || isPeerRttSpiked(pm)) {
           congestedPeers++;
         }
       }
@@ -717,9 +775,16 @@ const scheduleStats = () => {
         ];
         for (const pm of activeSessions) {
           const rtt = pm.transport.rttMs ?? pm.video.remoteRttMs;
-          const avgRtt = pm.transport.avgRttMs ?? pm.video.remoteAvgRttMs;
+          const minRtt =
+            pm.transport.rttMs != null
+              ? pm.transport.minRttMs
+              : pm.video.remoteMinRttMs;
+          const avgRtt =
+            pm.transport.rttMs != null
+              ? pm.transport.avgRttMs
+              : pm.video.remoteAvgRttMs;
           lines.push(
-            `  Peer ${pm.viewerId.slice(0, 6)} [${pm.connectionState}/${pm.iceConnectionState}] rtt=${rtt ?? "-"}ms (avg=${avgRtt ?? "-"}ms) ${pm.transport.protocol ?? "-"} ${pm.transport.localCandidate ?? "-"} -> ${pm.transport.remoteCandidate ?? "-"}`,
+            `  Peer ${pm.viewerId.slice(0, 6)} [${pm.connectionState}/${pm.iceConnectionState}] rtt=${rtt ?? "-"}ms (min=${minRtt ?? "-"}ms avg=${avgRtt ?? "-"}ms) ${pm.transport.protocol ?? "-"} ${pm.transport.localCandidate ?? "-"} -> ${pm.transport.remoteCandidate ?? "-"}`,
             `    vid ${pm.video.kbps}kbps (${pm.video.pps}pps, lost=${pm.video.remotePacketsLost}/${(pm.video.remoteFractionLost * 100).toFixed(1)}%, rtx=${pm.video.retransmittedPacketsSent}, nack=${pm.video.nackCount}, pli=${pm.video.pliCount}) | aud ${pm.audio.kbps}kbps (${pm.audio.pps}pps, lost=${pm.audio.remotePacketsLost})`,
           );
         }
@@ -744,130 +809,132 @@ scheduleStats();
 // 4. Start local WHIP + WebSocket server (http://127.0.0.1:2000)
 try {
   Bun.serve({
-  port,
-  hostname: "127.0.0.1",
-  async fetch(req, server) {
-    const url = new URL(req.url);
+    port,
+    hostname: "127.0.0.1",
+    async fetch(req, server) {
+      const url = new URL(req.url);
 
-    if (url.pathname === "/ws") {
-      if (server.upgrade(req)) return undefined;
-      return new Response("WebSocket upgrade failed", { status: 400 });
-    }
-
-    if (req.method === "POST" && url.pathname === "/whip") {
-      if (activeObsPc) {
-        await activeObsPc.close();
+      if (url.pathname === "/ws") {
+        if (server.upgrade(req)) return undefined;
+        return new Response("WebSocket upgrade failed", { status: 400 });
       }
-      const obsPc = new RTCPeerConnection({ codecs: supportedCodecs });
-      activeObsPc = obsPc;
-      metrics.obs.connectedCount++;
-      metrics.obs.lastConnectedAt = new Date().toISOString();
-      metrics.obs.connectionState = obsPc.connectionState;
 
-      obsPc.connectionStateChange.subscribe((state) => {
-        metrics.obs.connectionState = state;
-        console.info(`[WHIP] ${state}`);
-        if (
-          (state === "closed" ||
-            state === "failed" ||
-            state === "disconnected") &&
-          activeObsPc === obsPc
-        ) {
-          activeObsPc = null;
+      if (req.method === "POST" && url.pathname === "/whip") {
+        if (activeObsPc) {
+          await activeObsPc.close();
         }
-      });
+        const obsPc = new RTCPeerConnection({ codecs: supportedCodecs });
+        activeObsPc = obsPc;
+        metrics.obs.connectedCount++;
+        metrics.obs.lastConnectedAt = new Date().toISOString();
+        metrics.obs.connectionState = obsPc.connectionState;
 
-      obsPc.onTrack.subscribe((track) => {
-        if (track.kind === "video") {
-          const videoTransceiver = obsPc
-            .getTransceivers()
-            .find((t) => t.kind === "video");
+        obsPc.connectionStateChange.subscribe((state) => {
+          metrics.obs.connectionState = state;
+          console.info(`[WHIP] ${state}`);
+          if (
+            (state === "closed" ||
+              state === "failed" ||
+              state === "disconnected") &&
+            activeObsPc === obsPc
+          ) {
+            activeObsPc = null;
+          }
+        });
 
-          obsVideoReceiver = videoTransceiver?.receiver ?? null;
+        obsPc.onTrack.subscribe((track) => {
+          if (track.kind === "video") {
+            const videoTransceiver = obsPc
+              .getTransceivers()
+              .find((t) => t.kind === "video");
 
-          track.onReceiveRtp.subscribe((rtp) => {
-            if (obsVideoSsrc !== rtp.header.ssrc) {
-              obsVideoSsrc = rtp.header.ssrc;
-              const matched = videoTransceiver?.codecs.find(
-                (c) => c.payloadType === rtp.header.payloadType,
-              );
-              if (matched) {
-                activeVideoCodec = matched;
-                broadcastCodecToWorkers(matched);
-                console.info(
-                  `[WHIP] codec ${matched.mimeType} (pt=${matched.payloadType})`,
+            obsVideoReceiver = videoTransceiver?.receiver ?? null;
+
+            track.onReceiveRtp.subscribe((rtp) => {
+              if (obsVideoSsrc !== rtp.header.ssrc) {
+                obsVideoSsrc = rtp.header.ssrc;
+                const matched = videoTransceiver?.codecs.find(
+                  (c) => c.payloadType === rtp.header.payloadType,
                 );
+                if (matched) {
+                  activeVideoCodec = matched;
+                  broadcastCodecToWorkers(matched);
+                  console.info(
+                    `[WHIP] codec ${matched.mimeType} (pt=${matched.payloadType})`,
+                  );
+                }
               }
-            }
-            if (peerToWorker.size === 0) return;
-            const data = rtp.serialize();
-            for (const slot of workerSlots) {
-              if (slot.peers.size > 0) {
-                slot.worker.postMessage({ type: "rtp", kind: "video", data });
+              if (peerToWorker.size === 0) return;
+              const data = rtp.serialize();
+              for (const slot of workerSlots) {
+                if (slot.peers.size > 0) {
+                  slot.worker.postMessage({ type: "rtp", kind: "video", data });
+                }
               }
-            }
-          });
+            });
+          }
+
+          if (track.kind === "audio") {
+            track.onReceiveRtp.subscribe((rtp) => {
+              if (peerToWorker.size === 0) return;
+              const data = rtp.serialize();
+              for (const slot of workerSlots) {
+                if (slot.peers.size > 0) {
+                  slot.worker.postMessage({ type: "rtp", kind: "audio", data });
+                }
+              }
+            });
+          }
+        });
+
+        await obsPc.setRemoteDescription({
+          type: "offer",
+          sdp: await req.text(),
+        });
+        await obsPc.setLocalDescription(await obsPc.createAnswer());
+
+        const videoTransceiver = obsPc
+          .getTransceivers()
+          .find((t) => t.kind === "video");
+
+        if (videoTransceiver?.codecs[0]) {
+          activeVideoCodec = videoTransceiver.codecs[0];
+          broadcastCodecToWorkers(activeVideoCodec);
         }
 
-        if (track.kind === "audio") {
-          track.onReceiveRtp.subscribe((rtp) => {
-            if (peerToWorker.size === 0) return;
-            const data = rtp.serialize();
-            for (const slot of workerSlots) {
-              if (slot.peers.size > 0) {
-                slot.worker.postMessage({ type: "rtp", kind: "audio", data });
-              }
-            }
-          });
-        }
-      });
-
-      await obsPc.setRemoteDescription({
-        type: "offer",
-        sdp: await req.text(),
-      });
-      await obsPc.setLocalDescription(await obsPc.createAnswer());
-
-      const videoTransceiver = obsPc
-        .getTransceivers()
-        .find((t) => t.kind === "video");
-
-      if (videoTransceiver?.codecs[0]) {
-        activeVideoCodec = videoTransceiver.codecs[0];
-        broadcastCodecToWorkers(activeVideoCodec);
+        return new Response(obsPc.localDescription!.sdp, {
+          status: 201,
+          headers: {
+            "Content-Type": "application/sdp",
+            "Location": "/whip/session",
+          },
+        });
       }
 
-      return new Response(obsPc.localDescription!.sdp, {
-        status: 201,
-        headers: {
-          "Content-Type": "application/sdp",
-          Location: "/whip/session",
-        },
-      });
-    }
-
-    return new Response("Not Found", { status: 404 });
-  },
-  websocket: {
-    open(ws) {
-      wsClients.add(ws);
-      ws.send(
-        JSON.stringify({
-          type: "state",
-          rtx,
-          token,
-          streamId,
-          uplinkCongested,
-          metrics,
-          activeSessions: lastActiveSessions,
-        }),
-      );
+      return new Response("Not Found", { status: 404 });
     },
-    message() {},
-    close(ws) {
-      wsClients.delete(ws);
+    websocket: {
+      open(ws) {
+        wsClients.add(ws);
+        ws.send(
+          JSON.stringify({
+            type: "state",
+            rtx,
+            maxPeers,
+            maxUplinkMbps,
+            token,
+            streamId,
+            uplinkCongested,
+            metrics,
+            activeSessions: lastActiveSessions,
+          }),
+        );
+      },
+      message() {},
+      close(ws) {
+        wsClients.delete(ws);
+      },
     },
-  },
   });
 } catch (err) {
   if ((err as { code?: string })?.code === "EADDRINUSE") {
@@ -890,9 +957,15 @@ if (useTui) {
   );
   renderStatusLine();
 } else {
+  const limits = [
+    maxPeers > 0 ? `maxPeers=${maxPeers}` : null,
+    maxUplinkMbps > 0 ? `maxUplink=${maxUplinkMbps}Mbps` : null,
+  ]
+    .filter(Boolean)
+    .join(", ");
   console.info(
     [
-      `[Daemon] ready (version=${VERSION}, port=${port}, rtx=${rtx ? "on" : "off"}, workers=${WORKER_COUNT})`,
+      `[Daemon] ready (version=${VERSION}, port=${port}, rtx=${rtx ? "on" : "off"}, workers=${WORKER_COUNT}${limits ? `, ${limits}` : ""})`,
       `  Config:    ${configPath}`,
       `  Dashboard: http://127.0.0.1:${port}/`,
       `  WHIP:      http://127.0.0.1:${port}/whip`,
@@ -943,11 +1016,21 @@ client.on("message", async (_topic, rawPayload) => {
   try {
     const { viewerId, iv, data } = JSON.parse(rawPayload.toString());
     if (!viewerId) return;
-    if (peerToWorker.has(viewerId) || uplinkCongested) {
+    const inKbps = metrics.obs.video.kbps + metrics.obs.audio.kbps;
+    const rejectReason = peerToWorker.has(viewerId)
+      ? "duplicate"
+      : maxPeers > 0 && peerToWorker.size >= maxPeers
+        ? `max peers (${maxPeers})`
+        : maxUplinkKbps > 0 &&
+            inKbps > 0 &&
+            (peerToWorker.size + 1) * inKbps > maxUplinkKbps
+          ? `max uplink (${maxUplinkMbps} Mbps)`
+          : uplinkCongested
+            ? "host uplink congested"
+            : null;
+    if (rejectReason) {
       metrics.peers.totalRejected++;
-      console.warn(
-        `[Peer ${viewerId.slice(0, 6)}] rejected (${peerToWorker.has(viewerId) ? "duplicate" : "host uplink congested"})`,
-      );
+      console.warn(`[Peer ${viewerId.slice(0, 6)}] rejected (${rejectReason})`);
       return;
     }
 

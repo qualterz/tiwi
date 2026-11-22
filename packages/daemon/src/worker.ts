@@ -48,6 +48,7 @@ export type PeerMetrics = {
     protocol: string | null;
     rttMs: number | null;
     avgRttMs: number | null;
+    minRttMs: number | null;
     oneWayPingMs: number | null;
     bytesSent: number;
     packetsSent: number;
@@ -68,6 +69,7 @@ export type PeerMetrics = {
     remoteFractionLost: number;
     remoteRttMs: number | null;
     remoteAvgRttMs: number | null;
+    remoteMinRttMs: number | null;
   };
   audio: {
     ssrc: number | null;
@@ -249,6 +251,7 @@ self.onmessage = async (event: MessageEvent) => {
           protocol: null,
           rttMs: null,
           avgRttMs: null,
+          minRttMs: null,
           oneWayPingMs: null,
           bytesSent: 0,
           packetsSent: 0,
@@ -269,6 +272,7 @@ self.onmessage = async (event: MessageEvent) => {
           remoteFractionLost: 0,
           remoteRttMs: null,
           remoteAvgRttMs: null,
+          remoteMinRttMs: null,
         },
         audio: {
           ssrc: null,
@@ -475,6 +479,12 @@ self.onmessage = async (event: MessageEvent) => {
               );
               pm.video.remoteRttMs = rttMs;
               pm.video.remoteAvgRttMs = avgRttMs;
+              if (rttMs != null) {
+                pm.video.remoteMinRttMs =
+                  pm.video.remoteMinRttMs == null
+                    ? rttMs
+                    : Math.min(pm.video.remoteMinRttMs, rttMs);
+              }
             } else if (r.kind === "audio") {
               pm.audio.remotePacketsLost = r.packetsLost ?? 0;
               pm.audio.remoteRttMs = rttMs;
@@ -511,6 +521,12 @@ self.onmessage = async (event: MessageEvent) => {
               (local?.protocol as string | undefined) ?? null;
             pm.transport.rttMs = rttMs;
             pm.transport.avgRttMs = avgRttMs;
+            if (rttMs != null) {
+              pm.transport.minRttMs =
+                pm.transport.minRttMs == null
+                  ? rttMs
+                  : Math.min(pm.transport.minRttMs, rttMs);
+            }
             pm.transport.oneWayPingMs =
               rttMs != null ? Math.round(rttMs / 2) : null;
             pm.transport.bytesSent = pair.bytesSent ?? 0;
