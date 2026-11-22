@@ -87,7 +87,9 @@ export default function App() {
     setMuted(videoRef.muted);
   };
 
-  const onVolumeInput = (e: InputEvent & { currentTarget: HTMLInputElement }) => {
+  const onVolumeInput = (
+    e: InputEvent & { currentTarget: HTMLInputElement },
+  ) => {
     const val = Number(e.currentTarget.value);
     videoRef.volume = val;
     videoRef.muted = val === 0;

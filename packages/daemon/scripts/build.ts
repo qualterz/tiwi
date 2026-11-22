@@ -13,7 +13,9 @@ const { values, positionals } = parseArgs({
 
 const mode = positionals[0] ?? "npm";
 if (mode !== "npm" && mode !== "exe") {
-  console.error("Usage: bun run scripts/build.ts <npm|exe> [--version X.Y.Z] [--commit SHA]");
+  console.error(
+    "Usage: bun run scripts/build.ts <npm|exe> [--version X.Y.Z] [--commit SHA]",
+  );
   process.exit(1);
 }
 
@@ -63,9 +65,13 @@ if (mode === "npm") {
     indexPath,
     code.startsWith("#!") ? code : `#!/usr/bin/env bun\n${code}`,
   );
-  console.log(`Built npm bundle in ${distDir} (version=${version}, commit=${commit})`);
+  console.log(
+    `Built npm bundle in ${distDir} (version=${version}, commit=${commit})`,
+  );
 } else {
-  const winVersion = /^\d+\.\d+\.\d+$/.test(version) ? `${version}.0` : "0.0.0.0";
+  const winVersion = /^\d+\.\d+\.\d+$/.test(version)
+    ? `${version}.0`
+    : "0.0.0.0";
   const outFile = path.join(distDir, "tiwi.exe");
   const proc = Bun.spawnSync(
     [
@@ -89,5 +95,7 @@ if (mode === "npm") {
     { cwd: daemonDir, stdio: ["inherit", "inherit", "inherit"] },
   );
   if (proc.exitCode !== 0) process.exit(proc.exitCode);
-  console.log(`Built executable ${outFile} (version=${version}, commit=${commit})`);
+  console.log(
+    `Built executable ${outFile} (version=${version}, commit=${commit})`,
+  );
 }

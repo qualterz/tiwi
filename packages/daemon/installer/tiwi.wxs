@@ -4,11 +4,12 @@
     Manufacturer="qualterz"
     Version="$(var.Version)"
     UpgradeCode="6F8E4C2A-9B1D-4E7F-A3C5-8D2B1E4F9A6C"
-    Scope="perUser">
-
+    Scope="perUser"
+  >
     <MajorUpgrade
       DowngradeErrorMessage="A newer version of Tiwi is already installed."
-      Schedule="afterInstallInitialize" />
+      Schedule="afterInstallInitialize"
+    />
 
     <MediaTemplate EmbedCab="yes" />
 
@@ -21,15 +22,41 @@
     <StandardDirectory Id="ProgramMenuFolder" />
 
     <ComponentGroup Id="ProductComponents">
-      <Component Id="TiwiExecutable" Directory="INSTALLFOLDER" Guid="4E2A9C1B-7F5D-4B8E-A1C3-6D9F2E4B7A10">
+      <Component
+        Id="TiwiExecutable"
+        Directory="INSTALLFOLDER"
+        Guid="4E2A9C1B-7F5D-4B8E-A1C3-6D9F2E4B7A10"
+      >
         <File Id="TiwiExe" Source="$(var.ExePath)" Name="tiwi.exe" />
         <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
-        <RemoveFolder Id="RemoveProgramsFolder" Directory="ProgramsFolder" On="uninstall" />
-        <RegistryValue Root="HKCU" Key="Software\Tiwi" Name="Installed" Type="integer" Value="1" KeyPath="yes" />
+        <RemoveFolder
+          Id="RemoveProgramsFolder"
+          Directory="ProgramsFolder"
+          On="uninstall"
+        />
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\Tiwi"
+          Name="Installed"
+          Type="integer"
+          Value="1"
+          KeyPath="yes"
+        />
       </Component>
 
-      <Component Id="TiwiPath" Directory="INSTALLFOLDER" Guid="2A7B5C9E-4D1F-4A8B-9E3C-1F6A8D4B2E90">
-        <RegistryValue Root="HKCU" Key="Software\Tiwi" Name="PathAdded" Type="integer" Value="1" KeyPath="yes" />
+      <Component
+        Id="TiwiPath"
+        Directory="INSTALLFOLDER"
+        Guid="2A7B5C9E-4D1F-4A8B-9E3C-1F6A8D4B2E90"
+      >
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\Tiwi"
+          Name="PathAdded"
+          Type="integer"
+          Value="1"
+          KeyPath="yes"
+        />
         <Environment
           Id="PATH"
           Name="PATH"
@@ -37,17 +64,30 @@
           Permanent="no"
           Part="last"
           Action="set"
-          System="no" />
+          System="no"
+        />
       </Component>
 
-      <Component Id="StartMenuShortcut" Directory="ProgramMenuFolder" Guid="9C4E1A7D-3B8F-4C2E-8A5D-7E1B9C4F6A20">
+      <Component
+        Id="StartMenuShortcut"
+        Directory="ProgramMenuFolder"
+        Guid="9C4E1A7D-3B8F-4C2E-8A5D-7E1B9C4F6A20"
+      >
         <Shortcut
           Id="TiwiStartMenuShortcut"
           Name="Tiwi"
           Description="Start Tiwi streaming daemon"
           Target="[INSTALLFOLDER]tiwi.exe"
-          WorkingDirectory="INSTALLFOLDER" />
-        <RegistryValue Root="HKCU" Key="Software\Tiwi" Name="ShortcutInstalled" Type="integer" Value="1" KeyPath="yes" />
+          WorkingDirectory="INSTALLFOLDER"
+        />
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\Tiwi"
+          Name="ShortcutInstalled"
+          Type="integer"
+          Value="1"
+          KeyPath="yes"
+        />
       </Component>
     </ComponentGroup>
 
@@ -55,4 +95,4 @@
       <ComponentGroupRef Id="ProductComponents" />
     </Feature>
   </Package>
-</Wix>
+</Wix>;
