@@ -56,20 +56,31 @@ export default function App() {
 
   let lastTouch = 0;
 
-  const showTouchControls = (e: TouchEvent) => {
-    lastTouch = Date.now();
-    if (touchControls() && e.target === videoRef) {
-      clearTimeout(touchTimer);
-      setTouchControls(false);
-      return;
-    }
-    setTouchControls(true);
+  const scheduleTouchHide = () => {
     clearTimeout(touchTimer);
     touchTimer = setTimeout(() => setTouchControls(false), 3000);
   };
 
+  const onContainerTouchStart = (e: TouchEvent) => {
+    lastTouch = Date.now();
+    if ((touchControls() || paused()) && e.target !== videoRef) {
+      setTouchControls(true);
+      scheduleTouchHide();
+    }
+  };
+
   const onVideoClick = () => {
-    if (Date.now() - lastTouch < 500) return;
+    if (Date.now() - lastTouch < 500) {
+      if (fullscreen()) resetIdleTimer();
+      if (touchControls()) {
+        clearTimeout(touchTimer);
+        setTouchControls(false);
+      } else {
+        setTouchControls(true);
+        scheduleTouchHide();
+      }
+      return;
+    }
     clearTimeout(clickTimer);
     clickTimer = setTimeout(() => {
       togglePlay();
@@ -152,7 +163,7 @@ export default function App() {
       <div
         ref={containerRef}
         onMouseMove={resetIdleTimer}
-        onTouchStart={showTouchControls}
+        onTouchStart={onContainerTouchStart}
         class={`group relative aspect-video max-h-[90vh] w-full max-w-6xl select-none overflow-hidden bg-zinc-900 ${
           fullscreen() && idle() ? "cursor-none" : ""
         }`}
@@ -241,8 +252,8 @@ export default function App() {
             fullscreen() && idle()
               ? "pointer-events-none opacity-0"
               : touchControls() || paused()
-                ? "opacity-100"
-                : "opacity-0 group-hover:opacity-100"
+                ? "pointer-events-auto opacity-100"
+                : "pointer-events-none opacity-0 group-hover:pointer-events-auto group-hover:opacity-100"
           }`}
         >
           <div class="flex items-center">
