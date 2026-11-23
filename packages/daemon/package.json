@@ -22,6 +22,7 @@
     "dev": "bun run src/index.ts",
     "build": "bun run scripts/build.ts npm",
     "build:exe": "bun run scripts/build.ts exe",
+    "build:msi": "bun run scripts/build.ts msi",
     "typecheck": "bun check"
   },
   "dependencies": {

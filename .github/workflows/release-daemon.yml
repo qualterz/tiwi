@@ -58,10 +58,10 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
 
-      - name: Compile tiwi.exe
+      - name: Compile portable tiwi.exe
         run: bun run packages/daemon/scripts/build.ts exe --version ${{ needs.prepare.outputs.version }} --commit ${{ needs.prepare.outputs.commit }}
 
-      - name: Smoke test tiwi.exe
+      - name: Smoke test portable tiwi.exe
         run: |
           .\packages\daemon\dist\tiwi.exe --version
           .\packages\daemon\dist\tiwi.exe --help
@@ -69,10 +69,16 @@ jobs:
       - name: Package portable ZIP
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path release, portable | Out-Null
-          Copy-Item packages/daemon/dist/tiwi.exe portable/tiwi.exe
-          Set-Content -Path portable/config.json -Value "{}" -NoNewline
-          Compress-Archive -Path portable/tiwi.exe, portable/config.json -DestinationPath release/tiwi-windows-x64-portable.zip -Force
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Compress-Archive -Path packages/daemon/dist/tiwi.exe -DestinationPath release/tiwi-windows-x64-portable.zip -Force
+
+      - name: Compile MSI tiwi.exe
+        run: bun run packages/daemon/scripts/build.ts msi --version ${{ needs.prepare.outputs.version }} --commit ${{ needs.prepare.outputs.commit }}
+
+      - name: Smoke test MSI tiwi.exe
+        run: |
+          .\packages\daemon\dist\tiwi.exe --version
+          .\packages\daemon\dist\tiwi.exe --help
 
       - name: Build Windows MSI
         shell: pwsh

@@ -12,9 +12,9 @@ const { values, positionals } = parseArgs({
 });
 
 const mode = positionals[0] ?? "npm";
-if (mode !== "npm" && mode !== "exe") {
+if (mode !== "npm" && mode !== "exe" && mode !== "msi") {
   console.error(
-    "Usage: bun run scripts/build.ts <npm|exe> [--version X.Y.Z] [--commit SHA]",
+    "Usage: bun run scripts/build.ts <npm|exe|msi> [--version X.Y.Z] [--commit SHA]",
   );
   process.exit(1);
 }
@@ -87,7 +87,7 @@ if (mode === "npm") {
       "--define",
       `__TIWI_COMMIT__=${JSON.stringify(commit)}`,
       "--define",
-      `__TIWI_BUILD__="exe"`,
+      `__TIWI_BUILD__=${JSON.stringify(mode)}`,
       "--windows-title=Tiwi",
       "--windows-description=Zero-infrastructure peer-to-peer live streaming daemon",
       `--windows-version=${winVersion}`,
@@ -96,6 +96,6 @@ if (mode === "npm") {
   );
   if (proc.exitCode !== 0) process.exit(proc.exitCode);
   console.log(
-    `Built executable ${outFile} (version=${version}, commit=${commit})`,
+    `Built ${mode} executable ${outFile} (version=${version}, commit=${commit})`,
   );
 }

@@ -21,7 +21,7 @@ if (typeof Bun === "undefined") {
 
 declare const __TIWI_VERSION__: string | undefined;
 declare const __TIWI_COMMIT__: string | undefined;
-declare const __TIWI_BUILD__: "dev" | "npm" | "exe" | undefined;
+declare const __TIWI_BUILD__: "dev" | "npm" | "exe" | "msi" | undefined;
 
 const VERSION =
   typeof __TIWI_VERSION__ !== "undefined" ? __TIWI_VERSION__ : "0.0.0-dev";
@@ -101,8 +101,6 @@ if (values.version) {
   console.log(`tiwi ${VERSION} (${COMMIT})`);
   process.exit(0);
 }
-
-const exeConfigPath = path.join(path.dirname(process.execPath), "config.json");
 
 const isNewerVersion = (latest: string, current: string) => {
   const a = latest.split(".").map(Number);
@@ -200,7 +198,7 @@ if (positionals[0] === "update") {
   }
   const sumsText = await sumsRes.text();
 
-  const isPortable = fs.existsSync(exeConfigPath);
+  const isPortable = BUILD_CHANNEL === "exe";
   const asset = isPortable
     ? "tiwi-windows-x64-portable.zip"
     : "tiwi-windows-x64.msi";
@@ -273,8 +271,8 @@ const appDataDir =
 
 const configPath = values.config
   ? path.resolve(values.config)
-  : fs.existsSync(exeConfigPath)
-    ? exeConfigPath
+  : BUILD_CHANNEL === "exe"
+    ? path.join(path.dirname(process.execPath), "config.json")
     : path.join(appDataDir, "config.json");
 
 type DaemonConfig = {
