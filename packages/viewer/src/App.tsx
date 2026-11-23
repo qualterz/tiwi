@@ -29,6 +29,7 @@ function CarbonIcon(props: { icon: CarbonIconDescriptor; class?: string }) {
 }
 
 const DEFAULT_VOLUME = 0.2;
+const VOLUME_STEP = 0.05;
 const VOLUME_STORAGE_KEY = "tiwi:volume";
 const MUTED_STORAGE_KEY = "tiwi:muted";
 
@@ -254,15 +255,25 @@ export default function App() {
     saveAudioPrefs(videoRef.volume, nextMuted);
   };
 
+  const applyVolume = (val: number) => {
+    const clamped = Math.round(Math.min(1, Math.max(0, val)) * 100) / 100;
+    videoRef.volume = clamped;
+    videoRef.muted = clamped === 0;
+    setVolume(clamped);
+    setMuted(videoRef.muted);
+    saveAudioPrefs(clamped, videoRef.muted);
+  };
+
   const onVolumeInput = (
     e: InputEvent & { currentTarget: HTMLInputElement },
   ) => {
-    const val = Number(e.currentTarget.value);
-    videoRef.volume = val;
-    videoRef.muted = val === 0;
-    setVolume(val);
-    setMuted(videoRef.muted);
-    saveAudioPrefs(val, videoRef.muted);
+    applyVolume(Number(e.currentTarget.value));
+  };
+
+  const adjustVolume = (delta: number) => {
+    const current = videoRef.muted ? 0 : videoRef.volume;
+    if (current === 0 && delta < 0) return;
+    applyVolume(current + delta);
   };
 
   const toggleFullscreen = () => {
@@ -300,7 +311,45 @@ export default function App() {
         screen.orientation?.unlock?.();
       }
     };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
+      const target = e.target;
+      if (
+        target instanceof HTMLTextAreaElement ||
+        target instanceof HTMLSelectElement ||
+        (target instanceof HTMLElement && target.isContentEditable) ||
+        (target instanceof HTMLInputElement && target.type !== "range")
+      ) {
+        return;
+      }
+
+      const key = e.key.toLowerCase();
+      if (e.key === " ") {
+        e.preventDefault();
+        if (e.repeat) return;
+        togglePlay();
+        resetIdleTimer();
+      } else if (key === "f") {
+        if (e.repeat) return;
+        e.preventDefault();
+        toggleFullscreen();
+      } else if (key === "m") {
+        if (e.repeat) return;
+        e.preventDefault();
+        toggleMute();
+        resetIdleTimer();
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        adjustVolume(VOLUME_STEP);
+        resetIdleTimer();
+      } else if (e.key === "ArrowDown") {
+        e.preventDefault();
+        adjustVolume(-VOLUME_STEP);
+        resetIdleTimer();
+      }
+    };
     document.addEventListener("fullscreenchange", onFullscreenChange);
+    document.addEventListener("keydown", onKeyDown);
     onCleanup(() => {
       viewer?.destroy();
       clearTimeout(idleTimer);
@@ -308,6 +357,7 @@ export default function App() {
       clearTimeout(clickTimer);
       clearTimeout(liveTimer);
       document.removeEventListener("fullscreenchange", onFullscreenChange);
+      document.removeEventListener("keydown", onKeyDown);
     });
   });
 
@@ -352,6 +402,7 @@ export default function App() {
           type="button"
           onClick={togglePlay}
           aria-label={paused() ? "Play" : "Pause"}
+          aria-keyshortcuts="Space"
           class={`absolute top-1/2 left-1/2 z-10 flex h-16 w-16 -translate-x-1/2 -translate-y-1/2 cursor-pointer items-center justify-center rounded-full bg-black/50 text-white transition-opacity duration-200 ease-out [@media(hover:hover)_and_(pointer:fine)]:hidden ${
             controlsHidden()
               ? "pointer-events-none opacity-0"
@@ -408,6 +459,7 @@ export default function App() {
               type="button"
               onClick={togglePlay}
               aria-label={paused() ? "Play" : "Pause"}
+              aria-keyshortcuts="Space"
               class="group/btn relative hidden h-8 w-8 cursor-pointer items-center justify-center overflow-hidden rounded-full text-white [@media(hover:hover)_and_(pointer:fine)]:flex"
             >
               <span
@@ -434,6 +486,7 @@ export default function App() {
                 type="button"
                 onClick={toggleMute}
                 aria-label={muted() ? "Unmute" : "Mute"}
+                aria-keyshortcuts="m"
                 class="group/btn relative flex h-12 w-12 cursor-pointer items-center justify-center overflow-hidden rounded-full text-white [@media(hover:hover)_and_(pointer:fine)]:h-8 [@media(hover:hover)_and_(pointer:fine)]:w-8"
               >
                 <span
@@ -514,6 +567,7 @@ export default function App() {
                   value={muted() ? 0 : volume()}
                   onInput={onVolumeInput}
                   aria-label="Volume"
+                  aria-keyshortcuts="ArrowUp ArrowDown"
                   class="absolute inset-y-0 left-0 z-10 h-8 w-[calc(100%+6px)] cursor-pointer appearance-none bg-transparent [&::-moz-range-thumb]:h-5 [&::-moz-range-thumb]:w-1.5 [&::-moz-range-thumb]:rounded-none [&::-moz-range-thumb]:border-0 [&::-moz-range-thumb]:bg-white [&::-moz-range-track]:h-1 [&::-moz-range-track]:bg-transparent [&::-webkit-slider-runnable-track]:h-1 [&::-webkit-slider-runnable-track]:bg-transparent [&::-webkit-slider-thumb]:-mt-2 [&::-webkit-slider-thumb]:h-5 [&::-webkit-slider-thumb]:w-1.5 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-none [&::-webkit-slider-thumb]:bg-white"
                 />
               </div>
@@ -542,6 +596,7 @@ export default function App() {
               type="button"
               onClick={toggleFullscreen}
               aria-label={fullscreen() ? "Exit fullscreen" : "Fullscreen"}
+              aria-keyshortcuts="f"
               class="group/btn relative flex h-12 w-12 cursor-pointer items-center justify-center overflow-hidden rounded-full text-white [@media(hover:hover)_and_(pointer:fine)]:h-8 [@media(hover:hover)_and_(pointer:fine)]:w-8"
             >
               <span
