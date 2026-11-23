@@ -315,31 +315,32 @@ export default function App() {
         />
 
         <div
-          role="status"
-          aria-live="polite"
-          aria-hidden={!status() || undefined}
-          data-active={status() ? "" : undefined}
-          class={`status-badge pointer-events-none absolute bottom-2.5 left-1/2 z-10 flex h-12 -translate-x-1/2 flex-col items-center justify-center gap-1 font-sans text-xs font-medium uppercase tracking-[0.06em] text-white/90 transition-opacity duration-200 ease-out [@media(hover:hover)_and_(pointer:fine)]:h-8 ${
-            status() ? "opacity-100" : "opacity-0"
-          }`}
-        >
-          <span class="leading-none">{lastStatus()?.label ?? ""}</span>
-          <span
-            aria-hidden="true"
-            data-glint={lastStatus()?.glint ? "" : undefined}
-            class={`status-line relative h-[2px] w-full overflow-hidden ${lastStatus()?.line ?? ""}`}
-          />
-        </div>
-
-        <div
           class={`absolute inset-x-0 bottom-0 flex items-center justify-between px-3 py-2.5 transition-opacity duration-200 ease-out ${
-            controlsHidden()
-              ? "pointer-events-none opacity-0"
-              : touchControls() || paused()
-                ? "pointer-events-auto opacity-100"
-                : "pointer-events-none opacity-0 group-hover:pointer-events-auto group-hover:opacity-100"
+            status()
+              ? "pointer-events-auto opacity-100"
+              : controlsHidden()
+                ? "pointer-events-none opacity-0"
+                : touchControls() || paused()
+                  ? "pointer-events-auto opacity-100"
+                  : "pointer-events-none opacity-0 group-hover:pointer-events-auto group-hover:opacity-100"
           }`}
         >
+          <div
+            role="status"
+            aria-live="polite"
+            aria-hidden={!status() || undefined}
+            data-active={status() ? "" : undefined}
+            class={`status-badge pointer-events-none absolute top-1/2 left-1/2 flex -translate-x-1/2 -translate-y-1/2 flex-col items-center justify-center gap-1 font-sans text-xs font-medium uppercase tracking-[0.06em] text-white/90 transition-opacity duration-200 ease-out ${
+              status() ? "opacity-100" : "opacity-0"
+            }`}
+          >
+            <span class="leading-none">{lastStatus()?.label ?? ""}</span>
+            <span
+              aria-hidden="true"
+              data-glint={lastStatus()?.glint ? "" : undefined}
+              class={`status-line relative h-[2px] w-full overflow-hidden ${lastStatus()?.line ?? ""}`}
+            />
+          </div>
           <div class="flex items-center">
             <button
               type="button"
