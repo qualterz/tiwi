@@ -64,37 +64,75 @@ export default function App() {
   const status = () => {
     const s = viewerState();
     if (s === "waiting")
-      return { label: "Waiting", line: "bg-zinc-500", glint: false };
+      return {
+        label: "Waiting",
+        tone: "text-white/70",
+        line: "bg-white/25",
+        glint: false,
+      };
     if (s === "connecting")
       return {
         label: "Connecting",
-        line: "bg-white/30 text-white",
+        tone: "text-white/90",
+        line: "bg-white/25 text-white",
         glint: true,
       };
     if (s === "disconnected")
       return {
         label: "Reconnecting",
-        line: "bg-white/30 text-white",
+        tone: "text-white/90",
+        line: "bg-white/25 text-white",
         glint: true,
       };
     if (s === "no-internet")
-      return { label: "No internet", line: "bg-zinc-400", glint: false };
+      return {
+        label: "No internet",
+        tone: "text-white/80",
+        line: "bg-white/35",
+        glint: false,
+      };
     if (s === "timed-out")
-      return { label: "Timed out", line: "bg-zinc-400", glint: false };
+      return {
+        label: "Timed out",
+        tone: "text-white/80",
+        line: "bg-white/35",
+        glint: false,
+      };
     if (s === "unreachable")
-      return { label: "Unreachable", line: "bg-zinc-400", glint: false };
+      return {
+        label: "Unreachable",
+        tone: "text-white/80",
+        line: "bg-white/35",
+        glint: false,
+      };
     if (s === "stream-error")
-      return { label: "Stream error", line: "bg-zinc-400", glint: false };
+      return {
+        label: "Stream error",
+        tone: "text-white/80",
+        line: "bg-white/35",
+        glint: false,
+      };
     if (s === "invalid")
-      return { label: "Invalid link", line: "bg-zinc-400", glint: false };
+      return {
+        label: "Invalid link",
+        tone: "text-white/80",
+        line: "bg-white/35",
+        glint: false,
+      };
     if (s === "live" && !paused() && loading())
       return {
         label: "Buffering",
-        line: "bg-white/30 text-white",
+        tone: "text-white/90",
+        line: "bg-white/25 text-white",
         glint: true,
       };
     if (s === "live" && !paused() && liveBadge())
-      return { label: "Live", line: "bg-red-500", glint: false };
+      return {
+        label: "Live",
+        tone: "text-white",
+        line: "bg-red-500",
+        glint: false,
+      };
     return null;
   };
   const [lastStatus, setLastStatus] = createSignal(status());
@@ -313,7 +351,7 @@ export default function App() {
         />
 
         <div
-          class={`absolute inset-x-0 bottom-0 flex items-center justify-between px-3 py-2.5 transition-opacity duration-200 ease-out ${
+          class={`absolute inset-x-0 bottom-0 flex items-center gap-3 px-3 py-2.5 transition-opacity duration-200 ease-out ${
             status()
               ? "pointer-events-auto opacity-100"
               : controlsHidden()
@@ -323,23 +361,7 @@ export default function App() {
                   : "pointer-events-none opacity-0 group-hover:pointer-events-auto group-hover:opacity-100"
           }`}
         >
-          <div
-            role="status"
-            aria-live="polite"
-            aria-hidden={!status() || undefined}
-            data-active={status() ? "" : undefined}
-            class={`status-badge pointer-events-none absolute top-1/2 left-1/2 flex -translate-x-1/2 -translate-y-1/2 flex-col items-center justify-center gap-1 font-sans text-xs font-medium uppercase tracking-[0.06em] text-white/90 transition-opacity duration-200 ease-out ${
-              status() ? "opacity-100" : "opacity-0"
-            }`}
-          >
-            <span class="leading-none">{lastStatus()?.label ?? ""}</span>
-            <span
-              aria-hidden="true"
-              data-glint={lastStatus()?.glint ? "" : undefined}
-              class={`status-line relative h-[2px] w-full overflow-hidden ${lastStatus()?.line ?? ""}`}
-            />
-          </div>
-          <div class="flex items-center">
+          <div class="flex flex-1 items-center">
             <button
               type="button"
               onClick={togglePlay}
@@ -455,33 +477,53 @@ export default function App() {
               </div>
             </div>
           </div>
-          <button
-            type="button"
-            onClick={toggleFullscreen}
-            aria-label={fullscreen() ? "Exit fullscreen" : "Fullscreen"}
-            class="group/btn relative flex h-12 w-12 cursor-pointer items-center justify-center overflow-hidden rounded-full text-white [@media(hover:hover)_and_(pointer:fine)]:h-8 [@media(hover:hover)_and_(pointer:fine)]:w-8"
+          <div
+            role="status"
+            aria-live="polite"
+            aria-hidden={!status() || undefined}
+            data-active={status() ? "" : undefined}
+            class={`status-badge pointer-events-none flex shrink-0 flex-col items-center justify-center gap-[3px] whitespace-nowrap font-sans text-[11px] font-medium uppercase tracking-[0.08em] transition-opacity duration-200 ease-out ${
+              lastStatus()?.tone ?? "text-white/80"
+            } ${status() ? "opacity-100" : "opacity-0"}`}
           >
+            <span class="status-label leading-none">
+              {lastStatus()?.label ?? ""}
+            </span>
             <span
               aria-hidden="true"
-              class="pointer-events-none absolute inset-0 scale-75 rounded-full bg-white/20 opacity-0 transition duration-75 ease-out group-hover/btn:scale-100 group-hover/btn:opacity-100"
+              data-glint={lastStatus()?.glint ? "" : undefined}
+              class={`status-line relative h-[2px] w-full overflow-hidden ${lastStatus()?.line ?? ""}`}
             />
-            <svg
-              width="16"
-              height="16"
-              viewBox="0 0 16 16"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="1.5"
-              stroke-linecap="square"
-              aria-hidden="true"
+          </div>
+          <div class="flex flex-1 items-center justify-end">
+            <button
+              type="button"
+              onClick={toggleFullscreen}
+              aria-label={fullscreen() ? "Exit fullscreen" : "Fullscreen"}
+              class="group/btn relative flex h-12 w-12 cursor-pointer items-center justify-center overflow-hidden rounded-full text-white [@media(hover:hover)_and_(pointer:fine)]:h-8 [@media(hover:hover)_and_(pointer:fine)]:w-8"
             >
-              {fullscreen() ? (
-                <path d="M6 2v4H2M10 2v4h4M6 14v-4H2M10 14v-4h4" />
-              ) : (
-                <path d="M2 6V2h4M14 6V2h-4M2 10v4h4M14 10v4h-4" />
-              )}
-            </svg>
-          </button>
+              <span
+                aria-hidden="true"
+                class="pointer-events-none absolute inset-0 scale-75 rounded-full bg-white/20 opacity-0 transition duration-75 ease-out group-hover/btn:scale-100 group-hover/btn:opacity-100"
+              />
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 16 16"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.5"
+                stroke-linecap="square"
+                aria-hidden="true"
+              >
+                {fullscreen() ? (
+                  <path d="M6 2v4H2M10 2v4h4M6 14v-4H2M10 14v-4h4" />
+                ) : (
+                  <path d="M2 6V2h4M14 6V2h-4M2 10v4h4M14 10v4h-4" />
+                )}
+              </svg>
+            </button>
+          </div>
         </div>
       </div>
     </main>

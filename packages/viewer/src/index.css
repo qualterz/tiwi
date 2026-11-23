@@ -22,6 +22,10 @@ video::-webkit-media-controls {
   display: none !important;
 }
 
+.status-label {
+  text-box: trim-both cap alphabetic;
+}
+
 @media (prefers-reduced-motion: no-preference) {
   .status-badge[data-active] .status-line[data-glint]::after {
     content: "";
