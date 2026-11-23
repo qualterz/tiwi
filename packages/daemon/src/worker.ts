@@ -13,6 +13,10 @@ import {
 
 const UDP_BUFFER_BYTES = 16 * 1024 * 1024;
 const RTP_CACHE_SIZE = 4096;
+const RTX_MIN_COOLDOWN_MS = 20;
+const RTX_MAX_COOLDOWN_MS = 200;
+const RTX_MAX_FRACTION = 0.15;
+const RTX_MIN_PPS = 150;
 
 const origBind = dgram.Socket.prototype.bind;
 dgram.Socket.prototype.bind = function (
@@ -332,6 +336,11 @@ self.onmessage = async (event: MessageEvent) => {
 
       if (videoRtpHistory) {
         const history = videoRtpHistory;
+        const rtxSentAt = new Float64Array(RTP_CACHE_SIZE);
+        const rtxSentSeq = new Int32Array(RTP_CACHE_SIZE).fill(-1);
+        let rtxWindowStartMs = 0;
+        let rtxWindowSent = 0;
+
         videoSender.onGenericNack.subscribe(async (feedback) => {
           const sender = videoSender as unknown as {
             rtpCache: (RtpPacket | undefined)[];
@@ -349,13 +358,39 @@ self.onmessage = async (event: MessageEvent) => {
               opts: { injectProbePadding: boolean; isRetransmission: boolean },
             ) => Promise<void>;
           };
+          const now = performance.now();
+          if (now - rtxWindowStartMs >= 1000) {
+            rtxWindowStartMs = now;
+            rtxWindowSent = 0;
+          }
+          const maxRtxPerSec = Math.max(
+            RTX_MIN_PPS,
+            Math.round(pm.video.pps * RTX_MAX_FRACTION),
+          );
+          const rttMs = pm.transport.rttMs ?? pm.video.remoteRttMs ?? 25;
+          const cooldownMs = Math.max(
+            RTX_MIN_COOLDOWN_MS,
+            Math.min(RTX_MAX_COOLDOWN_MS, rttMs),
+          );
+
           for (const seqNum of feedback.lost) {
+            if (rtxWindowSent >= maxRtxPerSec) break;
             const inSmallCache = sender.rtpCache[seqNum % 128];
             if (inSmallCache && inSmallCache.header.sequenceNumber === seqNum) {
               continue;
             }
-            const cached = history[seqNum % RTP_CACHE_SIZE];
+            const slot = seqNum % RTP_CACHE_SIZE;
+            if (
+              rtxSentSeq[slot] === seqNum &&
+              now - rtxSentAt[slot]! < cooldownMs
+            ) {
+              continue;
+            }
+            const cached = history[slot];
             if (!cached || cached.header.sequenceNumber !== seqNum) continue;
+            rtxSentSeq[slot] = seqNum;
+            rtxSentAt[slot] = now;
+            rtxWindowSent++;
             let pkt = cached.clone();
             pkt.header.ssrc = sender.ssrc;
             if (sender.codec) pkt.header.payloadType = sender.codec.payloadType;
