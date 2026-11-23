@@ -1,6 +1,6 @@
 // @ts-expect-error @carbon/icons ships untyped ESM files
 import playFilledIcon from "@carbon/icons/es/play--filled--alt/16.js";
-import { createSignal, For, onCleanup, onMount } from "solid-js";
+import { createEffect, createSignal, For, onCleanup, onMount } from "solid-js";
 import { Dynamic } from "solid-js/web";
 import {
   startViewer,
@@ -34,11 +34,76 @@ export default function App() {
   const [videoPaused, setVideoPaused] = createSignal(true);
   const paused = () =>
     viewerState() === "paused" || (viewerState() === "live" && videoPaused());
-  const vhsActive = () =>
-    viewerState() === "waiting" ||
-    viewerState() === "connecting" ||
-    viewerState() === "disconnected" ||
-    (viewerState() === "live" && !paused() && loading());
+  const [liveBadge, setLiveBadge] = createSignal(false);
+  let liveTimer: ReturnType<typeof setTimeout> | undefined;
+  let wasLoading = false;
+
+  createEffect(() => {
+    const isLivePlaying = viewerState() === "live" && !paused() && !loading();
+    const isLoadingState =
+      !isLivePlaying && !paused() && viewerState() !== "invalid";
+
+    if (isLoadingState) {
+      wasLoading = true;
+      clearTimeout(liveTimer);
+      setLiveBadge(false);
+    } else if (isLivePlaying && wasLoading) {
+      wasLoading = false;
+      setLiveBadge(true);
+      clearTimeout(liveTimer);
+      liveTimer = setTimeout(() => setLiveBadge(false), 1500);
+      resetIdleTimer();
+    } else if (!isLivePlaying) {
+      clearTimeout(liveTimer);
+      setLiveBadge(false);
+    }
+  });
+
+  const controlsHidden = () => idle() && !paused();
+
+  const status = () => {
+    const s = viewerState();
+    if (s === "waiting")
+      return { label: "Waiting", line: "bg-zinc-500", glint: false };
+    if (s === "connecting")
+      return {
+        label: "Connecting",
+        line: "bg-white/30 text-white",
+        glint: true,
+      };
+    if (s === "disconnected")
+      return {
+        label: "Reconnecting",
+        line: "bg-white/30 text-white",
+        glint: true,
+      };
+    if (s === "no-internet")
+      return { label: "No internet", line: "bg-zinc-400", glint: false };
+    if (s === "server-offline")
+      return { label: "Server offline", line: "bg-zinc-400", glint: false };
+    if (s === "timed-out")
+      return { label: "Timed out", line: "bg-zinc-400", glint: false };
+    if (s === "unreachable")
+      return { label: "Unreachable", line: "bg-zinc-400", glint: false };
+    if (s === "stream-error")
+      return { label: "Stream error", line: "bg-zinc-400", glint: false };
+    if (s === "invalid")
+      return { label: "Invalid link", line: "bg-zinc-400", glint: false };
+    if (s === "live" && !paused() && loading())
+      return {
+        label: "Buffering",
+        line: "bg-white/30 text-white",
+        glint: true,
+      };
+    if (s === "live" && !paused() && liveBadge())
+      return { label: "Live", line: "bg-red-500", glint: false };
+    return null;
+  };
+  const [lastStatus, setLastStatus] = createSignal(status());
+  createEffect(() => {
+    const current = status();
+    if (current) setLastStatus(current);
+  });
   const [muted, setMuted] = createSignal(true);
   const [volume, setVolume] = createSignal(1);
   const [fullscreen, setFullscreen] = createSignal(false);
@@ -54,9 +119,12 @@ export default function App() {
   const resetIdleTimer = () => {
     setIdle(false);
     clearTimeout(idleTimer);
-    if (fullscreen()) {
-      idleTimer = setTimeout(() => setIdle(true), 3000);
-    }
+    idleTimer = setTimeout(() => setIdle(true), 5000);
+  };
+
+  const onContainerMouseLeave = () => {
+    clearTimeout(idleTimer);
+    setIdle(false);
   };
 
   let lastTouch = 0;
@@ -159,6 +227,7 @@ export default function App() {
       clearTimeout(idleTimer);
       clearTimeout(touchTimer);
       clearTimeout(clickTimer);
+      clearTimeout(liveTimer);
       document.removeEventListener("fullscreenchange", onFullscreenChange);
     });
   });
@@ -167,10 +236,12 @@ export default function App() {
     <main class="flex min-h-screen items-center justify-center p-0 sm:p-4">
       <div
         ref={containerRef}
+        onMouseEnter={resetIdleTimer}
         onMouseMove={resetIdleTimer}
+        onMouseLeave={onContainerMouseLeave}
         onTouchStart={onContainerTouchStart}
         class={`group relative aspect-video max-h-[90vh] w-full max-w-6xl select-none overflow-hidden bg-zinc-900 ${
-          fullscreen() && idle() ? "cursor-none" : ""
+          controlsHidden() ? "cursor-none" : ""
         }`}
       >
         <video
@@ -195,16 +266,7 @@ export default function App() {
             setVolume(videoRef.volume);
           }}
           class={`h-full w-full object-contain ${
-            fullscreen() && idle() ? "cursor-none" : "cursor-pointer"
-          }`}
-        />
-
-        <div
-          aria-hidden="true"
-          class={`vhs-scanlines pointer-events-none absolute inset-0 ${
-            vhsActive()
-              ? "opacity-100 transition-opacity duration-300 ease-out"
-              : "opacity-0"
+            controlsHidden() ? "cursor-none" : "cursor-pointer"
           }`}
         />
 
@@ -213,7 +275,7 @@ export default function App() {
           onClick={togglePlay}
           aria-label={paused() ? "Play" : "Pause"}
           class={`absolute top-1/2 left-1/2 z-10 flex h-16 w-16 -translate-x-1/2 -translate-y-1/2 cursor-pointer items-center justify-center rounded-full bg-black/50 text-white transition-opacity duration-200 ease-out [@media(hover:hover)_and_(pointer:fine)]:hidden ${
-            fullscreen() && idle()
+            controlsHidden()
               ? "pointer-events-none opacity-0"
               : touchControls() || paused()
                 ? "pointer-events-auto opacity-100"
@@ -238,11 +300,13 @@ export default function App() {
 
         <div
           class={`pointer-events-none absolute inset-x-0 bottom-0 h-24 transition-opacity duration-200 ease-out ${
-            fullscreen() && idle()
-              ? "opacity-0"
-              : touchControls() || paused()
-                ? "opacity-100"
-                : "opacity-0 group-hover:opacity-100"
+            status()
+              ? "opacity-100"
+              : controlsHidden()
+                ? "opacity-0"
+                : touchControls() || paused()
+                  ? "opacity-100"
+                  : "opacity-0 group-hover:opacity-100"
           }`}
           style={{
             background:
@@ -251,8 +315,25 @@ export default function App() {
         />
 
         <div
+          role="status"
+          aria-live="polite"
+          aria-hidden={!status() || undefined}
+          data-active={status() ? "" : undefined}
+          class={`status-badge pointer-events-none absolute bottom-2.5 left-1/2 z-10 flex h-12 -translate-x-1/2 flex-col items-center justify-center gap-1 font-sans text-xs font-medium uppercase tracking-[0.06em] text-white/90 transition-opacity duration-200 ease-out [@media(hover:hover)_and_(pointer:fine)]:h-8 ${
+            status() ? "opacity-100" : "opacity-0"
+          }`}
+        >
+          <span class="leading-none">{lastStatus()?.label ?? ""}</span>
+          <span
+            aria-hidden="true"
+            data-glint={lastStatus()?.glint ? "" : undefined}
+            class={`status-line relative h-[2px] w-full overflow-hidden ${lastStatus()?.line ?? ""}`}
+          />
+        </div>
+
+        <div
           class={`absolute inset-x-0 bottom-0 flex items-center justify-between px-3 py-2.5 transition-opacity duration-200 ease-out ${
-            fullscreen() && idle()
+            controlsHidden()
               ? "pointer-events-none opacity-0"
               : touchControls() || paused()
                 ? "pointer-events-auto opacity-100"

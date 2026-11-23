@@ -1,7 +1,33 @@
 import mqtt from "mqtt";
 
 export type ViewerState =
-  "invalid" | "paused" | "waiting" | "connecting" | "live" | "disconnected";
+  | "invalid"
+  | "paused"
+  | "waiting"
+  | "connecting"
+  | "live"
+  | "disconnected"
+  | "no-internet"
+  | "server-offline"
+  | "timed-out"
+  | "unreachable"
+  | "stream-error";
+
+type StandbyState =
+  | "waiting"
+  | "no-internet"
+  | "server-offline"
+  | "timed-out"
+  | "unreachable"
+  | "stream-error";
+
+const isStandby = (s: ViewerState | null): s is StandbyState =>
+  s === "waiting" ||
+  s === "no-internet" ||
+  s === "server-offline" ||
+  s === "timed-out" ||
+  s === "unreachable" ||
+  s === "stream-error";
 
 const MQTT_URL = "wss://broker.emqx.io:8084/mqtt";
 const METRICS_INTERVAL_MS = 5000;
@@ -139,7 +165,7 @@ export function startViewer(
           console.info("[MQTT] Connected");
         }
       });
-      if (state === "waiting") {
+      if (isStandby(state)) {
         void connect("mqtt-reconnect");
         return;
       }
@@ -212,7 +238,7 @@ export function startViewer(
 
   const play = () => {
     if (destroyed) return;
-    if (state === "paused" || state === "waiting") {
+    if (state === "paused" || isStandby(state)) {
       void connect();
     } else if (videoEl.paused && videoEl.srcObject) {
       videoEl.play().catch((err: unknown) => {
@@ -222,13 +248,16 @@ export function startViewer(
     }
   };
 
-  const waitForStream = (reason: string) => {
+  const waitForStream = (
+    reason: string,
+    nextState: StandbyState = "waiting",
+  ) => {
     if (destroyed || state === "paused" || !aesKey) return;
     gen++;
     clearTimers();
     clearSignalingHooks();
     closePc();
-    transition("waiting", reason);
+    transition(nextState, reason);
     ensureMqtt();
   };
 
@@ -541,7 +570,10 @@ export function startViewer(
       if (wasLive && navigator.onLine !== false) {
         void connect(reason);
       } else {
-        waitForStream(reason);
+        waitForStream(
+          reason,
+          navigator.onLine === false ? "no-internet" : "unreachable",
+        );
       }
     };
 
@@ -619,6 +651,7 @@ export function startViewer(
       if (gen !== myGen) return;
       waitForStream(
         `offer-failed: ${err instanceof Error ? err.message : String(err)}`,
+        "stream-error",
       );
       return;
     }
@@ -633,6 +666,11 @@ export function startViewer(
       if (gen !== myGen) return;
       waitForStream(
         `signaling-timeout; mqtt=${client.connected}, offerSent=${offerPublishedAtMs != null}, online=${navigator.onLine}`,
+        navigator.onLine === false
+          ? "no-internet"
+          : !client.connected
+            ? "server-offline"
+            : "waiting",
       );
     }, OFFER_TIMEOUT_MS);
 
@@ -655,7 +693,7 @@ export function startViewer(
         clearTimeout(phaseTimer);
         phaseTimer = setTimeout(() => {
           if (gen !== myGen || pc.connectionState === "connected") return;
-          waitForStream(`handshake-timeout; ${transportInfo(pc)}`);
+          waitForStream(`handshake-timeout; ${transportInfo(pc)}`, "timed-out");
         }, HANDSHAKE_TIMEOUT_MS);
 
         const rttNote =
@@ -669,6 +707,7 @@ export function startViewer(
         if (answerApplied) {
           waitForStream(
             `answer-failed: ${err instanceof Error ? err.message : String(err)}`,
+            "stream-error",
           );
         } else {
           console.warn("[MQTT] Ignored invalid answer:", err);
@@ -683,7 +722,7 @@ export function startViewer(
       client.subscribe(answerTopic, async (err) => {
         if (gen !== myGen) return;
         if (err) {
-          waitForStream(`subscribe-failed: ${err.message}`);
+          waitForStream(`subscribe-failed: ${err.message}`, "server-offline");
           return;
         }
         try {
@@ -713,6 +752,7 @@ export function startViewer(
           if (gen !== myGen) return;
           waitForStream(
             `publish-failed: ${encErr instanceof Error ? encErr.message : String(encErr)}`,
+            "server-offline",
           );
         }
       });
@@ -739,7 +779,7 @@ export function startViewer(
   };
 
   const onOnline = () => {
-    if (state === "waiting") {
+    if (isStandby(state)) {
       void connect("online");
     } else {
       console.info(`[Network] Online (state=${state})`);
@@ -748,6 +788,9 @@ export function startViewer(
 
   const onOffline = () => {
     console.warn(`[Network] Offline (state=${state})`);
+    if (isStandby(state) && state !== "no-internet") {
+      transition("no-internet", "network-offline");
+    }
   };
 
   const onPageHide = () => {

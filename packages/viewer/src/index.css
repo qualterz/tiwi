@@ -9,12 +9,12 @@
   --font-mono: "IBM Plex Mono", ui-monospace, monospace;
 }
 
-@keyframes vhs-roll {
-  from {
-    transform: translateY(-100%);
+@keyframes status-glint {
+  0% {
+    transform: translateX(-100%);
   }
-  to {
-    transform: translateY(100%);
+  100% {
+    transform: translateX(200%);
   }
 }
 
@@ -22,34 +22,18 @@ video::-webkit-media-controls {
   display: none !important;
 }
 
-.vhs-scanlines {
-  overflow: hidden;
-  background-image: repeating-linear-gradient(
-    to bottom,
-    transparent 0 4px,
-    rgba(0, 0, 0, 0.13) 4px 6px
-  );
-}
-
-.vhs-scanlines::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  background-image: linear-gradient(
-    to bottom,
-    transparent 0%,
-    rgba(255, 255, 255, 0.02) 24%,
-    rgba(255, 255, 255, 0.065) 50%,
-    rgba(255, 255, 255, 0.02) 76%,
-    transparent 100%
-  );
-  opacity: 0;
-  transform: translateY(-100%);
-}
-
 @media (prefers-reduced-motion: no-preference) {
-  .vhs-scanlines::before {
-    opacity: 1;
-    animation: vhs-roll 6.5s linear -2s infinite;
+  .status-badge[data-active] .status-line[data-glint]::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    width: 55%;
+    background: linear-gradient(
+      90deg,
+      transparent 0%,
+      currentColor 50%,
+      transparent 100%
+    );
+    animation: status-glint 1.5s ease-in-out infinite;
   }
 }
