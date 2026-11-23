@@ -28,6 +28,38 @@ function CarbonIcon(props: { icon: CarbonIconDescriptor; class?: string }) {
   );
 }
 
+const DEFAULT_VOLUME = 0.2;
+const VOLUME_STORAGE_KEY = "tiwi:volume";
+const MUTED_STORAGE_KEY = "tiwi:muted";
+
+function loadSavedVolume(): number {
+  try {
+    const raw = localStorage.getItem(VOLUME_STORAGE_KEY);
+    if (raw !== null) {
+      const parsed = Number(raw);
+      if (Number.isFinite(parsed) && parsed >= 0 && parsed <= 1) {
+        return parsed;
+      }
+    }
+  } catch {}
+  return DEFAULT_VOLUME;
+}
+
+function loadSavedMuted(): boolean {
+  try {
+    return localStorage.getItem(MUTED_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function saveAudioPrefs(volume: number, muted: boolean) {
+  try {
+    localStorage.setItem(VOLUME_STORAGE_KEY, String(volume));
+    localStorage.setItem(MUTED_STORAGE_KEY, muted ? "1" : "0");
+  } catch {}
+}
+
 export default function App() {
   const [viewerState, setViewerState] = createSignal<ViewerState>("connecting");
   const [loading, setLoading] = createSignal(true);
@@ -140,8 +172,10 @@ export default function App() {
     const current = status();
     if (current) setLastStatus(current);
   });
-  const [muted, setMuted] = createSignal(true);
-  const [volume, setVolume] = createSignal(1);
+  const initialVolume = loadSavedVolume();
+  const initialMuted = loadSavedMuted() || initialVolume === 0;
+  const [muted, setMuted] = createSignal(initialMuted);
+  const [volume, setVolume] = createSignal(initialVolume);
   const [fullscreen, setFullscreen] = createSignal(false);
   const [idle, setIdle] = createSignal(false);
   const [touchControls, setTouchControls] = createSignal(false);
@@ -210,8 +244,14 @@ export default function App() {
   };
 
   const toggleMute = () => {
-    videoRef.muted = !videoRef.muted;
-    setMuted(videoRef.muted);
+    const nextMuted = !videoRef.muted;
+    if (!nextMuted && videoRef.volume === 0) {
+      videoRef.volume = DEFAULT_VOLUME;
+      setVolume(DEFAULT_VOLUME);
+    }
+    videoRef.muted = nextMuted;
+    setMuted(nextMuted);
+    saveAudioPrefs(videoRef.volume, nextMuted);
   };
 
   const onVolumeInput = (
@@ -222,6 +262,7 @@ export default function App() {
     videoRef.muted = val === 0;
     setVolume(val);
     setMuted(videoRef.muted);
+    saveAudioPrefs(val, videoRef.muted);
   };
 
   const toggleFullscreen = () => {
@@ -238,6 +279,8 @@ export default function App() {
   };
 
   onMount(() => {
+    videoRef.volume = initialVolume;
+    videoRef.muted = initialMuted;
     viewer = startViewer(videoRef, setViewerState);
     const onFullscreenChange = () => {
       const isFs = Boolean(document.fullscreenElement);
@@ -283,7 +326,6 @@ export default function App() {
         <video
           ref={videoRef}
           playsinline
-          muted
           onClick={onVideoClick}
           onDblClick={onVideoDblClick}
           onPlay={() => {

@@ -286,6 +286,22 @@ export function startViewer(
         videoEl.srcObject = mediaStream;
         videoEl.play().catch((err: unknown) => {
           if (err instanceof DOMException && err.name === "AbortError") return;
+          if (
+            err instanceof DOMException &&
+            err.name === "NotAllowedError" &&
+            !videoEl.muted
+          ) {
+            videoEl.muted = true;
+            videoEl.play().catch((retryErr: unknown) => {
+              if (
+                retryErr instanceof DOMException &&
+                retryErr.name === "AbortError"
+              )
+                return;
+              console.warn("[Video] Autoplay blocked:", retryErr);
+            });
+            return;
+          }
           console.warn("[Video] Autoplay blocked:", err);
         });
       }
