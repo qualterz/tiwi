@@ -27,7 +27,13 @@ const METRICS_INTERVAL_MS = 5000;
 const ICE_GATHER_TIMEOUT_MS = 5000;
 const OFFER_TIMEOUT_MS = 10_000;
 const HANDSHAKE_TIMEOUT_MS = 15_000;
+const DISCONNECT_UI_DELAY_MS = 1500;
 const DISCONNECT_GRACE_MS = 5000;
+
+const nextMetricsDelay = () => {
+  const rem = METRICS_INTERVAL_MS - (Date.now() % METRICS_INTERVAL_MS);
+  return rem < 1000 ? rem + METRICS_INTERVAL_MS : rem;
+};
 
 const toBase64Url = (buf: Uint8Array) =>
   btoa(String.fromCharCode(...buf))
@@ -311,6 +317,8 @@ export function startViewer(
     const prevRtp = new Map<string, PrevRtp>();
     const startRtp = new Map<string, { ts: number; bytes: number }>();
     let videoPeakKbps = 0;
+    let rttSumMs = 0;
+    let rttSamples = 0;
     let videoCodec: string | null = null;
     let audioCodec: string | null = null;
     let playoutDelayMs: number | null = null;
@@ -371,6 +379,10 @@ export function startViewer(
           pair.currentRoundTripTime != null
             ? Math.round(pair.currentRoundTripTime * 1000)
             : null;
+        if (currentRttMs != null) {
+          rttSumMs += currentRttMs;
+          rttSamples++;
+        }
         const rttMeasurements =
           (pair.roundTripTimeMeasurements as number | undefined) ?? 0;
         const totalRttSec =
@@ -378,7 +390,9 @@ export function startViewer(
         avgRttMs =
           rttMeasurements > 0
             ? Math.round((totalRttSec / rttMeasurements) * 1000)
-            : currentRttMs;
+            : rttSamples > 0
+              ? Math.round(rttSumMs / rttSamples)
+              : currentRttMs;
         oneWayPingMs =
           currentRttMs != null ? Math.round(currentRttMs / 2) : null;
       }
@@ -561,16 +575,13 @@ export function startViewer(
     };
 
     const scheduleStats = () => {
-      statsTimer = setTimeout(
-        async () => {
-          if (gen !== myGen || pc.connectionState !== "connected") return;
-          await logMetrics("[Metrics]");
-          if (gen === myGen && pc.connectionState === "connected") {
-            scheduleStats();
-          }
-        },
-        METRICS_INTERVAL_MS - (Date.now() % METRICS_INTERVAL_MS),
-      );
+      statsTimer = setTimeout(async () => {
+        if (gen !== myGen || pc.connectionState !== "connected") return;
+        await logMetrics("[Metrics]");
+        if (gen === myGen && pc.connectionState === "connected") {
+          scheduleStats();
+        }
+      }, nextMetricsDelay());
     };
 
     let wasLive = false;
@@ -621,17 +632,20 @@ export function startViewer(
         wasLive = true;
         clearTimeout(phaseTimer);
         phaseTimer = undefined;
-        transition("live");
+        if (state !== "live") transition("live");
         if (!statsTimer) scheduleStats();
       } else if (s === "disconnected") {
-        clearTimeout(statsTimer);
-        statsTimer = undefined;
-        transition("disconnected", transportInfo(pc));
         clearTimeout(phaseTimer);
         phaseTimer = setTimeout(() => {
           if (gen !== myGen || pc.connectionState !== "disconnected") return;
-          void handleConnectionLost("disconnected-timeout");
-        }, DISCONNECT_GRACE_MS);
+          clearTimeout(statsTimer);
+          statsTimer = undefined;
+          transition("disconnected", transportInfo(pc));
+          phaseTimer = setTimeout(() => {
+            if (gen !== myGen || pc.connectionState !== "disconnected") return;
+            void handleConnectionLost("disconnected-timeout");
+          }, DISCONNECT_GRACE_MS - DISCONNECT_UI_DELAY_MS);
+        }, DISCONNECT_UI_DELAY_MS);
       } else if (s === "failed" || s === "closed") {
         void handleConnectionLost(`connection-${s}`);
       }
