@@ -8,23 +8,16 @@ export type ViewerState =
   | "live"
   | "disconnected"
   | "no-internet"
-  | "server-offline"
   | "timed-out"
   | "unreachable"
   | "stream-error";
 
 type StandbyState =
-  | "waiting"
-  | "no-internet"
-  | "server-offline"
-  | "timed-out"
-  | "unreachable"
-  | "stream-error";
+  "waiting" | "no-internet" | "timed-out" | "unreachable" | "stream-error";
 
 const isStandby = (s: ViewerState | null): s is StandbyState =>
   s === "waiting" ||
   s === "no-internet" ||
-  s === "server-offline" ||
   s === "timed-out" ||
   s === "unreachable" ||
   s === "stream-error";
@@ -263,6 +256,15 @@ export function startViewer(
 
   const connect = async (reason?: string) => {
     if (destroyed || !aesKey) return;
+    if (navigator.onLine === false) {
+      gen++;
+      clearTimers();
+      clearSignalingHooks();
+      closePc();
+      transition("no-internet", reason ?? "network-offline");
+      ensureMqtt();
+      return;
+    }
     const key = aesKey;
     const myGen = ++gen;
     const viewerId = crypto.randomUUID();
@@ -669,7 +671,7 @@ export function startViewer(
         navigator.onLine === false
           ? "no-internet"
           : !client.connected
-            ? "server-offline"
+            ? "unreachable"
             : "waiting",
       );
     }, OFFER_TIMEOUT_MS);
@@ -693,7 +695,10 @@ export function startViewer(
         clearTimeout(phaseTimer);
         phaseTimer = setTimeout(() => {
           if (gen !== myGen || pc.connectionState === "connected") return;
-          waitForStream(`handshake-timeout; ${transportInfo(pc)}`, "timed-out");
+          waitForStream(
+            `handshake-timeout; ${transportInfo(pc)}`,
+            navigator.onLine === false ? "no-internet" : "timed-out",
+          );
         }, HANDSHAKE_TIMEOUT_MS);
 
         const rttNote =
@@ -722,7 +727,10 @@ export function startViewer(
       client.subscribe(answerTopic, async (err) => {
         if (gen !== myGen) return;
         if (err) {
-          waitForStream(`subscribe-failed: ${err.message}`, "server-offline");
+          waitForStream(
+            `subscribe-failed: ${err.message}`,
+            navigator.onLine === false ? "no-internet" : "unreachable",
+          );
           return;
         }
         try {
@@ -752,7 +760,7 @@ export function startViewer(
           if (gen !== myGen) return;
           waitForStream(
             `publish-failed: ${encErr instanceof Error ? encErr.message : String(encErr)}`,
-            "server-offline",
+            navigator.onLine === false ? "no-internet" : "unreachable",
           );
         }
       });
@@ -788,7 +796,9 @@ export function startViewer(
 
   const onOffline = () => {
     console.warn(`[Network] Offline (state=${state})`);
-    if (isStandby(state) && state !== "no-internet") {
+    if (state === "connecting" || state === "disconnected") {
+      waitForStream("network-offline", "no-internet");
+    } else if (isStandby(state) && state !== "no-internet") {
       transition("no-internet", "network-offline");
     }
   };

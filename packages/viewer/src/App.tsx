@@ -79,8 +79,6 @@ export default function App() {
       };
     if (s === "no-internet")
       return { label: "No internet", line: "bg-zinc-400", glint: false };
-    if (s === "server-offline")
-      return { label: "Server offline", line: "bg-zinc-400", glint: false };
     if (s === "timed-out")
       return { label: "Timed out", line: "bg-zinc-400", glint: false };
     if (s === "unreachable")
