@@ -1,4 +1,5 @@
 import dgram from "dgram";
+import os from "os";
 import {
   RTCPeerConnection,
   MediaStreamTrack,
@@ -14,9 +15,21 @@ import {
 const UDP_BUFFER_BYTES = 16 * 1024 * 1024;
 const RTP_CACHE_SIZE = 4096;
 const RTX_MIN_COOLDOWN_MS = 20;
-const RTX_MAX_COOLDOWN_MS = 200;
+const RTX_MAX_COOLDOWN_MS = 500;
 const RTX_MAX_FRACTION = 0.15;
 const RTX_MIN_PPS = 150;
+
+const emptyRtpCache = new Proxy([] as (RtpPacket | undefined)[], {
+  get: () => undefined,
+  set: () => true,
+});
+
+const isIpv6Ula = (ip: string) => /^f[cd][0-9a-f]{2}:/i.test(ip);
+const isCgnatIpv4 = (ip: string) => {
+  if (!ip.startsWith("100.")) return false;
+  const second = Number(ip.split(".")[1]);
+  return second >= 64 && second <= 127;
+};
 
 const origBind = dgram.Socket.prototype.bind;
 dgram.Socket.prototype.bind = function (
@@ -260,6 +273,14 @@ self.onmessage = async (event: MessageEvent) => {
     try {
       setVideoCodec(videoCodec);
 
+      const hasNonCgnatIpv4 = Object.values(os.networkInterfaces()).some(
+        (addrs) =>
+          addrs?.some(
+            (a) =>
+              a.family === "IPv4" && !a.internal && !isCgnatIpv4(a.address),
+          ),
+      );
+
       const pc = new RTCPeerConnection({
         bandwidthEstimator: "none",
         codecs: {
@@ -275,6 +296,15 @@ self.onmessage = async (event: MessageEvent) => {
           audio: [audioCodec],
         },
         iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+        iceFilterCandidatePair: (pair) => {
+          const local = pair.localCandidate.host;
+          const remote = pair.remoteCandidate.host;
+          if (isIpv6Ula(local) !== isIpv6Ula(remote)) return false;
+          if (hasNonCgnatIpv4 && isCgnatIpv4(local) && !isCgnatIpv4(remote)) {
+            return false;
+          }
+          return true;
+        },
       });
 
       peers.set(viewerId, pc);
@@ -335,6 +365,13 @@ self.onmessage = async (event: MessageEvent) => {
       pc.addTrack(sharedAudioTrack);
 
       if (videoRtpHistory) {
+        // Workaround: disable werift's unthrottled 128-packet rtpCache so all
+        // NACKs go through our 4096-packet history with cooldown and rate cap.
+        Object.defineProperty(videoSender, "rtpCache", {
+          get: () => emptyRtpCache,
+          set: () => {},
+        });
+
         const history = videoRtpHistory;
         const rtxSentAt = new Float64Array(RTP_CACHE_SIZE);
         const rtxSentSeq = new Int32Array(RTP_CACHE_SIZE).fill(-1);
@@ -343,7 +380,6 @@ self.onmessage = async (event: MessageEvent) => {
 
         videoSender.onGenericNack.subscribe(async (feedback) => {
           const sender = videoSender as unknown as {
-            rtpCache: (RtpPacket | undefined)[];
             rtxPayloadType?: number;
             rtxSequenceNumber: number;
             rtxSsrc: number;
@@ -375,10 +411,6 @@ self.onmessage = async (event: MessageEvent) => {
 
           for (const seqNum of feedback.lost) {
             if (rtxWindowSent >= maxRtxPerSec) break;
-            const inSmallCache = sender.rtpCache[seqNum % 128];
-            if (inSmallCache && inSmallCache.header.sequenceNumber === seqNum) {
-              continue;
-            }
             const slot = seqNum % RTP_CACHE_SIZE;
             if (
               rtxSentSeq[slot] === seqNum &&
@@ -543,7 +575,6 @@ self.onmessage = async (event: MessageEvent) => {
           const report = await pc.getStats();
           let selectedPairId: string | undefined;
           let fallbackPair: RTCIceCandidatePairStats | undefined;
-          let rawFractionLost: number | null = null;
           let hasRemoteVideo = false;
           for (const s of report.values()) {
             if (s.type === "outbound-rtp") {
@@ -594,7 +625,6 @@ self.onmessage = async (event: MessageEvent) => {
                   : rttMs;
               if (r.kind === "video") {
                 pm.video.remotePacketsLost = packetsLost;
-                rawFractionLost = r.fractionLost ?? 0;
                 hasRemoteVideo = true;
                 pm.video.remoteRttMs = rttMs;
                 pm.video.remoteAvgRttMs = avgRttMs;
@@ -627,14 +657,11 @@ self.onmessage = async (event: MessageEvent) => {
 
           if (hasRemoteVideo) {
             const prev = prevVideoLoss.get(viewerId);
-            const curLost = pm.video.remotePacketsLost;
+            const curLost = Math.max(0, pm.video.remotePacketsLost);
             const curSent = pm.video.packetsSent;
-            let frac = rawFractionLost ?? 0;
-            if (prev) {
-              const dLost = Math.max(0, curLost - prev.lost);
-              const dSent = curSent - prev.sent;
-              frac = dSent > 0 ? Math.min(1, dLost / dSent) : 0;
-            }
+            const dLost = prev ? Math.max(0, curLost - prev.lost) : curLost;
+            const dSent = prev ? curSent - prev.sent : curSent;
+            const frac = dSent > 0 ? Math.min(1, dLost / dSent) : 0;
             prevVideoLoss.set(viewerId, { lost: curLost, sent: curSent });
             pm.video.remoteFractionLost = Number(frac.toFixed(4));
           }

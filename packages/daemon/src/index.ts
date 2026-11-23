@@ -417,7 +417,9 @@ let activeObsPc: RTCPeerConnection | null = null;
 let obsVideoReceiver: RTCRtpReceiver | null = null;
 let obsVideoSsrc: number | undefined;
 let lastPliSentAtMs = 0;
+const UPLINK_RECOVERY_TICKS = 3;
 let uplinkCongested = false;
+let uplinkCleanTicks = 0;
 
 const requestObsKeyframe = (force = false) => {
   if (!obsVideoReceiver || obsVideoSsrc === undefined) return;
@@ -456,7 +458,11 @@ const workerSlots: WorkerSlot[] = Array.from({ length: WORKER_COUNT }, () => {
       };
       if (closed) {
         slot.peers.delete(viewerId);
-        if (peerToWorker.delete(viewerId)) {
+        const isFailure =
+          state.startsWith("failed") ||
+          state.startsWith("timeout") ||
+          state.endsWith("-failed");
+        if (peerToWorker.delete(viewerId) && isFailure) {
           metrics.peers.totalFailedOrDisconnected++;
         }
         metrics.peers.activeCount = peerToWorker.size;
@@ -780,15 +786,25 @@ const scheduleStats = () => {
             congestedPeers++;
           }
         }
-        const nextCongested =
+        const isCongestedNow =
           connectedPeers >= 2 && congestedPeers > connectedPeers / 2;
-        if (nextCongested !== uplinkCongested) {
-          uplinkCongested = nextCongested;
-          console.warn(
-            uplinkCongested
-              ? `[Uplink] saturated (${congestedPeers}/${connectedPeers} peers congested) — pausing new peer joins`
-              : `[Uplink] recovered — accepting new peers`,
-          );
+        if (isCongestedNow) {
+          uplinkCleanTicks = 0;
+          if (!uplinkCongested) {
+            uplinkCongested = true;
+            console.warn(
+              `[Uplink] saturated (${congestedPeers}/${connectedPeers} peers congested) — pausing new peer joins`,
+            );
+          }
+        } else if (uplinkCongested) {
+          if (
+            connectedPeers < 2 ||
+            ++uplinkCleanTicks >= UPLINK_RECOVERY_TICKS
+          ) {
+            uplinkCongested = false;
+            uplinkCleanTicks = 0;
+            console.warn(`[Uplink] recovered — accepting new peers`);
+          }
         }
 
         if (useTui) {
