@@ -9,6 +9,11 @@
   --font-mono: "IBM Plex Mono", ui-monospace, monospace;
 }
 
+:root {
+  --control-fg: #ffffff;
+  --control-muted: rgba(255, 255, 255, 0.25);
+}
+
 @keyframes status-glint {
   0% {
     transform: translateX(-100%);
@@ -40,4 +45,64 @@ video::-webkit-media-controls {
     );
     animation: status-glint 1.5s ease-in-out infinite;
   }
+}
+
+.control-tip {
+  display: none;
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  translate: -50% 0;
+  pointer-events: none;
+  padding: 4px 4px 4px 8px;
+  background: var(--control-muted);
+  color: var(--control-fg);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  line-height: 1;
+  white-space: nowrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.control-tip-start {
+  left: 0;
+  translate: 0 0;
+}
+
+.control-tip-end {
+  left: auto;
+  right: 0;
+  translate: 0 0;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .control-anchor:hover > .control-tip {
+    display: flex;
+  }
+}
+
+.control-anchor:has(:focus-visible) > .control-tip {
+  display: flex;
+}
+
+.control-kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 4px;
+  border: 1px solid var(--control-muted);
+  color: var(--control-fg);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1;
+}
+
+.control-kbd:has(svg) {
+  padding: 0;
 }

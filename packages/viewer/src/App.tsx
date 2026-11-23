@@ -428,7 +428,7 @@ export default function App() {
         </button>
 
         <div
-          class={`pointer-events-none absolute inset-x-0 bottom-0 h-24 transition-opacity duration-200 ease-out ${
+          class={`pointer-events-none absolute inset-x-0 bottom-0 h-32 transition-opacity duration-200 ease-out ${
             status()
               ? "opacity-100"
               : controlsHidden()
@@ -455,85 +455,103 @@ export default function App() {
           }`}
         >
           <div class="flex flex-1 items-center">
-            <button
-              type="button"
-              onClick={togglePlay}
-              aria-label={paused() ? "Play" : "Pause"}
-              aria-keyshortcuts="Space"
-              class="group/btn relative hidden h-8 w-8 cursor-pointer items-center justify-center overflow-hidden rounded-full text-white [@media(hover:hover)_and_(pointer:fine)]:flex"
-            >
-              <span
-                aria-hidden="true"
-                class="pointer-events-none absolute inset-0 scale-75 rounded-full bg-white/20 opacity-0 transition duration-75 ease-out group-hover/btn:scale-100 group-hover/btn:opacity-100"
-              />
-              {paused() ? (
-                <CarbonIcon icon={playFilledIcon} />
-              ) : (
-                <svg
-                  width="16"
-                  height="16"
-                  viewBox="0 0 16 16"
-                  fill="currentColor"
-                  aria-hidden="true"
-                >
-                  <rect x="4" y="3" width="3" height="10" />
-                  <rect x="9" y="3" width="3" height="10" />
-                </svg>
-              )}
-            </button>
-            <div class="flex items-center">
+            <div class="control-anchor relative hidden [@media(hover:hover)_and_(pointer:fine)]:flex">
               <button
                 type="button"
-                onClick={toggleMute}
-                aria-label={muted() ? "Unmute" : "Mute"}
-                aria-keyshortcuts="m"
-                class="group/btn relative flex h-12 w-12 cursor-pointer items-center justify-center overflow-hidden rounded-full text-white [@media(hover:hover)_and_(pointer:fine)]:h-8 [@media(hover:hover)_and_(pointer:fine)]:w-8"
+                onClick={togglePlay}
+                aria-label={paused() ? "Play" : "Pause"}
+                aria-describedby="tip-play"
+                aria-keyshortcuts="Space"
+                class="group/btn relative flex h-8 w-8 cursor-pointer items-center justify-center overflow-hidden rounded-full text-white"
               >
                 <span
                   aria-hidden="true"
-                  class="pointer-events-none absolute inset-0 scale-75 rounded-full bg-white/20 opacity-0 transition duration-75 ease-out group-hover/btn:scale-100 group-hover/btn:opacity-100"
+                  class="pointer-events-none absolute inset-0 scale-75 rounded-full bg-[var(--control-muted)] opacity-0 transition duration-75 ease-out group-hover/btn:scale-100 group-hover/btn:opacity-100"
                 />
-                <svg
-                  width="16"
-                  height="16"
-                  viewBox="0 0 16 16"
-                  fill="none"
-                  aria-hidden="true"
+                {paused() ? (
+                  <CarbonIcon icon={playFilledIcon} />
+                ) : (
+                  <svg
+                    width="16"
+                    height="16"
+                    viewBox="0 0 16 16"
+                    fill="currentColor"
+                    aria-hidden="true"
+                  >
+                    <rect x="4" y="3" width="3" height="10" />
+                    <rect x="9" y="3" width="3" height="10" />
+                  </svg>
+                )}
+              </button>
+              <div
+                id="tip-play"
+                role="tooltip"
+                class="control-tip control-tip-start"
+              >
+                <span>{paused() ? "Play" : "Pause"}</span>
+                <kbd class="control-kbd">Space</kbd>
+              </div>
+            </div>
+            <div class="flex items-center">
+              <div class="control-anchor relative flex">
+                <button
+                  type="button"
+                  onClick={toggleMute}
+                  aria-label={muted() ? "Unmute" : "Mute"}
+                  aria-describedby="tip-mute"
+                  aria-keyshortcuts="m"
+                  class="group/btn relative flex h-12 w-12 cursor-pointer items-center justify-center overflow-hidden rounded-full text-white [@media(hover:hover)_and_(pointer:fine)]:h-8 [@media(hover:hover)_and_(pointer:fine)]:w-8"
                 >
-                  <g transform="translate(-0.55 0)">
-                    <path
-                      d="M2 6.2c0-.44.36-.8.8-.8h2.4L8.6 2.7a.5.5 0 0 1 .8.4v9.8a.5.5 0 0 1-.8.4L5.2 10.6H2.8a.8.8 0 0 1-.8-.8V6.2z"
-                      fill="currentColor"
-                    />
-                    {muted() || volume() === 0 ? (
+                  <span
+                    aria-hidden="true"
+                    class="pointer-events-none absolute inset-0 scale-75 rounded-full bg-[var(--control-muted)] opacity-0 transition duration-75 ease-out group-hover/btn:scale-100 group-hover/btn:opacity-100"
+                  />
+                  <svg
+                    width="16"
+                    height="16"
+                    viewBox="0 0 16 16"
+                    fill="none"
+                    aria-hidden="true"
+                  >
+                    <g transform="translate(-0.55 0)">
                       <path
-                        d="M11.5 6.2l3 3.6m0-3.6l-3 3.6"
-                        stroke="currentColor"
-                        stroke-width="1.5"
-                        stroke-linecap="round"
+                        d="M2 6.2c0-.44.36-.8.8-.8h2.4L8.6 2.7a.5.5 0 0 1 .8.4v9.8a.5.5 0 0 1-.8.4L5.2 10.6H2.8a.8.8 0 0 1-.8-.8V6.2z"
+                        fill="currentColor"
                       />
-                    ) : (
-                      <>
+                      {muted() || volume() === 0 ? (
                         <path
-                          d="M11.2 5.7a3.2 3.2 0 0 1 0 4.6"
+                          d="M11.5 6.2l3 3.6m0-3.6l-3 3.6"
                           stroke="currentColor"
                           stroke-width="1.5"
                           stroke-linecap="round"
                         />
-                        {volume() > 0.5 && (
+                      ) : (
+                        <>
                           <path
-                            d="M13.2 3.8a6 6 0 0 1 0 8.4"
+                            d="M11.2 5.7a3.2 3.2 0 0 1 0 4.6"
                             stroke="currentColor"
                             stroke-width="1.5"
                             stroke-linecap="round"
                           />
-                        )}
-                      </>
-                    )}
-                  </g>
-                </svg>
-              </button>
-              <div class="relative ml-2 hidden h-8 items-center [@media(hover:hover)_and_(pointer:fine)]:flex">
+                          {volume() > 0.5 && (
+                            <path
+                              d="M13.2 3.8a6 6 0 0 1 0 8.4"
+                              stroke="currentColor"
+                              stroke-width="1.5"
+                              stroke-linecap="round"
+                            />
+                          )}
+                        </>
+                      )}
+                    </g>
+                  </svg>
+                </button>
+                <div id="tip-mute" role="tooltip" class="control-tip">
+                  <span>{muted() ? "Unmute" : "Mute"}</span>
+                  <kbd class="control-kbd">M</kbd>
+                </div>
+              </div>
+              <div class="control-anchor relative ml-2 hidden h-8 items-center [@media(hover:hover)_and_(pointer:fine)]:flex">
                 <svg
                   width="93"
                   height="10"
@@ -552,8 +570,8 @@ export default function App() {
                         fill={
                           i / 15 <= (muted() ? 0 : volume()) &&
                           !(muted() || volume() === 0)
-                            ? "rgba(255,255,255,1)"
-                            : "rgba(255,255,255,0.35)"
+                            ? "var(--control-fg)"
+                            : "var(--control-muted)"
                         }
                       />
                     )}
@@ -567,9 +585,43 @@ export default function App() {
                   value={muted() ? 0 : volume()}
                   onInput={onVolumeInput}
                   aria-label="Volume"
+                  aria-describedby="tip-volume"
                   aria-keyshortcuts="ArrowUp ArrowDown"
                   class="absolute inset-y-0 left-0 z-10 h-8 w-[calc(100%+6px)] cursor-pointer appearance-none bg-transparent [&::-moz-range-thumb]:h-5 [&::-moz-range-thumb]:w-1.5 [&::-moz-range-thumb]:rounded-none [&::-moz-range-thumb]:border-0 [&::-moz-range-thumb]:bg-white [&::-moz-range-track]:h-1 [&::-moz-range-track]:bg-transparent [&::-webkit-slider-runnable-track]:h-1 [&::-webkit-slider-runnable-track]:bg-transparent [&::-webkit-slider-thumb]:-mt-2 [&::-webkit-slider-thumb]:h-5 [&::-webkit-slider-thumb]:w-1.5 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-none [&::-webkit-slider-thumb]:bg-white"
                 />
+                <div id="tip-volume" role="tooltip" class="control-tip">
+                  <span>Volume</span>
+                  <span class="inline-flex items-center gap-1">
+                    <kbd class="control-kbd" aria-label="Up arrow">
+                      <svg
+                        width="10"
+                        height="10"
+                        viewBox="0 0 10 10"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.25"
+                        stroke-linecap="square"
+                        aria-hidden="true"
+                      >
+                        <path d="M5 8V2M2.5 4.5L5 2l2.5 2.5" />
+                      </svg>
+                    </kbd>
+                    <kbd class="control-kbd" aria-label="Down arrow">
+                      <svg
+                        width="10"
+                        height="10"
+                        viewBox="0 0 10 10"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.25"
+                        stroke-linecap="square"
+                        aria-hidden="true"
+                      >
+                        <path d="M5 2v6M2.5 5.5L5 8l2.5-2.5" />
+                      </svg>
+                    </kbd>
+                  </span>
+                </div>
               </div>
             </div>
           </div>
@@ -592,34 +644,45 @@ export default function App() {
             />
           </div>
           <div class="flex flex-1 items-center justify-end">
-            <button
-              type="button"
-              onClick={toggleFullscreen}
-              aria-label={fullscreen() ? "Exit fullscreen" : "Fullscreen"}
-              aria-keyshortcuts="f"
-              class="group/btn relative flex h-12 w-12 cursor-pointer items-center justify-center overflow-hidden rounded-full text-white [@media(hover:hover)_and_(pointer:fine)]:h-8 [@media(hover:hover)_and_(pointer:fine)]:w-8"
-            >
-              <span
-                aria-hidden="true"
-                class="pointer-events-none absolute inset-0 scale-75 rounded-full bg-white/20 opacity-0 transition duration-75 ease-out group-hover/btn:scale-100 group-hover/btn:opacity-100"
-              />
-              <svg
-                width="16"
-                height="16"
-                viewBox="0 0 16 16"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.5"
-                stroke-linecap="square"
-                aria-hidden="true"
+            <div class="control-anchor relative flex">
+              <button
+                type="button"
+                onClick={toggleFullscreen}
+                aria-label={fullscreen() ? "Exit fullscreen" : "Fullscreen"}
+                aria-describedby="tip-fullscreen"
+                aria-keyshortcuts="f"
+                class="group/btn relative flex h-12 w-12 cursor-pointer items-center justify-center overflow-hidden rounded-full text-white [@media(hover:hover)_and_(pointer:fine)]:h-8 [@media(hover:hover)_and_(pointer:fine)]:w-8"
               >
-                {fullscreen() ? (
-                  <path d="M6 2v4H2M10 2v4h4M6 14v-4H2M10 14v-4h4" />
-                ) : (
-                  <path d="M2 6V2h4M14 6V2h-4M2 10v4h4M14 10v4h-4" />
-                )}
-              </svg>
-            </button>
+                <span
+                  aria-hidden="true"
+                  class="pointer-events-none absolute inset-0 scale-75 rounded-full bg-[var(--control-muted)] opacity-0 transition duration-75 ease-out group-hover/btn:scale-100 group-hover/btn:opacity-100"
+                />
+                <svg
+                  width="16"
+                  height="16"
+                  viewBox="0 0 16 16"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.5"
+                  stroke-linecap="square"
+                  aria-hidden="true"
+                >
+                  {fullscreen() ? (
+                    <path d="M6 2v4H2M10 2v4h4M6 14v-4H2M10 14v-4h4" />
+                  ) : (
+                    <path d="M2 6V2h4M14 6V2h-4M2 10v4h4M14 10v4h-4" />
+                  )}
+                </svg>
+              </button>
+              <div
+                id="tip-fullscreen"
+                role="tooltip"
+                class="control-tip control-tip-end"
+              >
+                <span>{fullscreen() ? "Exit fullscreen" : "Fullscreen"}</span>
+                <kbd class="control-kbd">F</kbd>
+              </div>
+            </div>
           </div>
         </div>
       </div>
