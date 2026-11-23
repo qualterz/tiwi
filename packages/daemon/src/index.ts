@@ -46,17 +46,19 @@ if (BUILD_CHANNEL === "exe" && process.platform === "win32") {
 }
 
 // Enlarge OS UDP socket buffers (default 64KB on Windows overflows during 30-55Mbps keyframe bursts)
-const origCreateSocket = dgram.createSocket;
-dgram.createSocket = ((...args: Parameters<typeof dgram.createSocket>) => {
-  const sock = origCreateSocket(...args);
-  sock.once("listening", () => {
+const origBind = dgram.Socket.prototype.bind;
+dgram.Socket.prototype.bind = function (
+  this: dgram.Socket,
+  ...args: Parameters<dgram.Socket["bind"]>
+) {
+  this.once("listening", () => {
     try {
-      sock.setRecvBufferSize(UDP_BUFFER_BYTES);
-      sock.setSendBufferSize(UDP_BUFFER_BYTES);
+      this.setRecvBufferSize(UDP_BUFFER_BYTES);
+      this.setSendBufferSize(UDP_BUFFER_BYTES);
     } catch {}
   });
-  return sock;
-}) as typeof dgram.createSocket;
+  return origBind.apply(this, args);
+} as dgram.Socket["bind"];
 
 // 1. Parse CLI flags and handle subcommands/meta flags
 const { values, positionals } = parseArgs({

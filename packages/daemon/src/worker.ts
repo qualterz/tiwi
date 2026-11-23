@@ -14,17 +14,19 @@ import {
 const UDP_BUFFER_BYTES = 16 * 1024 * 1024;
 const RTP_CACHE_SIZE = 4096;
 
-const origCreateSocket = dgram.createSocket;
-dgram.createSocket = ((...args: Parameters<typeof dgram.createSocket>) => {
-  const sock = origCreateSocket(...args);
-  sock.once("listening", () => {
+const origBind = dgram.Socket.prototype.bind;
+dgram.Socket.prototype.bind = function (
+  this: dgram.Socket,
+  ...args: Parameters<dgram.Socket["bind"]>
+) {
+  this.once("listening", () => {
     try {
-      sock.setRecvBufferSize(UDP_BUFFER_BYTES);
-      sock.setSendBufferSize(UDP_BUFFER_BYTES);
+      this.setRecvBufferSize(UDP_BUFFER_BYTES);
+      this.setSendBufferSize(UDP_BUFFER_BYTES);
     } catch {}
   });
-  return sock;
-}) as typeof dgram.createSocket;
+  return origBind.apply(this, args);
+} as dgram.Socket["bind"];
 
 export type CodecConfig = {
   mimeType: string;
