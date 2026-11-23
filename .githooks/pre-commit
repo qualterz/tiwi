@@ -1,5 +1,5 @@
 #!/bin/sh
 set -e
 
-git diff --cached --name-only --diff-filter=ACMR -z | xargs -0 -r bun prettier --write --ignore-unknown --ignore-path .gitignore --
+git diff --cached --name-only --diff-filter=ACMR -z | xargs -0 -r bun prettier --write --ignore-unknown --ignore-path .gitignore --ignore-path .prettierignore --
 git diff --cached --name-only --diff-filter=ACMR -z | xargs -0 -r git add --

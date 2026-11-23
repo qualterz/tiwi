@@ -13,8 +13,8 @@
     "build:dashboard": "bun run --filter @tiwi/dashboard build",
     "build:viewer": "bun run --filter @tiwi/viewer build",
     "typecheck": "bun run --filter '*' typecheck",
-    "format": "prettier --write . --ignore-path .gitignore",
-    "format:check": "prettier --check . --ignore-path .gitignore",
+    "format": "prettier --write . --ignore-path .gitignore --ignore-path .prettierignore",
+    "format:check": "prettier --check . --ignore-path .gitignore --ignore-path .prettierignore",
     "prepare": "git config core.hooksPath .githooks"
   },
   "devDependencies": {

@@ -95,4 +95,4 @@
       <ComponentGroupRef Id="ProductComponents" />
     </Feature>
   </Package>
-</Wix>;
+</Wix>
