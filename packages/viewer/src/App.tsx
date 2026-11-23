@@ -28,12 +28,16 @@ function CarbonIcon(props: { icon: CarbonIconDescriptor; class?: string }) {
   );
 }
 
-const DEFAULT_VOLUME = 0.2;
+const HAS_FINE_POINTER = window.matchMedia(
+  "(hover: hover) and (pointer: fine)",
+).matches;
+const DEFAULT_VOLUME = HAS_FINE_POINTER ? 0.2 : 1;
 const VOLUME_STEP = 0.05;
 const VOLUME_STORAGE_KEY = "tiwi:volume";
 const MUTED_STORAGE_KEY = "tiwi:muted";
 
 function loadSavedVolume(): number {
+  if (!HAS_FINE_POINTER) return 1;
   try {
     const raw = localStorage.getItem(VOLUME_STORAGE_KEY);
     if (raw !== null) {
