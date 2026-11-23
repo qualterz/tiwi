@@ -34,6 +34,11 @@ export default function App() {
   const [videoPaused, setVideoPaused] = createSignal(true);
   const paused = () =>
     viewerState() === "paused" || (viewerState() === "live" && videoPaused());
+  const vhsActive = () =>
+    viewerState() === "waiting" ||
+    viewerState() === "connecting" ||
+    viewerState() === "disconnected" ||
+    (viewerState() === "live" && !paused() && loading());
   const [muted, setMuted] = createSignal(true);
   const [volume, setVolume] = createSignal(1);
   const [fullscreen, setFullscreen] = createSignal(false);
@@ -195,13 +200,9 @@ export default function App() {
         />
 
         <div
+          aria-hidden="true"
           class={`vhs-scanlines pointer-events-none absolute inset-0 transition-opacity duration-300 ease-out ${
-            viewerState() === "waiting" ||
-            viewerState() === "connecting" ||
-            viewerState() === "disconnected" ||
-            (viewerState() === "live" && !paused() && loading())
-              ? "opacity-100"
-              : "opacity-0"
+            vhsActive() ? "opacity-100" : "opacity-0"
           }`}
         />
 

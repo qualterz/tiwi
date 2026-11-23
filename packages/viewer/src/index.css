@@ -9,12 +9,12 @@
   --font-mono: "IBM Plex Mono", ui-monospace, monospace;
 }
 
-@keyframes vhs-scan {
+@keyframes vhs-roll {
   from {
-    background-position: 0 0;
+    transform: translateY(-100%);
   }
   to {
-    background-position: 0 100%;
+    transform: translateY(100%);
   }
 }
 
@@ -23,13 +23,33 @@ video::-webkit-media-controls {
 }
 
 .vhs-scanlines {
+  overflow: hidden;
   background-image: repeating-linear-gradient(
     to bottom,
-    transparent 0%,
-    rgba(255, 255, 255, 0.05) 12%,
-    transparent 24%,
-    transparent 50%
+    transparent 0 4px,
+    rgba(0, 0, 0, 0.13) 4px 6px
   );
-  background-size: 100% 200%;
-  animation: vhs-scan 5s ease-in-out infinite alternate;
+}
+
+.vhs-scanlines::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image: linear-gradient(
+    to bottom,
+    transparent 0%,
+    rgba(255, 255, 255, 0.02) 24%,
+    rgba(255, 255, 255, 0.065) 50%,
+    rgba(255, 255, 255, 0.02) 76%,
+    transparent 100%
+  );
+  opacity: 0;
+  transform: translateY(-100%);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .vhs-scanlines::before {
+    opacity: 1;
+    animation: vhs-roll 6.5s linear -2s infinite;
+  }
 }
