@@ -201,8 +201,10 @@ export default function App() {
 
         <div
           aria-hidden="true"
-          class={`vhs-scanlines pointer-events-none absolute inset-0 transition-opacity duration-300 ease-out ${
-            vhsActive() ? "opacity-100" : "opacity-0"
+          class={`vhs-scanlines pointer-events-none absolute inset-0 ${
+            vhsActive()
+              ? "opacity-100 transition-opacity duration-300 ease-out"
+              : "opacity-0"
           }`}
         />
 
