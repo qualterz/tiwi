@@ -1,37 +1,58 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rand::RngCore;
 use socket2::{Domain, Protocol as SockProto, Socket, Type};
 use str0m::Candidate;
 use tokio::net::UdpSocket;
+use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
 
-// Asymmetric UDP buffers: 4 MB receive avoids multi-second bufferbloat under overload;
-// 16 MB send absorbs high-fanout egress bursts across worker shards.
-const UDP_RECV_BUFFER_BYTES: usize = 4 * 1024 * 1024;
-const UDP_SEND_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+// Ingest receives OBS media (high RX, tiny RTCP/STUN TX).
+const INGEST_RECV_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+const INGEST_SEND_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
-pub fn bind_shared_udp(port: u16) -> std::io::Result<(UdpSocket, Arc<std::net::UdpSocket>)> {
+// Each egress shard handles viewer media TX (high TX) and viewer STUN/DTLS/RTCP RX (low RX).
+const SHARD_RECV_BUFFER_BYTES: usize = 1024 * 1024;
+const SHARD_SEND_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+
+pub struct BoundCandidates {
+    pub local_port: u16,
+    pub loopback_addr: SocketAddr,
+    pub host_addr: SocketAddr,
+    pub candidates: Vec<Candidate>,
+}
+
+pub fn bind_ingest_udp(port: u16) -> std::io::Result<UdpSocket> {
+    let std_udp = bind_udp_socket(port, INGEST_RECV_BUFFER_BYTES, INGEST_SEND_BUFFER_BYTES)?;
+    UdpSocket::from_std(std_udp)
+}
+
+pub fn bind_shard_udp(port: u16) -> std::io::Result<UdpSocket> {
+    let std_udp = bind_udp_socket(port, SHARD_RECV_BUFFER_BYTES, SHARD_SEND_BUFFER_BYTES)?;
+    UdpSocket::from_std(std_udp)
+}
+
+fn bind_udp_socket(
+    port: u16,
+    recv_buf: usize,
+    send_buf: usize,
+) -> std::io::Result<std::net::UdpSocket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(SockProto::UDP))?;
     sock.set_nonblocking(true)?;
     #[cfg(windows)]
     disable_udp_connreset(&sock);
-    if let Err(e) = sock.set_recv_buffer_size(UDP_RECV_BUFFER_BYTES) {
-        debug!("Could not set UDP SO_RCVBUF to 4MB: {e}");
+    if let Err(e) = sock.set_recv_buffer_size(recv_buf) {
+        debug!("Could not set UDP SO_RCVBUF to {recv_buf}: {e}");
     }
-    if let Err(e) = sock.set_send_buffer_size(UDP_SEND_BUFFER_BYTES) {
-        debug!("Could not set UDP SO_SNDBUF to 16MB: {e}");
+    if let Err(e) = sock.set_send_buffer_size(send_buf) {
+        debug!("Could not set UDP SO_SNDBUF to {send_buf}: {e}");
     }
-    let addr: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
     sock.bind(&addr.into())?;
-    let std_udp: std::net::UdpSocket = sock.into();
-    let tx_udp = std_udp.try_clone()?;
-    tx_udp.set_nonblocking(true)?;
-    Ok((UdpSocket::from_std(std_udp)?, Arc::new(tx_udp)))
+    Ok(sock.into())
 }
 
 #[cfg(windows)]
@@ -78,54 +99,109 @@ fn disable_udp_connreset(sock: &Socket) {
     }
 }
 
-pub async fn gather_local_candidates(
-    socket: &UdpSocket,
-    local_port: u16,
+/// Gathers host + server-reflexive ICE candidates for a batch of UDP sockets in parallel
+/// (single LAN route lookup, single STUN DNS resolution, concurrent STUN probes).
+pub async fn gather_all_candidates(
+    sockets: Vec<UdpSocket>,
     config: &Config,
-) -> (Vec<Candidate>, SocketAddr) {
-    let mut candidates = Vec::new();
-
-    // Always add loopback host candidate for local OBS WHIP.
-    let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), local_port);
-    if let Ok(c) = Candidate::host(loopback, "udp") {
-        candidates.push(c);
-    }
-
-    // Discover primary LAN IP via UDP route lookup (no packet sent).
+) -> Vec<(UdpSocket, BoundCandidates)> {
     let lan_ip = discover_lan_ip();
-    if let Some(ip) = lan_ip
-        && !ip.is_loopback()
-    {
-        let lan_addr = SocketAddr::new(ip, local_port);
-        if let Ok(c) = Candidate::host(lan_addr, "udp") {
-            candidates.push(c);
+    let stun_addr = if config.public_ip.is_none() && !config.stun_server.is_empty() {
+        match resolve_stun_addr(&config.stun_server).await {
+            Ok(addr) => Some(addr),
+            Err(e) => {
+                warn!(
+                    stun = %config.stun_server,
+                    "STUN DNS lookup failed: {e} (continuing with host candidates only)"
+                );
+                None
+            }
         }
-    }
+    } else {
+        None
+    };
 
-    let base_addr = SocketAddr::new(lan_ip.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)), local_port);
+    let public_ip = config.public_ip;
+    let stun_label = config.stun_server.clone();
+    let count = sockets.len();
 
-    // Public / server-reflexive candidate: static public_ip if configured, else one-shot STUN.
-    if let Some(pub_ip) = config.public_ip {
-        let pub_addr = SocketAddr::new(pub_ip, local_port);
-        if let Ok(c) = Candidate::server_reflexive(pub_addr, base_addr, "udp") {
-            info!(public = %pub_addr, "Using configured static public IP candidate");
-            candidates.push(c);
-        }
-    } else if !config.stun_server.is_empty() {
-        match stun_discover_mapped_addr(socket, &config.stun_server).await {
-            Ok(mapped) => {
-                info!(srflx = %mapped, stun = %config.stun_server, "Discovered STUN candidate");
-                if let Ok(c) = Candidate::server_reflexive(mapped, base_addr, "udp") {
+    let mut set = JoinSet::new();
+    for (idx, socket) in sockets.into_iter().enumerate() {
+        let stun_label = stun_label.clone();
+        set.spawn(async move {
+            let local_port = socket.local_addr().expect("bound UDP socket").port();
+            let loopback_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), local_port);
+            let host_addr = SocketAddr::new(
+                lan_ip.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                local_port,
+            );
+
+            let mut candidates = Vec::with_capacity(3);
+            if let Ok(c) = Candidate::host(loopback_addr, "udp") {
+                candidates.push(c);
+            }
+            if let Some(ip) = lan_ip
+                && !ip.is_loopback()
+                && let Ok(c) = Candidate::host(SocketAddr::new(ip, local_port), "udp")
+            {
+                candidates.push(c);
+            }
+
+            if let Some(pub_ip) = public_ip {
+                let pub_addr = SocketAddr::new(pub_ip, local_port);
+                if let Ok(c) = Candidate::server_reflexive(pub_addr, host_addr, "udp") {
+                    if idx == 0 {
+                        info!(public = %pub_addr, "Using configured static public IP candidate");
+                    }
                     candidates.push(c);
                 }
+            } else if let Some(stun_addr) = stun_addr {
+                match stun_discover_mapped_addr(&socket, stun_addr).await {
+                    Ok(mapped) => {
+                        if idx == 0 {
+                            info!(srflx = %mapped, stun = %stun_label, "Discovered STUN candidate");
+                        } else {
+                            debug!(shard = idx - 1, srflx = %mapped, "Discovered shard STUN candidate");
+                        }
+                        if let Ok(c) = Candidate::server_reflexive(mapped, host_addr, "udp") {
+                            candidates.push(c);
+                        }
+                    }
+                    Err(e) => {
+                        if idx == 0 {
+                            warn!(stun = %stun_label, "STUN discovery failed: {e} (continuing with host candidates only)");
+                        } else {
+                            debug!(shard = idx - 1, "Shard STUN discovery failed: {e}");
+                        }
+                    }
+                }
             }
-            Err(e) => {
-                warn!(stun = %config.stun_server, "STUN discovery failed: {e} (continuing with host candidates only)");
-            }
+
+            (
+                idx,
+                socket,
+                BoundCandidates {
+                    local_port,
+                    loopback_addr,
+                    host_addr,
+                    candidates,
+                },
+            )
+        });
+    }
+
+    let mut ordered: Vec<Option<(UdpSocket, BoundCandidates)>> =
+        (0..count).map(|_| None).collect();
+    while let Some(res) = set.join_next().await {
+        if let Ok((idx, socket, info)) = res {
+            ordered[idx] = Some((socket, info));
         }
     }
 
-    (candidates, base_addr)
+    ordered
+        .into_iter()
+        .map(|slot| slot.expect("candidate gathering task panicked"))
+        .collect()
 }
 
 fn discover_lan_ip() -> Option<IpAddr> {
@@ -134,18 +210,20 @@ fn discover_lan_ip() -> Option<IpAddr> {
     Some(sock.local_addr().ok()?.ip())
 }
 
-/// Minimal RFC 5389 STUN Binding Request on the shared UDP socket so the NAT mapping
-/// matches the exact port used for WebRTC media.
-async fn stun_discover_mapped_addr(
-    socket: &UdpSocket,
-    stun_server: &str,
-) -> Result<SocketAddr, String> {
-    let stun_addr = tokio::net::lookup_host(stun_server)
+async fn resolve_stun_addr(stun_server: &str) -> Result<SocketAddr, String> {
+    tokio::net::lookup_host(stun_server)
         .await
         .map_err(|e| e.to_string())?
         .find(|a| a.is_ipv4())
-        .ok_or_else(|| "no IPv4 address for STUN server".to_string())?;
+        .ok_or_else(|| "no IPv4 address for STUN server".to_string())
+}
 
+/// Minimal RFC 5389 STUN Binding Request on a bound UDP socket so the NAT mapping
+/// matches the exact port used for WebRTC media.
+async fn stun_discover_mapped_addr(
+    socket: &UdpSocket,
+    stun_addr: SocketAddr,
+) -> Result<SocketAddr, String> {
     let mut tx_id = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut tx_id);
 

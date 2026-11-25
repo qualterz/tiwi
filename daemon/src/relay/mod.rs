@@ -3,7 +3,7 @@ mod net;
 
 use std::collections::HashMap;
 use std::io::ErrorKind;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self as std_mpsc, RecvTimeoutError, TryRecvError, TrySendError};
@@ -17,11 +17,12 @@ use str0m::media::{KeyframeRequestKind, MediaKind, Mid, Pt};
 use str0m::net::{Protocol, Receive};
 use str0m::rtp::{RtpWrite, SeqNo, Ssrc};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
+use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, error, info, trace, warn};
 
 use self::metrics::{MetricsRollup, MetricsWriter, RelayMetrics, ShardCounters};
-use self::net::{bind_shared_udp, gather_local_candidates};
+use self::net::{BoundCandidates, bind_ingest_udp, bind_shard_udp, gather_all_candidates};
 use crate::config::Config;
 use crate::signal::{SignalEvent, ViewerOffer};
 use crate::whip::{WhipAccepted, WhipCommand, WhipError};
@@ -37,6 +38,7 @@ const RTX_CONGESTED_RATIO_CAP: f32 = 0.05;
 const SHARD_CHANNEL_CAP: usize = 2048;
 const MAX_UDP_BATCH: usize = 64;
 const MAX_SHARD_BATCH: usize = 64;
+const SHARD_UDP_POLL_CAP: Duration = Duration::from_millis(2);
 
 struct IngestSession {
     id: String,
@@ -82,28 +84,15 @@ struct SharedRtp {
 
 enum ShardMsg {
     Rtp(Arc<SharedRtp>),
-    Udp {
-        source: SocketAddr,
-        dest: SocketAddr,
-        data: Box<[u8]>,
-        recv_time: Instant,
-    },
     AddViewer {
         viewer_id: String,
         sdp: String,
         video_codec: Option<Codec>,
-        candidates: Vec<Candidate>,
         reply: oneshot::Sender<Result<String, String>>,
     },
     SetCongested(bool),
     ClearViewers,
     Shutdown,
-}
-
-enum ShardFeedback {
-    BindAddr { source: SocketAddr, shard_id: usize },
-    UnbindAddr { source: SocketAddr },
-    RequestPli,
 }
 
 struct ShardHandle {
@@ -119,16 +108,52 @@ pub async fn run(
     signal_tx: mpsc::Sender<SignalEvent>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    let (socket, tx_socket) = match bind_shared_udp(config.media_port) {
-        Ok(pair) => pair,
+    let mut shard_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    if config.max_peers > 0 {
+        shard_count = shard_count.min(config.max_peers);
+    }
+    let shard_count = shard_count.clamp(1, 32);
+
+    let ingest_socket = match bind_ingest_udp(config.media_port) {
+        Ok(s) => s,
         Err(e) => {
-            error!(err = %e, "Failed to bind media UDP socket");
+            error!(err = %e, "Failed to bind ingest UDP socket");
             return;
         }
     };
-    let local_port = socket.local_addr().expect("bound UDP socket").port();
-    let loopback_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), local_port);
-    let (candidates, host_addr) = gather_local_candidates(&socket, local_port, &config).await;
+
+    let mut all_sockets = Vec::with_capacity(1 + shard_count);
+    all_sockets.push(ingest_socket);
+
+    for shard_id in 0..shard_count {
+        let port = if config.media_port == 0 {
+            0
+        } else {
+            match config.media_port.checked_add(1 + shard_id as u16) {
+                Some(p) => p,
+                None => {
+                    error!(
+                        media_port = config.media_port,
+                        shard_id, "Media port range overflow"
+                    );
+                    return;
+                }
+            }
+        };
+        match bind_shard_udp(port) {
+            Ok(s) => all_sockets.push(s),
+            Err(e) => {
+                error!(port, shard_id, err = %e, "Failed to bind shard UDP socket");
+                return;
+            }
+        }
+    }
+
+    let mut gathered = gather_all_candidates(all_sockets, &config).await.into_iter();
+    let (socket, ingest_bound) = gathered.next().expect("ingest socket");
+
     let mut metrics_writer = config.resolved_metrics_dir().and_then(|dir| {
         match MetricsWriter::open(&dir) {
             Ok(w) => Some(w),
@@ -139,27 +164,25 @@ pub async fn run(
         }
     });
 
-    let mut shard_count = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(2);
-    if config.max_peers > 0 {
-        shard_count = shard_count.min(config.max_peers);
-    }
-    let shard_count = shard_count.clamp(1, 16);
-
     let dtls_cert = str0m_crypto::from_feature_flags()
         .dtls_provider
         .generate_certificate();
 
-    let (feedback_tx, mut feedback_rx) = mpsc::channel::<ShardFeedback>(256);
+    let (pli_tx, mut pli_rx) = mpsc::channel::<()>(64);
     let mut shards: Vec<ShardHandle> = Vec::with_capacity(shard_count);
 
-    for shard_id in 0..shard_count {
+    for (shard_id, (shard_tokio_sock, shard_bound)) in gathered.enumerate() {
+        let shard_socket = match shard_tokio_sock.into_std() {
+            Ok(s) => s,
+            Err(e) => {
+                error!(shard_id, err = %e, "Failed to convert shard UDP socket");
+                return;
+            }
+        };
         let (tx, rx) = std_mpsc::sync_channel::<ShardMsg>(SHARD_CHANNEL_CAP);
         let counters = Arc::new(ShardCounters::new());
         let shard_counters = Arc::clone(&counters);
-        let shard_tx_socket = Arc::clone(&tx_socket);
-        let shard_feedback = feedback_tx.clone();
+        let shard_pli_tx = pli_tx.clone();
         let shard_cert = dtls_cert.clone();
         let handle = std::thread::Builder::new()
             .name(format!("tiwi-egress-{shard_id}"))
@@ -167,9 +190,10 @@ pub async fn run(
                 run_egress_shard(
                     shard_id,
                     rx,
-                    shard_tx_socket,
+                    shard_socket,
+                    shard_bound,
                     shard_counters,
-                    shard_feedback,
+                    shard_pli_tx,
                     shard_cert,
                 );
             })
@@ -182,14 +206,13 @@ pub async fn run(
     }
 
     info!(
-        media_port = local_port,
-        candidates = candidates.len(),
+        media_port = ingest_bound.local_port,
+        candidates = ingest_bound.candidates.len(),
         shards = shard_count,
         "Media relay ready"
     );
 
     let mut ingest: Option<IngestSession> = None;
-    let mut addr_to_shard: HashMap<SocketAddr, usize> = HashMap::new();
     let mut metrics = RelayMetrics::new(Instant::now());
     let mut udp_buf = vec![0u8; 2048];
     let mut next_session_seq: u64 = 1;
@@ -208,7 +231,7 @@ pub async fn run(
                 if *shutdown_rx.borrow() {
                     info!("Media relay shutting down");
                     if ingest.is_some() {
-                        teardown_ingest(&mut ingest, &shards, &mut addr_to_shard, &mut metrics, &signal_tx);
+                        teardown_ingest(&mut ingest, &shards, &mut metrics, &signal_tx);
                     }
                     for shard in &mut shards {
                         let _ = shard.tx.send(ShardMsg::Shutdown);
@@ -228,31 +251,29 @@ pub async fn run(
             recv = socket.recv_from(&mut udp_buf) => {
                 match recv {
                     Ok((n, source)) => {
-                        handle_udp_packet(
+                        handle_ingest_udp(
                             &udp_buf[..n],
                             source,
-                            loopback_addr,
-                            host_addr,
+                            ingest_bound.loopback_addr,
+                            ingest_bound.host_addr,
                             &mut ingest,
                             &shards,
-                            &addr_to_shard,
-                            &tx_socket,
+                            &socket,
                             &mut metrics,
                             &signal_tx,
                         );
-                        // Drain queued UDP packets in a tight batch to amortize select! overhead.
+                        // Drain queued ingest UDP packets in a tight batch to amortize select! overhead.
                         for _ in 1..MAX_UDP_BATCH {
                             match socket.try_recv_from(&mut udp_buf) {
                                 Ok((n, source)) => {
-                                    handle_udp_packet(
+                                    handle_ingest_udp(
                                         &udp_buf[..n],
                                         source,
-                                        loopback_addr,
-                                        host_addr,
+                                        ingest_bound.loopback_addr,
+                                        ingest_bound.host_addr,
                                         &mut ingest,
                                         &shards,
-                                        &addr_to_shard,
-                                        &tx_socket,
+                                        &socket,
                                         &mut metrics,
                                         &signal_tx,
                                     );
@@ -260,7 +281,7 @@ pub async fn run(
                                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                                 Err(e) => {
                                     metrics.record_udp_drop();
-                                    trace!(err = %e, "UDP try_recv_from error");
+                                    trace!(err = %e, "Ingest UDP try_recv_from error");
                                     break;
                                 }
                             }
@@ -268,15 +289,15 @@ pub async fn run(
                     }
                     Err(e) => {
                         metrics.record_udp_drop();
-                        trace!(err = %e, "UDP recv_from error");
+                        trace!(err = %e, "Ingest UDP recv_from error");
                     }
                 }
             }
 
-            Some(fb) = feedback_rx.recv() => {
-                handle_shard_feedback(fb, &mut addr_to_shard, &mut ingest, &tx_socket, &mut metrics);
-                while let Ok(fb) = feedback_rx.try_recv() {
-                    handle_shard_feedback(fb, &mut addr_to_shard, &mut ingest, &tx_socket, &mut metrics);
+            Some(()) = pli_rx.recv() => {
+                while pli_rx.try_recv().is_ok() {}
+                if let Some(ing) = ingest.as_mut() {
+                    request_ingest_keyframe(ing, &socket, &mut metrics);
                 }
             }
 
@@ -285,13 +306,12 @@ pub async fn run(
                     WhipCommand::Offer { sdp, reply } => {
                         let res = handle_whip_offer(
                             sdp,
-                            &candidates,
+                            &ingest_bound.candidates,
                             &mut next_session_seq,
                             &mut ingest,
                             &shards,
-                            &mut addr_to_shard,
                             &mut metrics,
-                            &tx_socket,
+                            &socket,
                             &signal_tx,
                         );
                         let _ = reply.send(res);
@@ -300,7 +320,7 @@ pub async fn run(
                         let matched = ingest.as_ref().is_some_and(|i| i.id == session_id);
                         if matched {
                             info!(session = %session_id, "WHIP session deleted");
-                            teardown_ingest(&mut ingest, &shards, &mut addr_to_shard, &mut metrics, &signal_tx);
+                            teardown_ingest(&mut ingest, &shards, &mut metrics, &signal_tx);
                         }
                         let _ = reply.send(matched);
                     }
@@ -311,7 +331,6 @@ pub async fn run(
                 dispatch_viewer_offer(
                     offer,
                     &config,
-                    &candidates,
                     ingest.as_ref(),
                     &shards,
                     &mut metrics,
@@ -331,7 +350,7 @@ pub async fn run(
                     if let Err(e) = ing.rtc.handle_input(Input::Timeout(now)) {
                         debug!("Ingest timeout error: {e}");
                     }
-                    drain_ingest(ing, &shards, &tx_socket, &mut metrics, &signal_tx);
+                    drain_ingest(ing, &shards, &socket, &mut metrics, &signal_tx);
                 }
                 if !ing.rtc.is_alive() {
                     ingest_dead = true;
@@ -348,7 +367,7 @@ pub async fn run(
                 }
             }
             if ingest_dead {
-                teardown_ingest(&mut ingest, &shards, &mut addr_to_shard, &mut metrics, &signal_tx);
+                teardown_ingest(&mut ingest, &shards, &mut metrics, &signal_tx);
             }
 
             // 1s derivative metrics snapshot to JSONL file, folded into 5s stdout debug rollup.
@@ -432,97 +451,36 @@ pub async fn run(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn handle_udp_packet(
+fn handle_ingest_udp(
     buf: &[u8],
     source: SocketAddr,
     loopback_addr: SocketAddr,
     host_addr: SocketAddr,
     ingest: &mut Option<IngestSession>,
     shards: &[ShardHandle],
-    addr_to_shard: &HashMap<SocketAddr, usize>,
-    tx_socket: &std::net::UdpSocket,
+    socket: &UdpSocket,
     metrics: &mut RelayMetrics,
     signal_tx: &mpsc::Sender<SignalEvent>,
 ) {
-    let recv_time = Instant::now();
+    let Some(ing) = ingest.as_mut() else {
+        return;
+    };
     let dest = if source.ip().is_loopback() {
         loopback_addr
     } else {
         host_addr
     };
-
-    if let Some(ing) = ingest.as_mut()
-        && let Ok(receive) = Receive::new(Protocol::Udp, source, dest, buf)
-    {
-        let input = Input::Receive(recv_time, receive);
-        if ing.rtc.accepts(&input) {
-            if let Err(e) = ing.rtc.handle_input(input) {
-                debug!("Ingest handle_input error: {e}");
-            }
-            drain_ingest(ing, shards, tx_socket, metrics, signal_tx);
-            return;
-        }
-    }
-
-    // Fast O(1) route for known viewer SocketAddrs.
-    if let Some(&shard_id) = addr_to_shard.get(&source) {
-        let msg = ShardMsg::Udp {
-            source,
-            dest,
-            data: buf.into(),
-            recv_time,
-        };
-        if let Err(TrySendError::Full(_)) = shards[shard_id].tx.try_send(msg) {
-            metrics.record_udp_drop();
-        }
+    let Ok(receive) = Receive::new(Protocol::Udp, source, dest, buf) else {
         return;
-    }
-
-    // Unknown source (e.g., initial STUN/ICE binding from a new viewer): forward to shards
-    // that currently have active viewers so the owning shard can claim and bind `source`.
-    let mut forwarded = false;
-    for shard in shards {
-        if shard.counters.viewers.load(Ordering::Relaxed) == 0 {
-            continue;
+    };
+    let input = Input::Receive(Instant::now(), receive);
+    if ing.rtc.accepts(&input) {
+        if let Err(e) = ing.rtc.handle_input(input) {
+            debug!("Ingest handle_input error: {e}");
         }
-        let msg = ShardMsg::Udp {
-            source,
-            dest,
-            data: buf.into(),
-            recv_time,
-        };
-        match shard.tx.try_send(msg) {
-            Ok(()) => forwarded = true,
-            Err(TrySendError::Full(_)) => metrics.record_udp_drop(),
-            Err(TrySendError::Disconnected(_)) => {}
-        }
-    }
-
-    if !forwarded {
-        metrics.record_udp_drop();
-        trace!(addr = %source, bytes = buf.len(), "Dropped unmatched UDP packet");
-    }
-}
-
-fn handle_shard_feedback(
-    fb: ShardFeedback,
-    addr_to_shard: &mut HashMap<SocketAddr, usize>,
-    ingest: &mut Option<IngestSession>,
-    tx_socket: &std::net::UdpSocket,
-    metrics: &mut RelayMetrics,
-) {
-    match fb {
-        ShardFeedback::BindAddr { source, shard_id } => {
-            addr_to_shard.insert(source, shard_id);
-        }
-        ShardFeedback::UnbindAddr { source } => {
-            addr_to_shard.remove(&source);
-        }
-        ShardFeedback::RequestPli => {
-            if let Some(ing) = ingest.as_mut() {
-                request_ingest_keyframe(ing, tx_socket, metrics);
-            }
-        }
+        drain_ingest(ing, shards, socket, metrics, signal_tx);
+    } else {
+        trace!(addr = %source, bytes = buf.len(), "Ignored unmatched ingest UDP packet");
     }
 }
 
@@ -546,9 +504,8 @@ fn handle_whip_offer(
     next_session_seq: &mut u64,
     ingest: &mut Option<IngestSession>,
     shards: &[ShardHandle],
-    addr_to_shard: &mut HashMap<SocketAddr, usize>,
     metrics: &mut RelayMetrics,
-    tx_socket: &std::net::UdpSocket,
+    socket: &UdpSocket,
     signal_tx: &mpsc::Sender<SignalEvent>,
 ) -> Result<WhipAccepted, WhipError> {
     let offer = SdpOffer::from_sdp_string(&sdp)
@@ -574,7 +531,7 @@ fn handle_whip_offer(
 
     if ingest.is_some() {
         info!("Replacing existing WHIP ingest session");
-        teardown_ingest(ingest, shards, addr_to_shard, metrics, signal_tx);
+        teardown_ingest(ingest, shards, metrics, signal_tx);
     }
 
     metrics.last_tick = now;
@@ -595,7 +552,7 @@ fn handle_whip_offer(
         metrics_rollup: MetricsRollup::new(STDOUT_ROLLUP_TICKS),
     };
 
-    drain_ingest(&mut session, shards, tx_socket, metrics, signal_tx);
+    drain_ingest(&mut session, shards, socket, metrics, signal_tx);
 
     debug!(session = %session_id, "WHIP ingest offer accepted");
     *ingest = Some(session);
@@ -609,7 +566,6 @@ fn handle_whip_offer(
 fn dispatch_viewer_offer(
     offer: ViewerOffer,
     config: &Config,
-    candidates: &[Candidate],
     ingest: Option<&IngestSession>,
     shards: &[ShardHandle],
     metrics: &mut RelayMetrics,
@@ -659,7 +615,6 @@ fn dispatch_viewer_offer(
         viewer_id: offer.viewer_id,
         sdp: offer.sdp,
         video_codec: ing.video_codec,
-        candidates: candidates.to_vec(),
         reply: offer.reply,
     };
 
@@ -680,7 +635,7 @@ fn dispatch_viewer_offer(
 fn drain_ingest(
     ing: &mut IngestSession,
     shards: &[ShardHandle],
-    tx_socket: &std::net::UdpSocket,
+    socket: &UdpSocket,
     metrics: &mut RelayMetrics,
     signal_tx: &mpsc::Sender<SignalEvent>,
 ) {
@@ -691,7 +646,7 @@ fn drain_ingest(
                 break;
             }
             Ok(Output::Transmit(t)) => {
-                if let Err(e) = tx_socket.send_to(&t.contents, t.destination) {
+                if let Err(e) = socket.try_send_to(&t.contents, t.destination) {
                     metrics.record_udp_drop();
                     trace!(session = %ing.id, err = %e, "Ingest UDP send_to error");
                 }
@@ -816,7 +771,7 @@ fn drain_ingest(
 
 fn request_ingest_keyframe(
     ing: &mut IngestSession,
-    tx_socket: &std::net::UdpSocket,
+    socket: &UdpSocket,
     metrics: &mut RelayMetrics,
 ) {
     let now = Instant::now();
@@ -852,7 +807,7 @@ fn request_ingest_keyframe(
                     break;
                 }
                 Ok(Output::Transmit(t)) => {
-                    let _ = tx_socket.send_to(&t.contents, t.destination);
+                    let _ = socket.try_send_to(&t.contents, t.destination);
                 }
                 Ok(Output::Event(_)) => {}
                 Err(_) => break,
@@ -864,14 +819,12 @@ fn request_ingest_keyframe(
 fn teardown_ingest(
     ingest: &mut Option<IngestSession>,
     shards: &[ShardHandle],
-    addr_to_shard: &mut HashMap<SocketAddr, usize>,
     metrics: &mut RelayMetrics,
     signal_tx: &mpsc::Sender<SignalEvent>,
 ) {
     if let Some(mut ing) = ingest.take() {
         let _ = ing.rtc.close();
     }
-    addr_to_shard.clear();
     for shard in shards {
         let _ = shard.tx.send(ShardMsg::ClearViewers);
     }
@@ -880,68 +833,134 @@ fn teardown_ingest(
 }
 
 // ============================================================================
-// Dedicated OS-thread egress shard (zero Tokio / async overhead)
+// Dedicated OS-thread egress shard with its own UDP socket (zero Tokio overhead)
 // ============================================================================
 
 fn run_egress_shard(
     shard_id: usize,
     rx: std_mpsc::Receiver<ShardMsg>,
-    tx_socket: Arc<std::net::UdpSocket>,
+    socket: std::net::UdpSocket,
+    bound: BoundCandidates,
     counters: Arc<ShardCounters>,
-    feedback_tx: mpsc::Sender<ShardFeedback>,
+    pli_tx: mpsc::Sender<()>,
     dtls_cert: Option<DtlsCert>,
 ) {
     let mut viewers: HashMap<String, ViewerSession> = HashMap::new();
+    let mut addr_to_viewer: HashMap<SocketAddr, String> = HashMap::new();
+    let mut udp_buf = vec![0u8; 2048];
     let mut congested = false;
 
     loop {
-        let now = Instant::now();
-        let next_deadline = compute_shard_deadline(now, &viewers);
-        let wait = next_deadline
-            .saturating_duration_since(now)
-            .min(Duration::from_millis(50));
-
-        match rx.recv_timeout(wait) {
-            Ok(msg) => {
-                if !handle_shard_msg(
-                    shard_id,
-                    msg,
-                    &mut viewers,
-                    &mut congested,
-                    &tx_socket,
-                    &counters,
-                    &feedback_tx,
-                    dtls_cert.as_ref(),
-                ) {
-                    break;
-                }
-                for _ in 1..MAX_SHARD_BATCH {
-                    match rx.try_recv() {
-                        Ok(m) => {
-                            if !handle_shard_msg(
-                                shard_id,
-                                m,
-                                &mut viewers,
-                                &mut congested,
-                                &tx_socket,
-                                &counters,
-                                &feedback_tx,
-                                dtls_cert.as_ref(),
-                            ) {
-                                return;
+        let next_deadline = if viewers.is_empty() {
+            // 0% CPU when idle: block until a viewer or control message arrives.
+            match rx.recv() {
+                Ok(msg) => {
+                    if !handle_shard_msg(
+                        shard_id,
+                        msg,
+                        &mut viewers,
+                        &mut addr_to_viewer,
+                        &mut congested,
+                        &socket,
+                        &bound.candidates,
+                        &counters,
+                        dtls_cert.as_ref(),
+                    ) {
+                        break;
+                    }
+                    for _ in 1..MAX_SHARD_BATCH {
+                        match rx.try_recv() {
+                            Ok(m) => {
+                                if !handle_shard_msg(
+                                    shard_id,
+                                    m,
+                                    &mut viewers,
+                                    &mut addr_to_viewer,
+                                    &mut congested,
+                                    &socket,
+                                    &bound.candidates,
+                                    &counters,
+                                    dtls_cert.as_ref(),
+                                ) {
+                                    return;
+                                }
                             }
+                            Err(TryRecvError::Empty) => break,
+                            Err(TryRecvError::Disconnected) => return,
                         }
-                        Err(TryRecvError::Empty) => break,
-                        Err(TryRecvError::Disconnected) => return,
                     }
                 }
+                Err(_) => break,
             }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
+            Instant::now()
+        } else {
+            let now = Instant::now();
+            let deadline = compute_shard_deadline(now, &viewers);
+            let wait = deadline
+                .saturating_duration_since(now)
+                .min(SHARD_UDP_POLL_CAP);
+
+            match rx.recv_timeout(wait) {
+                Ok(msg) => {
+                    if !handle_shard_msg(
+                        shard_id,
+                        msg,
+                        &mut viewers,
+                        &mut addr_to_viewer,
+                        &mut congested,
+                        &socket,
+                        &bound.candidates,
+                        &counters,
+                        dtls_cert.as_ref(),
+                    ) {
+                        break;
+                    }
+                    for _ in 1..MAX_SHARD_BATCH {
+                        match rx.try_recv() {
+                            Ok(m) => {
+                                if !handle_shard_msg(
+                                    shard_id,
+                                    m,
+                                    &mut viewers,
+                                    &mut addr_to_viewer,
+                                    &mut congested,
+                                    &socket,
+                                    &bound.candidates,
+                                    &counters,
+                                    dtls_cert.as_ref(),
+                                ) {
+                                    return;
+                                }
+                            }
+                            Err(TryRecvError::Empty) => break,
+                            Err(TryRecvError::Disconnected) => return,
+                        }
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+            deadline
+        };
+
+        if viewers.is_empty() {
+            continue;
         }
 
+        // Drain incoming viewer STUN/DTLS/RTCP/NACK packets directly on this shard's socket.
+        drain_shard_udp(
+            &socket,
+            &mut udp_buf,
+            bound.loopback_addr,
+            bound.host_addr,
+            &mut viewers,
+            &mut addr_to_viewer,
+            &counters,
+            &pli_tx,
+        );
+
         let now = Instant::now();
-        if now >= next_deadline && !viewers.is_empty() {
+        if now >= next_deadline {
             let mut dead_viewers = Vec::new();
             let mut want_pli = false;
             let mut stats_dirty = false;
@@ -951,7 +970,7 @@ fn run_egress_shard(
                     if let Err(e) = v.rtc.handle_input(Input::Timeout(now)) {
                         debug!(viewer = %id, "Viewer timeout error: {e}");
                     }
-                    let (pli, dirty) = drain_viewer(v, &tx_socket, &counters);
+                    let (pli, dirty) = drain_viewer(v, &socket, &counters);
                     want_pli |= pli;
                     stats_dirty |= dirty;
                 }
@@ -969,7 +988,7 @@ fn run_egress_shard(
                     if let Some(v) = viewers.remove(&id)
                         && let Some(addr) = v.remote_addr
                     {
-                        let _ = feedback_tx.try_send(ShardFeedback::UnbindAddr { source: addr });
+                        addr_to_viewer.remove(&addr);
                     }
                     info!(viewer = %id, shard = shard_id, "Viewer disconnected");
                 }
@@ -980,9 +999,87 @@ fn run_egress_shard(
             }
 
             if want_pli {
-                let _ = feedback_tx.try_send(ShardFeedback::RequestPli);
+                let _ = pli_tx.try_send(());
             }
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drain_shard_udp(
+    socket: &std::net::UdpSocket,
+    udp_buf: &mut [u8],
+    loopback_addr: SocketAddr,
+    host_addr: SocketAddr,
+    viewers: &mut HashMap<String, ViewerSession>,
+    addr_to_viewer: &mut HashMap<SocketAddr, String>,
+    counters: &ShardCounters,
+    pli_tx: &mpsc::Sender<()>,
+) {
+    let mut want_pli = false;
+    let mut stats_dirty = false;
+
+    for _ in 0..MAX_UDP_BATCH {
+        let (n, source) = match socket.recv_from(udp_buf) {
+            Ok(pair) => pair,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+            Err(e) => {
+                counters.record_udp_drop();
+                trace!(err = %e, "Shard UDP recv_from error");
+                break;
+            }
+        };
+
+        let dest = if source.ip().is_loopback() {
+            loopback_addr
+        } else {
+            host_addr
+        };
+        let Ok(receive) = Receive::new(Protocol::Udp, source, dest, &udp_buf[..n]) else {
+            continue;
+        };
+        let input = Input::Receive(Instant::now(), receive);
+
+        // Fast O(1) dispatch for known viewer SocketAddrs.
+        if let Some(vid) = addr_to_viewer.get(&source)
+            && let Some(v) = viewers.get_mut(vid)
+            && v.rtc.accepts(&input)
+        {
+            if let Err(e) = v.rtc.handle_input(input) {
+                debug!(viewer = %vid, "Viewer handle_input error: {e}");
+            }
+            let (pli, dirty) = drain_viewer(v, socket, counters);
+            want_pli |= pli;
+            stats_dirty |= dirty;
+            continue;
+        }
+
+        // Initial STUN/ICE binding or NAT rebind: scan this shard's viewers and cache the mapping.
+        let target_id = viewers
+            .iter()
+            .find(|(_, v)| v.rtc.accepts(&input))
+            .map(|(id, _)| id.clone());
+        if let Some(vid) = target_id
+            && let Some(v) = viewers.get_mut(&vid)
+        {
+            if let Some(old) = v.remote_addr.replace(source) {
+                addr_to_viewer.remove(&old);
+            }
+            addr_to_viewer.insert(source, vid.clone());
+            if let Err(e) = v.rtc.handle_input(input) {
+                debug!(viewer = %vid, "Viewer handle_input error: {e}");
+            }
+            let (pli, dirty) = drain_viewer(v, socket, counters);
+            want_pli |= pli;
+            stats_dirty |= dirty;
+        }
+    }
+
+    if stats_dirty {
+        sync_shard_stats(viewers, counters);
+    }
+    if want_pli {
+        let _ = pli_tx.try_send(());
     }
 }
 
@@ -991,70 +1088,39 @@ fn handle_shard_msg(
     shard_id: usize,
     msg: ShardMsg,
     viewers: &mut HashMap<String, ViewerSession>,
+    addr_to_viewer: &mut HashMap<SocketAddr, String>,
     congested: &mut bool,
-    tx_socket: &std::net::UdpSocket,
+    socket: &std::net::UdpSocket,
+    candidates: &[Candidate],
     counters: &ShardCounters,
-    feedback_tx: &mpsc::Sender<ShardFeedback>,
     dtls_cert: Option<&DtlsCert>,
 ) -> bool {
     match msg {
         ShardMsg::Rtp(pkt) => {
-            fanout_rtp_shard(&pkt, viewers, *congested, tx_socket, counters);
-            true
-        }
-        ShardMsg::Udp {
-            source,
-            dest,
-            data,
-            recv_time,
-        } => {
-            if let Ok(receive) = Receive::new(Protocol::Udp, source, dest, &data) {
-                let input = Input::Receive(recv_time, receive);
-                let target_id = viewers
-                    .iter()
-                    .find(|(_, v)| v.rtc.accepts(&input))
-                    .map(|(id, _)| id.clone());
-                if let Some(vid) = target_id
-                    && let Some(v) = viewers.get_mut(&vid)
-                {
-                    if v.remote_addr != Some(source) {
-                        v.remote_addr = Some(source);
-                        let _ = feedback_tx.try_send(ShardFeedback::BindAddr { source, shard_id });
-                    }
-                    if let Err(e) = v.rtc.handle_input(input) {
-                        debug!(viewer = %vid, "Viewer handle_input error: {e}");
-                    }
-                    let (want_pli, dirty) = drain_viewer(v, tx_socket, counters);
-                    if dirty {
-                        sync_shard_stats(viewers, counters);
-                    }
-                    if want_pli {
-                        let _ = feedback_tx.try_send(ShardFeedback::RequestPli);
-                    }
-                }
-            }
+            fanout_rtp_shard(&pkt, viewers, *congested, socket, counters);
             true
         }
         ShardMsg::AddViewer {
             viewer_id,
             sdp,
             video_codec,
-            candidates,
             reply,
         } => {
             let res = build_viewer_session(
                 viewer_id.clone(),
                 sdp,
                 video_codec,
-                &candidates,
+                candidates,
                 dtls_cert,
-                tx_socket,
+                socket,
                 counters,
             );
             match res {
                 Ok((viewer, answer_sdp)) => {
-                    let replaced = viewers.insert(viewer_id.clone(), viewer).is_some();
-                    if replaced {
+                    if let Some(old) = viewers.insert(viewer_id.clone(), viewer) {
+                        if let Some(addr) = old.remote_addr {
+                            addr_to_viewer.remove(&addr);
+                        }
                         // Undo extra pre-increment when replacing an existing viewer_id.
                         counters.viewers.fetch_sub(1, Ordering::Relaxed);
                     }
@@ -1086,13 +1152,14 @@ fn handle_shard_msg(
                 {
                     tx.set_rtx_cache(RTX_CACHE_PACKETS, RTX_CACHE_AGE, ratio_cap);
                 }
-                let _ = drain_viewer(v, tx_socket, counters);
+                let _ = drain_viewer(v, socket, counters);
             }
             true
         }
         ShardMsg::ClearViewers => {
             let removed = viewers.len();
             viewers.clear();
+            addr_to_viewer.clear();
             if removed > 0 {
                 counters.viewers.fetch_sub(removed, Ordering::Relaxed);
             }
@@ -1103,6 +1170,7 @@ fn handle_shard_msg(
         }
         ShardMsg::Shutdown => {
             viewers.clear();
+            addr_to_viewer.clear();
             counters.reset();
             false
         }
@@ -1115,7 +1183,7 @@ fn build_viewer_session(
     video_codec: Option<Codec>,
     candidates: &[Candidate],
     dtls_cert: Option<&DtlsCert>,
-    tx_socket: &std::net::UdpSocket,
+    socket: &std::net::UdpSocket,
     counters: &ShardCounters,
 ) -> Result<(ViewerSession, String), String> {
     let offer = SdpOffer::from_sdp_string(&sdp).map_err(|e| format!("Invalid viewer SDP: {e}"))?;
@@ -1174,7 +1242,7 @@ fn build_viewer_session(
         last_loss: None,
     };
 
-    let _ = drain_viewer(&mut viewer, tx_socket, counters);
+    let _ = drain_viewer(&mut viewer, socket, counters);
     Ok((viewer, answer.to_sdp_string()))
 }
 
@@ -1182,7 +1250,7 @@ fn fanout_rtp_shard(
     pkt: &SharedRtp,
     viewers: &mut HashMap<String, ViewerSession>,
     congested: bool,
-    tx_socket: &std::net::UdpSocket,
+    socket: &std::net::UdpSocket,
     counters: &ShardCounters,
 ) {
     let nackable = pkt.is_video;
@@ -1231,7 +1299,7 @@ fn fanout_rtp_shard(
         }
 
         // Single-mutation invariant: drain immediately after write_rtp.
-        let _ = drain_viewer(v, tx_socket, counters);
+        let _ = drain_viewer(v, socket, counters);
     }
 }
 
@@ -1239,7 +1307,7 @@ fn fanout_rtp_shard(
 /// Returns `(want_pli, stats_or_conn_changed)`.
 fn drain_viewer(
     v: &mut ViewerSession,
-    tx_socket: &std::net::UdpSocket,
+    socket: &std::net::UdpSocket,
     counters: &ShardCounters,
 ) -> (bool, bool) {
     let mut want_pli = false;
@@ -1252,7 +1320,7 @@ fn drain_viewer(
                 break;
             }
             Ok(Output::Transmit(t)) => {
-                if let Err(e) = tx_socket.send_to(&t.contents, t.destination) {
+                if let Err(e) = socket.send_to(&t.contents, t.destination) {
                     counters.record_udp_drop();
                     trace!(viewer = %v.id, err = %e, "Viewer UDP send_to error");
                 }
