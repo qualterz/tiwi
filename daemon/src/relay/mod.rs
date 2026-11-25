@@ -864,6 +864,7 @@ fn run_egress_shard(
                         &socket,
                         &bound.candidates,
                         &counters,
+                        &pli_tx,
                         dtls_cert.as_ref(),
                     ) {
                         break;
@@ -880,6 +881,7 @@ fn run_egress_shard(
                                     &socket,
                                     &bound.candidates,
                                     &counters,
+                                    &pli_tx,
                                     dtls_cert.as_ref(),
                                 ) {
                                     return;
@@ -911,6 +913,7 @@ fn run_egress_shard(
                         &socket,
                         &bound.candidates,
                         &counters,
+                        &pli_tx,
                         dtls_cert.as_ref(),
                     ) {
                         break;
@@ -927,6 +930,7 @@ fn run_egress_shard(
                                     &socket,
                                     &bound.candidates,
                                     &counters,
+                                    &pli_tx,
                                     dtls_cert.as_ref(),
                                 ) {
                                     return;
@@ -1093,11 +1097,12 @@ fn handle_shard_msg(
     socket: &std::net::UdpSocket,
     candidates: &[Candidate],
     counters: &ShardCounters,
+    pli_tx: &mpsc::Sender<()>,
     dtls_cert: Option<&DtlsCert>,
 ) -> bool {
     match msg {
         ShardMsg::Rtp(pkt) => {
-            fanout_rtp_shard(&pkt, viewers, *congested, socket, counters);
+            fanout_rtp_shard(&pkt, viewers, *congested, socket, counters, pli_tx);
             true
         }
         ShardMsg::AddViewer {
@@ -1146,13 +1151,23 @@ fn handle_shard_msg(
             } else {
                 Some(RTX_RATIO_CAP)
             };
+            let mut want_pli = false;
+            let mut stats_dirty = false;
             for v in viewers.values_mut() {
                 if let Some(mid) = v.video_mid
                     && let Some(tx) = v.rtc.direct_api().stream_tx_by_mid(mid, None)
                 {
                     tx.set_rtx_cache(RTX_CACHE_PACKETS, RTX_CACHE_AGE, ratio_cap);
                 }
-                let _ = drain_viewer(v, socket, counters);
+                let (pli, dirty) = drain_viewer(v, socket, counters);
+                want_pli |= pli;
+                stats_dirty |= dirty;
+            }
+            if stats_dirty {
+                sync_shard_stats(viewers, counters);
+            }
+            if want_pli {
+                let _ = pli_tx.try_send(());
             }
             true
         }
@@ -1252,9 +1267,12 @@ fn fanout_rtp_shard(
     congested: bool,
     socket: &std::net::UdpSocket,
     counters: &ShardCounters,
+    pli_tx: &mpsc::Sender<()>,
 ) {
     let nackable = pkt.is_video;
     let payload_len = pkt.payload.len();
+    let mut want_pli = false;
+    let mut stats_dirty = false;
 
     for v in viewers.values_mut() {
         if !v.connected {
@@ -1299,7 +1317,16 @@ fn fanout_rtp_shard(
         }
 
         // Single-mutation invariant: drain immediately after write_rtp.
-        let _ = drain_viewer(v, socket, counters);
+        let (pli, dirty) = drain_viewer(v, socket, counters);
+        want_pli |= pli;
+        stats_dirty |= dirty;
+    }
+
+    if stats_dirty {
+        sync_shard_stats(viewers, counters);
+    }
+    if want_pli {
+        let _ = pli_tx.try_send(());
     }
 }
 
