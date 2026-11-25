@@ -45,10 +45,10 @@ fn bind_udp_socket(
     #[cfg(windows)]
     disable_udp_connreset(&sock);
     if let Err(e) = sock.set_recv_buffer_size(recv_buf) {
-        debug!("Could not set UDP SO_RCVBUF to {recv_buf}: {e}");
+        debug!(bytes = recv_buf, err = %e, "Could not set UDP SO_RCVBUF");
     }
     if let Err(e) = sock.set_send_buffer_size(send_buf) {
-        debug!("Could not set UDP SO_SNDBUF to {send_buf}: {e}");
+        debug!(bytes = send_buf, err = %e, "Could not set UDP SO_SNDBUF");
     }
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
     sock.bind(&addr.into())?;
@@ -112,7 +112,8 @@ pub async fn gather_all_candidates(
             Err(e) => {
                 warn!(
                     stun = %config.stun_server,
-                    "STUN DNS lookup failed: {e} (continuing with host candidates only)"
+                    err = %e,
+                    "STUN DNS lookup failed; continuing with host candidates only"
                 );
                 None
             }
@@ -169,9 +170,13 @@ pub async fn gather_all_candidates(
                     }
                     Err(e) => {
                         if idx == 0 {
-                            warn!(stun = %stun_label, "STUN discovery failed: {e} (continuing with host candidates only)");
+                            warn!(
+                                stun = %stun_label,
+                                err = %e,
+                                "STUN discovery failed; continuing with host candidates only"
+                            );
                         } else {
-                            debug!(shard = idx - 1, "Shard STUN discovery failed: {e}");
+                            debug!(shard = idx - 1, err = %e, "Shard STUN discovery failed");
                         }
                     }
                 }

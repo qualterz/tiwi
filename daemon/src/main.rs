@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 
 use clap::Parser;
 use tokio::sync::{mpsc, watch};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::cli::Cli;
@@ -32,7 +32,7 @@ async fn main() {
     let cfg = match Config::load(cli) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("error: {e}");
+            error!(err = %e, "Failed to load configuration");
             std::process::exit(1);
         }
     };
@@ -94,7 +94,7 @@ async fn main() {
     let listener = match tokio::net::TcpListener::bind(bind_addr).await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("error: failed to bind {bind_addr}: {e}");
+            error!(addr = %bind_addr, err = %e, "Failed to bind WHIP HTTP listener");
             let _ = shutdown_tx.send(true);
             let _ = media_handle.join();
             std::process::exit(1);
@@ -109,7 +109,7 @@ async fn main() {
     tokio::select! {
         res = server => {
             if let Err(e) = res {
-                warn!("WHIP HTTP server error: {e}");
+                warn!(err = %e, "WHIP HTTP server error");
             }
         }
         _ = shutdown_signal() => {

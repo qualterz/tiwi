@@ -138,8 +138,9 @@ impl Config {
             if let Some(path) = save_path {
                 if let Err(e) = persist_token(&path, &new_token) {
                     warn!(
-                        "Could not save token to {} ({e}); using ephemeral token for this run",
-                        path.display()
+                        path = %path.display(),
+                        err = %e,
+                        "Could not save token; using ephemeral token for this run"
                     );
                 } else {
                     cfg.config_path = Some(path);

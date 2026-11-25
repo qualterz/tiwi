@@ -141,10 +141,10 @@ pub async fn run(
                             .publish(&events_topic, QoS::AtMostOnce, false, payload)
                             .await
                         {
-                            debug!("Failed to publish stream event '{kind}': {e}");
+                            debug!(event = kind, err = %e, "Failed to publish stream event");
                         }
                     }
-                    Err(e) => warn!("Failed to encrypt stream event: {e}"),
+                    Err(e) => warn!(event = kind, err = %e, "Failed to encrypt stream event"),
                 }
             }
 
@@ -153,7 +153,7 @@ pub async fn run(
                     Ok(Event::Incoming(Incoming::ConnAck(_))) => {
                         info!("MQTT signaling connected");
                         if let Err(e) = client.subscribe(&offer_topic, QoS::AtMostOnce).await {
-                            warn!("Failed to subscribe to offer topic: {e}");
+                            warn!(err = %e, "Failed to subscribe to offer topic");
                         }
                     }
                     Ok(Event::Incoming(Incoming::Publish(p))) if p.topic == offer_topic => {
@@ -167,7 +167,7 @@ pub async fn run(
                     }
                     Ok(_) => {}
                     Err(e) => {
-                        warn!("MQTT signaling error: {e} (retrying in 2s)");
+                        warn!(err = %e, retry_secs = 2, "MQTT signaling error");
                         tokio::select! {
                             _ = tokio::time::sleep(Duration::from_secs(2)) => {}
                             _ = shutdown_rx.changed() => {

@@ -136,7 +136,8 @@ pub async fn run(
                 None => {
                     error!(
                         media_port = config.media_port,
-                        shard_id, "Media port range overflow"
+                        shard = shard_id,
+                        "Media port range overflow"
                     );
                     return;
                 }
@@ -145,7 +146,7 @@ pub async fn run(
         match bind_shard_udp(port) {
             Ok(s) => all_sockets.push(s),
             Err(e) => {
-                error!(port, shard_id, err = %e, "Failed to bind shard UDP socket");
+                error!(port, shard = shard_id, err = %e, "Failed to bind shard UDP socket");
                 return;
             }
         }
@@ -175,7 +176,7 @@ pub async fn run(
         let shard_socket = match shard_tokio_sock.into_std() {
             Ok(s) => s,
             Err(e) => {
-                error!(shard_id, err = %e, "Failed to convert shard UDP socket");
+                error!(shard = shard_id, err = %e, "Failed to convert shard UDP socket");
                 return;
             }
         };
@@ -229,7 +230,7 @@ pub async fn run(
 
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
-                    info!("Media relay shutting down");
+                    debug!("Media relay shutting down");
                     if ingest.is_some() {
                         teardown_ingest(&mut ingest, &shards, &mut metrics, &signal_tx);
                     }
@@ -319,7 +320,7 @@ pub async fn run(
                     WhipCommand::Delete { session_id, reply } => {
                         let matched = ingest.as_ref().is_some_and(|i| i.id == session_id);
                         if matched {
-                            info!(session = %session_id, "WHIP session deleted");
+                            info!(session = %session_id, "WHIP ingest deleted");
                             teardown_ingest(&mut ingest, &shards, &mut metrics, &signal_tx);
                         }
                         let _ = reply.send(matched);
@@ -348,7 +349,7 @@ pub async fn run(
             if let Some(ing) = ingest.as_mut() {
                 if now >= ing.next_timeout {
                     if let Err(e) = ing.rtc.handle_input(Input::Timeout(now)) {
-                        debug!("Ingest timeout error: {e}");
+                        debug!(session = %ing.id, err = %e, "Ingest timeout error");
                     }
                     drain_ingest(ing, &shards, &socket, &mut metrics, &signal_tx);
                 }
@@ -361,7 +362,7 @@ pub async fn run(
                     warn!(
                         session = %ing.id,
                         timeout_secs = config.ingest_timeout_secs,
-                        "Ingest media silence timeout"
+                        "WHIP ingest media silence timeout"
                     );
                     ingest_dead = true;
                 }
@@ -476,7 +477,7 @@ fn handle_ingest_udp(
     let input = Input::Receive(Instant::now(), receive);
     if ing.rtc.accepts(&input) {
         if let Err(e) = ing.rtc.handle_input(input) {
-            debug!("Ingest handle_input error: {e}");
+            debug!(session = %ing.id, err = %e, "Ingest handle_input error");
         }
         drain_ingest(ing, shards, socket, metrics, signal_tx);
     } else {
@@ -529,8 +530,8 @@ fn handle_whip_offer(
     let session_id = format!("s{}", *next_session_seq);
     *next_session_seq += 1;
 
-    if ingest.is_some() {
-        info!("Replacing existing WHIP ingest session");
+    if let Some(prev) = ingest.as_ref() {
+        info!(session = %prev.id, next = %session_id, "Replacing existing WHIP ingest");
         teardown_ingest(ingest, shards, metrics, signal_tx);
     }
 
@@ -762,7 +763,7 @@ fn drain_ingest(
                 _ => {}
             },
             Err(e) => {
-                warn!(session = %ing.id, "Ingest poll_output error: {e}");
+                warn!(session = %ing.id, err = %e, "Ingest poll_output error");
                 break;
             }
         }
@@ -972,7 +973,7 @@ fn run_egress_shard(
             for (id, v) in viewers.iter_mut() {
                 if now >= v.next_timeout {
                     if let Err(e) = v.rtc.handle_input(Input::Timeout(now)) {
-                        debug!(viewer = %id, "Viewer timeout error: {e}");
+                        debug!(viewer = %id, err = %e, "Viewer timeout error");
                     }
                     let (pli, dirty) = drain_viewer(v, &socket, &counters);
                     want_pli |= pli;
@@ -994,7 +995,7 @@ fn run_egress_shard(
                     {
                         addr_to_viewer.remove(&addr);
                     }
-                    info!(viewer = %id, shard = shard_id, "Viewer disconnected");
+                    info!(viewer = %id, "Viewer disconnected");
                 }
                 counters.viewers.fetch_sub(removed, Ordering::Relaxed);
                 sync_shard_stats(&viewers, &counters);
@@ -1050,7 +1051,7 @@ fn drain_shard_udp(
             && v.rtc.accepts(&input)
         {
             if let Err(e) = v.rtc.handle_input(input) {
-                debug!(viewer = %vid, "Viewer handle_input error: {e}");
+                debug!(viewer = %vid, err = %e, "Viewer handle_input error");
             }
             let (pli, dirty) = drain_viewer(v, socket, counters);
             want_pli |= pli;
@@ -1071,7 +1072,7 @@ fn drain_shard_udp(
             }
             addr_to_viewer.insert(source, vid.clone());
             if let Err(e) = v.rtc.handle_input(input) {
-                debug!(viewer = %vid, "Viewer handle_input error: {e}");
+                debug!(viewer = %vid, err = %e, "Viewer handle_input error");
             }
             let (pli, dirty) = drain_viewer(v, socket, counters);
             want_pli |= pli;
@@ -1396,7 +1397,7 @@ fn drain_viewer(
                 _ => {}
             },
             Err(e) => {
-                debug!(viewer = %v.id, "Viewer poll_output error: {e}");
+                debug!(viewer = %v.id, err = %e, "Viewer poll_output error");
                 break;
             }
         }
