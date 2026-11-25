@@ -4,75 +4,83 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use clap_serde_derive::ClapSerde;
 use rand::RngCore;
-use serde::Deserialize;
 use tracing::warn;
 
 use crate::cli::Cli;
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct FileConfig {
-    bind: Option<IpAddr>,
-    port: Option<u16>,
-    media_port: Option<u16>,
-    public_ip: Option<IpAddr>,
-    stun_server: Option<String>,
-    mqtt_url: Option<String>,
-    viewer_url: Option<String>,
-    token: Option<String>,
-    whip_token: Option<String>,
-    max_peers: Option<usize>,
-    max_uplink_mbps: Option<f64>,
-    ingest_timeout_secs: Option<u64>,
-}
-
+#[derive(ClapSerde)]
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// HTTP bind address for WHIP ingest
+    #[default(IpAddr::V4(Ipv4Addr::LOCALHOST))]
+    #[arg(long, env = "TIWI_BIND")]
     pub bind: IpAddr,
+
+    /// HTTP port for WHIP ingest
+    #[default(2000)]
+    #[arg(short, long, env = "TIWI_PORT")]
     pub port: u16,
+
+    /// Fixed UDP port for WebRTC media (0 = OS-assigned)
+    #[default(0)]
+    #[arg(long, env = "TIWI_MEDIA_PORT")]
     pub media_port: u16,
+
+    /// Static public IP to advertise in ICE candidates (skips STUN when set)
+    #[arg(long, env = "TIWI_PUBLIC_IP")]
     pub public_ip: Option<IpAddr>,
+
+    /// STUN server address (host:port) for public IP discovery
+    #[default("stun.l.google.com:19302".to_string())]
+    #[arg(long)]
     pub stun_server: String,
+
+    /// MQTT over WebSocket broker URL for viewer signaling
+    #[default("wss://broker.emqx.io:8084/mqtt".to_string())]
+    #[arg(long, env = "TIWI_MQTT_URL")]
     pub mqtt_url: String,
+
+    /// Base viewer URL used when printing the shareable watch link
+    #[default("https://qualterz.github.io/tiwi/".to_string())]
+    #[arg(long)]
     pub viewer_url: String,
+
+    /// Stream token for this session only (does not modify config.toml)
+    #[arg(long, env = "TIWI_TOKEN")]
     pub token: String,
+
+    /// Optional Bearer token required on WHIP POST/DELETE requests
+    #[arg(long, env = "TIWI_WHIP_TOKEN")]
     pub whip_token: Option<String>,
+
+    /// Maximum simultaneous viewers
+    #[default(16)]
+    #[arg(long)]
     pub max_peers: usize,
+
+    /// Maximum total viewer egress bitrate in Mbps (0 = unlimited)
+    #[default(0.0)]
+    #[arg(long)]
     pub max_uplink_mbps: f64,
+
+    /// Ingest media silence timeout in seconds (0 = disabled)
+    #[default(15)]
+    #[arg(long)]
     pub ingest_timeout_secs: u64,
-    pub verbose: bool,
+
+    #[arg(skip)]
+    #[serde(skip)]
     pub config_path: Option<PathBuf>,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            port: 2000,
-            media_port: 0,
-            public_ip: None,
-            stun_server: "stun.l.google.com:19302".to_string(),
-            mqtt_url: "wss://broker.emqx.io:8084/mqtt".to_string(),
-            viewer_url: "https://qualterz.github.io/tiwi/".to_string(),
-            token: String::new(),
-            whip_token: None,
-            max_peers: 16,
-            max_uplink_mbps: 0.0,
-            ingest_timeout_secs: 15,
-            verbose: false,
-            config_path: None,
-        }
-    }
-}
-
 impl Config {
-    pub fn load(cli: Cli) -> Result<Self, String> {
+    pub fn load(mut cli: Cli) -> Result<Self, String> {
         let exe_dir = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(Path::to_path_buf));
         let home_config_dir = dirs::config_dir().map(|d| d.join("tiwi"));
-        let mut cfg = Self::default();
 
         // 1. Discover config file: --config > <exe_dir>/config.toml > <home_config_dir>/config.toml
         let discovered = if let Some(explicit) = cli.config.clone() {
@@ -93,60 +101,29 @@ impl Config {
                 .filter(|p| p.exists())
         };
 
-        if let Some(ref path) = discovered {
+        // Take CLI token before merging so it stays session-only and never touches disk.
+        let cli_token = cli.opts.token.take().filter(|t| !t.is_empty());
+
+        // 2. Layer precedence: defaults <- config.toml <- CLI / env
+        let mut cfg = if let Some(ref path) = discovered {
             let raw = fs::read_to_string(path)
                 .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
-            let file_cfg: FileConfig = toml::from_str(&raw)
+            let file_opts: <Self as ClapSerde>::Opt = toml::from_str(&raw)
                 .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
-            cfg.apply_file(file_cfg);
-            cfg.config_path = Some(path.clone());
-        }
+            Self::from(file_opts).merge(&mut cli.opts)
+        } else {
+            Self::from(&mut cli.opts)
+        };
+        cfg.config_path = discovered;
 
-        // 2. Apply CLI flag overrides
-        if let Some(bind) = cli.bind {
-            cfg.bind = bind;
-        }
-        if let Some(port) = cli.port {
-            cfg.port = port;
-        }
-        if let Some(media_port) = cli.media_port {
-            cfg.media_port = media_port;
-        }
-        if let Some(public_ip) = cli.public_ip {
-            cfg.public_ip = Some(public_ip);
-        }
-        if let Some(stun_server) = cli.stun_server {
-            cfg.stun_server = stun_server;
-        }
-        if let Some(mqtt_url) = cli.mqtt_url {
-            cfg.mqtt_url = mqtt_url;
-        }
-        if let Some(viewer_url) = cli.viewer_url {
-            cfg.viewer_url = viewer_url;
-        }
-        if let Some(whip_token) = cli.whip_token {
-            cfg.whip_token = (!whip_token.is_empty()).then_some(whip_token);
-        }
-        if let Some(max_peers) = cli.max_peers {
-            cfg.max_peers = max_peers;
-        }
-        if let Some(max_uplink_mbps) = cli.max_uplink_mbps {
-            cfg.max_uplink_mbps = max_uplink_mbps;
-        }
-        if let Some(ingest_timeout_secs) = cli.ingest_timeout_secs {
-            cfg.ingest_timeout_secs = ingest_timeout_secs;
-        }
-        cfg.verbose = cli.verbose;
-
-        // Normalize empty whip_token from file
+        // Normalize empty whip_token
         if cfg.whip_token.as_deref().is_some_and(str::is_empty) {
             cfg.whip_token = None;
         }
 
         // 3. Resolve stream token
-        if let Some(cli_token) = cli.token.filter(|t| !t.is_empty()) {
-            // Session-only override; never writes disk.
-            cfg.token = cli_token;
+        if let Some(token) = cli_token {
+            cfg.token = token;
         } else if cli.new_token || cfg.token.is_empty() {
             let new_token = generate_token();
             let save_path = cfg
@@ -168,45 +145,6 @@ impl Config {
         }
 
         Ok(cfg)
-    }
-
-    fn apply_file(&mut self, f: FileConfig) {
-        if let Some(v) = f.bind {
-            self.bind = v;
-        }
-        if let Some(v) = f.port {
-            self.port = v;
-        }
-        if let Some(v) = f.media_port {
-            self.media_port = v;
-        }
-        if let Some(v) = f.public_ip {
-            self.public_ip = Some(v);
-        }
-        if let Some(v) = f.stun_server {
-            self.stun_server = v;
-        }
-        if let Some(v) = f.mqtt_url {
-            self.mqtt_url = v;
-        }
-        if let Some(v) = f.viewer_url {
-            self.viewer_url = v;
-        }
-        if let Some(v) = f.token {
-            self.token = v;
-        }
-        if let Some(v) = f.whip_token {
-            self.whip_token = Some(v);
-        }
-        if let Some(v) = f.max_peers {
-            self.max_peers = v;
-        }
-        if let Some(v) = f.max_uplink_mbps {
-            self.max_uplink_mbps = v;
-        }
-        if let Some(v) = f.ingest_timeout_secs {
-            self.ingest_timeout_secs = v;
-        }
     }
 
     pub fn watch_url(&self) -> String {

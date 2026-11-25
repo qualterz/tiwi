@@ -12,6 +12,7 @@ aes-gcm = "0.10"
 axum = "0.8"
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
+clap-serde-derive = "1.0.0"
 dirs = "6"
 hmac = "0.12"
 rand = "0.8"
