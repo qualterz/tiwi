@@ -104,7 +104,9 @@ export function startViewer(
   let onAnswerMessage: ((topic: string, payload: Buffer) => void) | null = null;
   let statsTimer: ReturnType<typeof setTimeout> | undefined;
   let phaseTimer: ReturnType<typeof setTimeout> | undefined;
+  let cancelGather: (() => void) | null = null;
 
+  const MAX_SEEN_EVENT_IVS = 512;
   const seenEventIvs = new Set<string>();
   let streamId = "";
   let eventsTopic = "";
@@ -128,6 +130,8 @@ export function startViewer(
     statsTimer = undefined;
     clearTimeout(phaseTimer);
     phaseTimer = undefined;
+    cancelGather?.();
+    cancelGather = null;
   };
 
   const clearSignalingHooks = () => {
@@ -186,6 +190,10 @@ export function startViewer(
             fromBase64Url(data),
           );
           if (mqttClient !== c || destroyed) return;
+          if (seenEventIvs.size >= MAX_SEEN_EVENT_IVS) {
+            const oldest = seenEventIvs.values().next().value;
+            if (oldest !== undefined) seenEventIvs.delete(oldest);
+          }
           seenEventIvs.add(iv);
           const { type } = JSON.parse(new TextDecoder().decode(decrypted)) as {
             type?: string;
@@ -214,6 +222,13 @@ export function startViewer(
   };
 
   const closePc = () => {
+    const stream = videoEl.srcObject as MediaStream | null;
+    if (stream) {
+      for (const track of stream.getTracks()) {
+        track.stop();
+      }
+      videoEl.srcObject = null;
+    }
     if (!activePc) return;
     const pc = activePc;
     activePc = null;
@@ -661,16 +676,20 @@ export function startViewer(
       let gatherTimedOut = false;
       if (pc.iceGatheringState !== "complete") {
         await new Promise<void>((resolve) => {
+          const finish = () => {
+            clearTimeout(timer);
+            pc.onicegatheringstatechange = null;
+            if (cancelGather === finish) cancelGather = null;
+            resolve();
+          };
           const timer = setTimeout(() => {
             gatherTimedOut = true;
-            pc.onicegatheringstatechange = null;
-            resolve();
+            finish();
           }, ICE_GATHER_TIMEOUT_MS);
+          cancelGather = finish;
           pc.onicegatheringstatechange = () => {
             if (pc.iceGatheringState === "complete" || gen !== myGen) {
-              clearTimeout(timer);
-              pc.onicegatheringstatechange = null;
-              resolve();
+              finish();
             }
           };
         });

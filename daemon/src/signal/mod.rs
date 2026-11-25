@@ -137,11 +137,10 @@ pub async fn run(
                 };
                 match crypto.encrypt_json(&StreamEventPayload { event_type: kind }) {
                     Ok(payload) => {
-                        if let Err(e) = client
-                            .publish(&events_topic, QoS::AtMostOnce, false, payload)
-                            .await
+                        if let Err(e) =
+                            client.try_publish(&events_topic, QoS::AtMostOnce, false, payload)
                         {
-                            debug!(event = kind, err = %e, "Failed to publish stream event");
+                            debug!(event = kind, err = %e, "Failed to enqueue stream event");
                         }
                     }
                     Err(e) => warn!(event = kind, err = %e, "Failed to encrypt stream event"),
@@ -152,9 +151,14 @@ pub async fn run(
                 match poll {
                     Ok(Event::Incoming(Incoming::ConnAck(_))) => {
                         info!("MQTT signaling connected");
-                        if let Err(e) = client.subscribe(&offer_topic, QoS::AtMostOnce).await {
-                            warn!(err = %e, "Failed to subscribe to offer topic");
-                        }
+                        let sub_client = client.clone();
+                        let sub_topic = offer_topic.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = sub_client.subscribe(&sub_topic, QoS::AtMostOnce).await
+                            {
+                                warn!(err = %e, "Failed to subscribe to offer topic");
+                            }
+                        });
                     }
                     Ok(Event::Incoming(Incoming::Publish(p))) if p.topic == offer_topic => {
                         handle_incoming_offer(

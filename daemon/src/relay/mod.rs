@@ -306,7 +306,14 @@ pub async fn run(
             Some(()) = pli_rx.recv() => {
                 while pli_rx.try_recv().is_ok() {}
                 if let Some(ing) = ingest.as_mut() {
-                    request_ingest_keyframe(ing, &socket, ingest_bound.is_dual_stack, &mut metrics);
+                    request_ingest_keyframe(
+                        ing,
+                        &shards,
+                        &socket,
+                        ingest_bound.is_dual_stack,
+                        &mut metrics,
+                        &signal_tx,
+                    );
                 }
             }
 
@@ -316,6 +323,7 @@ pub async fn run(
                         let res = handle_whip_offer(
                             sdp,
                             &ingest_bound,
+                            dtls_cert.as_ref(),
                             &mut next_session_seq,
                             &mut ingest,
                             &shards,
@@ -354,6 +362,18 @@ pub async fn run(
             }
 
             _ = tokio::time::sleep(sleep_dur) => {}
+        }
+
+        // Reap a closed ingest session immediately rather than waiting for the next timer tick.
+        if ingest.as_ref().is_some_and(|i| !i.rtc.is_alive()) {
+            teardown_ingest(
+                &mut ingest,
+                &shards,
+                &socket,
+                ingest_bound.is_dual_stack,
+                &mut metrics,
+                &signal_tx,
+            );
         }
 
         // Run ingest timers and 1s metrics tick outside `select!` so continuous UDP traffic
@@ -538,6 +558,7 @@ fn compute_ingest_deadline(
 fn handle_whip_offer(
     sdp: String,
     bound: &BoundCandidates,
+    dtls_cert: Option<&DtlsCert>,
     next_session_seq: &mut u64,
     ingest: &mut Option<IngestSession>,
     shards: &[ShardHandle],
@@ -552,6 +573,9 @@ fn handle_whip_offer(
     let mut rtc_cfg = RtcConfig::new()
         .set_rtp_mode(true)
         .set_stats_interval(Some(Duration::from_secs(1)));
+    if let Some(cert) = dtls_cert {
+        rtc_cfg = rtc_cfg.set_dtls_cert(cert.clone());
+    }
     register_offer_av1_formats(rtc_cfg.codec_config(), &sdp);
     let mut rtc = rtc_cfg.build(now);
 
@@ -828,9 +852,11 @@ fn drain_ingest(
 
 fn request_ingest_keyframe(
     ing: &mut IngestSession,
+    shards: &[ShardHandle],
     socket: &UdpSocket,
     is_dual_stack: bool,
     metrics: &mut RelayMetrics,
+    signal_tx: &mpsc::Sender<SignalEvent>,
 ) {
     let now = Instant::now();
     if let Some(last) = ing.last_pli_at
@@ -857,21 +883,8 @@ fn request_ingest_keyframe(
         ing.last_pli_at = Some(now);
         metrics.record_pli();
         trace!(session = %ing.id, "PLI sent");
-        // Drain PLI RTCP packet out to OBS immediately.
-        loop {
-            match ing.rtc.poll_output() {
-                Ok(Output::Timeout(t)) => {
-                    ing.next_timeout = t;
-                    break;
-                }
-                Ok(Output::Transmit(t)) => {
-                    let _ = socket
-                        .try_send_to(&t.contents, to_socket_addr(t.destination, is_dual_stack));
-                }
-                Ok(Output::Event(_)) => {}
-                Err(_) => break,
-            }
-        }
+        // Drain PLI RTCP packet out to OBS immediately without dropping queued events.
+        drain_ingest(ing, shards, socket, is_dual_stack, metrics, signal_tx);
     }
 }
 
@@ -922,7 +935,7 @@ fn run_egress_shard(
     let mut congested = false;
 
     loop {
-        let next_deadline = if viewers.is_empty() {
+        if viewers.is_empty() {
             // 0% CPU when idle: block until a viewer or control message arrives.
             match rx.recv() {
                 Ok(msg) => {
@@ -965,7 +978,6 @@ fn run_egress_shard(
                 }
                 Err(_) => break,
             }
-            Instant::now()
         } else {
             let now = Instant::now();
             let deadline = compute_shard_deadline(now, &viewers);
@@ -1015,8 +1027,7 @@ fn run_egress_shard(
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }
-            deadline
-        };
+        }
 
         if viewers.is_empty() {
             continue;
@@ -1033,58 +1044,88 @@ fn run_egress_shard(
             &pli_tx,
         );
 
-        let now = Instant::now();
-        if now >= next_deadline {
-            let mut dead_viewers: Vec<(String, bool)> = Vec::new();
-            let mut want_pli = false;
-            let mut stats_dirty = false;
+        // Drive due viewer timeouts and reap closed/timed-out sessions on every pass so
+        // continuous RTP traffic can never starve timeouts or leak closed sessions.
+        tick_and_reap_viewers(
+            Instant::now(),
+            &mut viewers,
+            &mut addr_to_viewer,
+            &socket,
+            bound.is_dual_stack,
+            &counters,
+            &pli_tx,
+        );
+    }
+}
 
-            for (id, v) in viewers.iter_mut() {
-                if now >= v.next_timeout {
-                    if let Err(e) = v.rtc.handle_input(Input::Timeout(now)) {
-                        debug!(viewer = %id, err = %e, "Viewer timeout error");
-                    }
-                    let (pli, dirty) = drain_viewer(v, &socket, bound.is_dual_stack, &counters);
-                    want_pli |= pli;
-                    stats_dirty |= dirty;
+fn tick_and_reap_viewers(
+    now: Instant,
+    viewers: &mut HashMap<String, ViewerSession>,
+    addr_to_viewer: &mut HashMap<SocketAddr, String>,
+    socket: &std::net::UdpSocket,
+    is_dual_stack: bool,
+    counters: &ShardCounters,
+    pli_tx: &mpsc::Sender<()>,
+) {
+    let mut dead_viewers: Vec<(String, bool)> = Vec::new();
+    let mut want_pli = false;
+    let mut stats_dirty = false;
+
+    for (id, v) in viewers.iter_mut() {
+        if v.rtc.is_alive() && now >= v.next_timeout {
+            if let Err(e) = v.rtc.handle_input(Input::Timeout(now)) {
+                debug!(viewer = %id, err = %e, "Viewer timeout error");
+            }
+            let (pli, dirty) = drain_viewer(v, socket, is_dual_stack, counters);
+            want_pli |= pli;
+            stats_dirty |= dirty;
+        }
+
+        if !v.rtc.is_alive() {
+            dead_viewers.push((id.clone(), v.connected));
+        } else if !v.connected && now.duration_since(v.created_at) >= VIEWER_HANDSHAKE_TIMEOUT {
+            dead_viewers.push((id.clone(), false));
+        }
+    }
+
+    if !dead_viewers.is_empty() {
+        let removed = dead_viewers.len();
+        for (id, was_connected) in dead_viewers {
+            if let Some(mut v) = viewers.remove(&id) {
+                if let Some(addr) = v.remote_addr {
+                    remove_addr_mapping(addr_to_viewer, addr, &id);
                 }
-
-                if !v.rtc.is_alive() {
-                    dead_viewers.push((id.clone(), v.connected));
-                } else if !v.connected
-                    && now.duration_since(v.created_at) >= VIEWER_HANDSHAKE_TIMEOUT
-                {
-                    dead_viewers.push((id.clone(), false));
+                if v.rtc.is_alive() {
+                    close_viewer(&mut v, socket, is_dual_stack);
                 }
             }
-
-            if !dead_viewers.is_empty() {
-                let removed = dead_viewers.len();
-                for (id, was_connected) in dead_viewers {
-                    if let Some(mut v) = viewers.remove(&id) {
-                        if let Some(addr) = v.remote_addr {
-                            addr_to_viewer.remove(&addr);
-                        }
-                        if v.rtc.is_alive() {
-                            close_viewer(&mut v, &socket, bound.is_dual_stack);
-                        }
-                    }
-                    if was_connected {
-                        info!(viewer = %id, "Viewer disconnected");
-                    } else {
-                        debug!(viewer = %id, "Viewer handshake timed out");
-                    }
-                }
-                counters.viewers.fetch_sub(removed, Ordering::Relaxed);
-                sync_shard_stats(&viewers, &counters);
-            } else if stats_dirty {
-                sync_shard_stats(&viewers, &counters);
-            }
-
-            if want_pli {
-                let _ = pli_tx.try_send(());
+            if was_connected {
+                info!(viewer = %id, "Viewer disconnected");
+            } else {
+                debug!(viewer = %id, "Viewer handshake timed out");
             }
         }
+        counters.viewers.fetch_sub(removed, Ordering::Relaxed);
+        sync_shard_stats(viewers, counters);
+    } else if stats_dirty {
+        sync_shard_stats(viewers, counters);
+    }
+
+    if want_pli {
+        let _ = pli_tx.try_send(());
+    }
+}
+
+fn remove_addr_mapping(
+    addr_to_viewer: &mut HashMap<SocketAddr, String>,
+    addr: SocketAddr,
+    viewer_id: &str,
+) {
+    if addr_to_viewer
+        .get(&addr)
+        .is_some_and(|mapped| mapped == viewer_id)
+    {
+        addr_to_viewer.remove(&addr);
     }
 }
 
@@ -1142,7 +1183,7 @@ fn drain_shard_udp(
             && let Some(v) = viewers.get_mut(&vid)
         {
             if let Some(old) = v.remote_addr.replace(source) {
-                addr_to_viewer.remove(&old);
+                remove_addr_mapping(addr_to_viewer, old, &vid);
             }
             addr_to_viewer.insert(source, vid.clone());
             if let Err(e) = v.rtc.handle_input(input) {
@@ -1207,11 +1248,12 @@ fn handle_shard_msg(
                 Ok((viewer, answer_sdp)) => {
                     if let Some(mut old) = viewers.insert(viewer_id.clone(), viewer) {
                         if let Some(addr) = old.remote_addr {
-                            addr_to_viewer.remove(&addr);
+                            remove_addr_mapping(addr_to_viewer, addr, &old.id);
                         }
                         close_viewer(&mut old, socket, bound.is_dual_stack);
                         // Undo extra pre-increment when replacing an existing viewer_id.
                         counters.viewers.fetch_sub(1, Ordering::Relaxed);
+                        sync_shard_stats(viewers, counters);
                     }
                     debug!(
                         viewer = %viewer_id,
@@ -1388,7 +1430,7 @@ fn fanout_rtp_shard(
     let mut stats_dirty = false;
 
     for v in viewers.values_mut() {
-        if !v.connected {
+        if !v.connected || !v.rtc.is_alive() {
             continue;
         }
         let (mid_opt, pt_opt, seq_counter) = if pkt.is_video {
@@ -1477,6 +1519,10 @@ fn drain_viewer(
                 }
                 Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
                     let _ = v.rtc.close();
+                    dirty = true;
+                }
+                Event::Closed => {
+                    dirty = true;
                 }
                 Event::MediaAdded(m) => {
                     if let Some(p) = negotiated_param(&v.rtc, m.mid) {
@@ -1531,15 +1577,26 @@ fn compute_shard_deadline(now: Instant, viewers: &HashMap<String, ViewerSession>
     let mut earliest = now + Duration::from_millis(50);
     for v in viewers.values() {
         earliest = earliest.min(v.next_timeout);
+        if !v.connected {
+            earliest = earliest.min(v.created_at + VIEWER_HANDSHAKE_TIMEOUT);
+        }
     }
     earliest
 }
 
 fn sync_shard_stats(viewers: &HashMap<String, ViewerSession>, counters: &ShardCounters) {
-    let connected = viewers.values().filter(|v| v.connected).count();
-    let max_rtt = viewers.values().filter_map(|v| v.last_rtt).max();
+    let connected = viewers
+        .values()
+        .filter(|v| v.connected && v.rtc.is_alive())
+        .count();
+    let max_rtt = viewers
+        .values()
+        .filter(|v| v.rtc.is_alive())
+        .filter_map(|v| v.last_rtt)
+        .max();
     let max_loss = viewers
         .values()
+        .filter(|v| v.rtc.is_alive())
         .filter_map(|v| v.last_loss)
         .reduce(f32::max);
     counters.connected_viewers.store(connected, Ordering::Relaxed);
@@ -1821,6 +1878,82 @@ mod tests {
             viewer.next_timeout.saturating_duration_since(before) < Duration::from_secs(5),
             "ICE timer was not armed: next_timeout = {:?}",
             viewer.next_timeout.saturating_duration_since(before)
+        );
+    }
+
+    #[test]
+    fn closed_viewer_is_skipped_on_fanout_and_reaped_immediately() {
+        let (sock, bound) = test_bound_and_socket();
+        let counters = ShardCounters::new();
+        let offer = sample_firefox_offer(
+            "m=video 9 UDP/TLS/RTP/SAVPF 120\r\n\
+             c=IN IP4 0.0.0.0\r\n\
+             a=recvonly\r\n\
+             a=ice-ufrag:testufrag\r\n\
+             a=ice-pwd:testpassword123456789012\r\n\
+             a=mid:0\r\n\
+             a=rtcp-mux\r\n\
+             a=setup:actpass\r\n\
+             a=rtpmap:120 VP8/90000\r\n",
+        );
+
+        let (mut viewer, _) = build_viewer_session(
+            "v-dead".to_string(),
+            offer,
+            Some(Codec::Vp8),
+            &bound,
+            None,
+            &sock,
+            &counters,
+        )
+        .expect("viewer offer should be accepted");
+
+        let shared_addr: SocketAddr = "198.51.100.42:54321".parse().unwrap();
+        viewer.connected = true;
+        viewer.remote_addr = Some(shared_addr);
+        viewer.rtc.disconnect();
+        assert!(!viewer.rtc.is_alive());
+
+        counters.viewers.store(1, Ordering::Relaxed);
+        counters.connected_viewers.store(1, Ordering::Relaxed);
+
+        let mut viewers = HashMap::new();
+        viewers.insert("v-dead".to_string(), viewer);
+        let mut addr_to_viewer = HashMap::new();
+        // Simulate a newer viewer already owning the same SocketAddr.
+        addr_to_viewer.insert(shared_addr, "v-newer".to_string());
+
+        let (pli_tx, _pli_rx) = mpsc::channel(4);
+        let pkt = SharedRtp {
+            is_video: true,
+            timestamp: 90_000,
+            wall_time: Instant::now(),
+            marker: true,
+            payload: Arc::from([1u8, 2, 3, 4]),
+        };
+
+        fanout_rtp_shard(&pkt, &mut viewers, false, &sock, false, &counters, &pli_tx);
+        let (out_bytes, out_pkts, _, _, _) = counters.take_interval();
+        assert_eq!(out_bytes, 0, "closed viewer must not receive RTP fanout");
+        assert_eq!(out_pkts, 0);
+
+        tick_and_reap_viewers(
+            Instant::now(),
+            &mut viewers,
+            &mut addr_to_viewer,
+            &sock,
+            false,
+            &counters,
+            &pli_tx,
+        );
+
+        assert!(viewers.is_empty(), "closed viewer must be reaped immediately");
+        assert_eq!(counters.viewers.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.connected_viewers.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            addr_to_viewer.get(&shared_addr).map(String::as_str),
+            Some("v-newer"),
+            "reaping old viewer must not clobber newer viewer's addr mapping"
         );
     }
 }
