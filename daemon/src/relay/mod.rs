@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use str0m::change::SdpOffer;
 use str0m::config::DtlsCert;
 use str0m::crypto as str0m_crypto;
-use str0m::format::Codec;
-use str0m::media::{KeyframeRequestKind, MediaKind, Mid, Pt};
+use str0m::format::{Codec, CodecConfig, FormatParams, PayloadParams};
+use str0m::media::{Frequency, KeyframeRequestKind, MediaKind, Mid, Pt};
 use str0m::net::{Protocol, Receive};
 use str0m::rtp::{RtpWrite, SeqNo, Ssrc};
 use str0m::{Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
@@ -418,7 +418,7 @@ pub async fn run(
 
                 let codec = ing
                     .video_codec
-                    .map(|c| format!("{c:?}"))
+                    .map(|c| c.to_string())
                     .unwrap_or_else(|| "pending".to_string());
                 let snap = metrics.take_snapshot(
                     now,
@@ -528,10 +528,11 @@ fn handle_whip_offer(
         .map_err(|e| WhipError::BadRequest(format!("Invalid SDP offer: {e}")))?;
 
     let now = Instant::now();
-    let mut rtc = RtcConfig::new()
+    let mut rtc_cfg = RtcConfig::new()
         .set_rtp_mode(true)
-        .set_stats_interval(Some(Duration::from_secs(1)))
-        .build(now);
+        .set_stats_interval(Some(Duration::from_secs(1)));
+    register_offer_av1_formats(rtc_cfg.codec_config(), &sdp);
+    let mut rtc = rtc_cfg.build(now);
 
     for c in &bound.candidates {
         rtc.add_local_candidate(c.clone());
@@ -688,34 +689,28 @@ fn drain_ingest(
                     let _ = ing.rtc.close();
                 }
                 Event::MediaAdded(m) => {
-                    let first_param = ing
-                        .rtc
-                        .codec_config()
-                        .params()
-                        .iter()
-                        .find(|p| p.spec().codec.kind() == m.kind)
-                        .copied();
+                    let param = negotiated_param(&ing.rtc, m.mid);
                     match m.kind {
                         MediaKind::Video => {
-                            ing.video_mid = Some(m.mid);
-                            if let Some(p) = first_param {
+                            if let Some(p) = param {
+                                ing.video_mid = Some(m.mid);
                                 ing.video_pt = Some(p.pt());
                                 ing.video_codec = Some(p.spec().codec);
-                                debug!(
+                                info!(
                                     session = %ing.id,
-                                    codec = ?p.spec().codec,
+                                    codec = %p.spec().codec,
                                     pt = *p.pt(),
                                     "Ingest video track negotiated"
                                 );
                             }
                         }
                         MediaKind::Audio => {
-                            ing.audio_mid = Some(m.mid);
-                            if let Some(p) = first_param {
+                            if let Some(p) = param {
+                                ing.audio_mid = Some(m.mid);
                                 ing.audio_pt = Some(p.pt());
                                 debug!(
                                     session = %ing.id,
-                                    codec = ?p.spec().codec,
+                                    codec = %p.spec().codec,
                                     pt = *p.pt(),
                                     "Ingest audio track negotiated"
                                 );
@@ -740,14 +735,21 @@ fn drain_ingest(
                         Some(p) => {
                             let v = p.spec().codec.kind() == MediaKind::Video;
                             if v && ing.video_codec != Some(p.spec().codec) {
+                                let prev_codec = ing.video_codec;
                                 ing.video_pt = Some(p.pt());
                                 ing.video_codec = Some(p.spec().codec);
                                 info!(
                                     session = %ing.id,
-                                    codec = ?p.spec().codec,
+                                    codec = %p.spec().codec,
                                     pt = *p.pt(),
                                     "Active ingest video codec detected"
                                 );
+                                if prev_codec.is_some() {
+                                    for shard in shards {
+                                        let _ = shard.tx.send(ShardMsg::ClearViewers);
+                                    }
+                                    let _ = signal_tx.try_send(SignalEvent::StreamStart);
+                                }
                             }
                             v
                         }
@@ -1252,18 +1254,28 @@ fn build_viewer_session(
     if let Some(codec) = video_codec {
         rtc_cfg = rtc_cfg.clear_codecs().enable_opus(true, false);
         rtc_cfg = match codec {
-            Codec::Av1 => rtc_cfg.enable_av1(true),
+            Codec::Av1 => {
+                rtc_cfg = rtc_cfg.enable_av1(true);
+                register_offer_av1_formats(rtc_cfg.codec_config(), &sdp);
+                rtc_cfg
+            }
             Codec::H264 => rtc_cfg.enable_h264(true),
             Codec::H265 => rtc_cfg.enable_h265(true),
             Codec::Vp8 => rtc_cfg.enable_vp8(true),
             Codec::Vp9 => rtc_cfg.enable_vp9(true),
-            _ => rtc_cfg
-                .enable_av1(true)
-                .enable_h264(true)
-                .enable_h265(true)
-                .enable_vp8(true)
-                .enable_vp9(true),
+            _ => {
+                rtc_cfg = rtc_cfg
+                    .enable_av1(true)
+                    .enable_h264(true)
+                    .enable_h265(true)
+                    .enable_vp8(true)
+                    .enable_vp9(true);
+                register_offer_av1_formats(rtc_cfg.codec_config(), &sdp);
+                rtc_cfg
+            }
         };
+    } else {
+        register_offer_av1_formats(rtc_cfg.codec_config(), &sdp);
     }
 
     let mut rtc = rtc_cfg.build(now);
@@ -1275,6 +1287,18 @@ fn build_viewer_session(
         .sdp_api()
         .accept_offer(offer)
         .map_err(|e| format!("Failed to accept viewer offer: {e}"))?;
+    let answer_sdp = answer.to_sdp_string();
+
+    if let Some(codec) = video_codec
+        && !answer_has_active_video(&answer_sdp)
+    {
+        warn!(
+            viewer = %viewer_id,
+            codec = %codec,
+            "Viewer does not support stream video codec"
+        );
+        return Err(format!("Unsupported video codec ({codec})"));
+    }
 
     let mut viewer = ViewerSession {
         id: viewer_id,
@@ -1295,7 +1319,8 @@ fn build_viewer_session(
     };
 
     let _ = drain_viewer(&mut viewer, socket, bound.is_dual_stack, counters);
-    Ok((viewer, answer.to_sdp_string()))
+
+    Ok((viewer, answer_sdp))
 }
 
 fn fanout_rtp_shard(
@@ -1404,14 +1429,7 @@ fn drain_viewer(
                     let _ = v.rtc.close();
                 }
                 Event::MediaAdded(m) => {
-                    if let Some(p) = v
-                        .rtc
-                        .codec_config()
-                        .params()
-                        .iter()
-                        .find(|p| p.spec().codec.kind() == m.kind)
-                        .copied()
-                    {
+                    if let Some(p) = negotiated_param(&v.rtc, m.mid) {
                         match m.kind {
                             MediaKind::Video => {
                                 v.video_mid = Some(m.mid);
@@ -1463,4 +1481,245 @@ fn sync_shard_stats(viewers: &HashMap<String, ViewerSession>, counters: &ShardCo
         .reduce(f32::max);
     counters.connected_viewers.store(connected, Ordering::Relaxed);
     counters.set_peer_stats(max_rtt, max_loss);
+}
+
+fn negotiated_param(rtc: &Rtc, mid: Mid) -> Option<PayloadParams> {
+    let pt = rtc.media(mid)?.remote_pts().first().copied()?;
+    rtc.codec_config()
+        .params()
+        .iter()
+        .find(|p| p.pt() == pt)
+        .copied()
+}
+
+fn answer_has_active_video(answer_sdp: &str) -> bool {
+    answer_sdp.lines().any(|line| {
+        let Some(rest) = line.trim().strip_prefix("m=video ") else {
+            return false;
+        };
+        rest.split_whitespace()
+            .next()
+            .is_some_and(|port| port != "0")
+    })
+}
+
+/// Workaround for str0m's exact-equality AV1 `level-idx`/`profile`/`tier` matching:
+/// registers any AV1 `a=fmtp` parameters advertised by the remote SDP offer so
+/// str0m negotiates AV1 regardless of the peer's advertised level-idx.
+fn register_offer_av1_formats(cfg: &mut CodecConfig, sdp: &str) {
+    let mut av1_pts: Vec<u8> = Vec::new();
+    for line in sdp.lines().map(str::trim) {
+        let Some(rest) = line.strip_prefix("a=rtpmap:") else {
+            continue;
+        };
+        let Some((pt_str, codec)) = rest.split_once(' ') else {
+            continue;
+        };
+        if codec.to_ascii_lowercase().starts_with("av1/90000")
+            && let Ok(pt) = pt_str.parse::<u8>()
+            && !av1_pts.contains(&pt)
+        {
+            av1_pts.push(pt);
+        }
+    }
+    if av1_pts.is_empty() {
+        return;
+    }
+
+    let mut fmtps: Vec<(Option<u8>, Option<u8>, Option<u8>)> = Vec::new();
+    for line in sdp.lines().map(str::trim) {
+        let Some(rest) = line.strip_prefix("a=fmtp:") else {
+            continue;
+        };
+        let Some((pt_str, params)) = rest.split_once(' ') else {
+            continue;
+        };
+        let Ok(pt) = pt_str.parse::<u8>() else {
+            continue;
+        };
+        if !av1_pts.contains(&pt) {
+            continue;
+        }
+        let (mut profile, mut level_idx, mut tier) = (None, None, None);
+        for kv in params.split(';') {
+            let Some((k, v)) = kv.trim().split_once('=') else {
+                continue;
+            };
+            match k.trim().to_ascii_lowercase().as_str() {
+                "profile" => profile = v.trim().parse::<u8>().ok(),
+                "level-idx" => level_idx = v.trim().parse::<u8>().ok(),
+                "tier" => tier = v.trim().parse::<u8>().ok(),
+                _ => {}
+            }
+        }
+        fmtps.push((profile, level_idx, tier));
+    }
+
+    for (profile, level_idx, tier) in fmtps {
+        let norm = (profile.unwrap_or(0), level_idx.unwrap_or(5), tier.unwrap_or(0));
+        let already_exists = cfg.params().iter().any(|p| {
+            let s = p.spec();
+            s.codec == Codec::Av1
+                && (
+                    s.format.profile.unwrap_or(0),
+                    s.format.level_idx.unwrap_or(5),
+                    s.format.tier.unwrap_or(0),
+                ) == norm
+        });
+        if already_exists {
+            continue;
+        }
+
+        let Some(pt) = next_free_pt(cfg) else {
+            break;
+        };
+        let rtx_pt = next_free_pt_excluding(cfg, pt);
+        cfg.add_config(
+            pt,
+            rtx_pt,
+            Codec::Av1,
+            Frequency::NINETY_KHZ,
+            None,
+            FormatParams {
+                profile,
+                level_idx,
+                tier,
+                ..Default::default()
+            },
+        );
+    }
+}
+
+fn is_pt_used(cfg: &CodecConfig, candidate: u8) -> bool {
+    let pt = Pt::new_with_value(candidate);
+    cfg.params()
+        .iter()
+        .any(|p| p.pt() == pt || p.resend() == Some(pt) || p.red() == Some(pt))
+}
+
+fn next_free_pt(cfg: &CodecConfig) -> Option<Pt> {
+    (35..=63)
+        .chain(80..=127)
+        .find(|&n| !is_pt_used(cfg, n))
+        .map(Pt::new_with_value)
+}
+
+fn next_free_pt_excluding(cfg: &CodecConfig, exclude: Pt) -> Option<Pt> {
+    (35..=63)
+        .chain(80..=127)
+        .find(|&n| n != *exclude && !is_pt_used(cfg, n))
+        .map(Pt::new_with_value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use str0m::Candidate;
+
+    fn test_bound_and_socket() -> (std::net::UdpSocket, BoundCandidates) {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_nonblocking(true).unwrap();
+        let addr = sock.local_addr().unwrap();
+        let bound = BoundCandidates {
+            local_port: addr.port(),
+            loopback_addr: addr,
+            host_addr: addr,
+            v6_host_addr: None,
+            is_dual_stack: false,
+            candidates: vec![Candidate::host(addr, "udp").unwrap()],
+        };
+        (sock, bound)
+    }
+
+    fn sample_firefox_offer(video_sdp: &str) -> String {
+        format!(
+            "v=0\r\n\
+             o=mozilla...THIS_IS_SDPARTA-99.0 12345 0 IN IP4 0.0.0.0\r\n\
+             s=-\r\n\
+             t=0 0\r\n\
+             a=fingerprint:sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\n\
+             a=group:BUNDLE 0 1\r\n\
+             a=ice-options:trickle\r\n\
+             a=msid-semantic:WMS *\r\n\
+             {video_sdp}\
+             m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+             c=IN IP4 0.0.0.0\r\n\
+             a=recvonly\r\n\
+             a=ice-ufrag:testufrag\r\n\
+             a=ice-pwd:testpassword123456789012\r\n\
+             a=mid:1\r\n\
+             a=rtcp-mux\r\n\
+             a=setup:actpass\r\n\
+             a=rtpmap:111 opus/48000/2\r\n"
+        )
+    }
+
+    #[test]
+    fn av1_non_default_level_idx_negotiates_video() {
+        let (sock, bound) = test_bound_and_socket();
+        let counters = ShardCounters::new();
+        let offer = sample_firefox_offer(
+            "m=video 9 UDP/TLS/RTP/SAVPF 41 42\r\n\
+             c=IN IP4 0.0.0.0\r\n\
+             a=recvonly\r\n\
+             a=ice-ufrag:testufrag\r\n\
+             a=ice-pwd:testpassword123456789012\r\n\
+             a=mid:0\r\n\
+             a=rtcp-mux\r\n\
+             a=setup:actpass\r\n\
+             a=rtpmap:41 AV1/90000\r\n\
+             a=fmtp:41 level-idx=31;profile=0;tier=0\r\n\
+             a=rtpmap:42 rtx/90000\r\n\
+             a=fmtp:42 apt=41\r\n",
+        );
+
+        let (viewer, answer) = build_viewer_session(
+            "v-av1".to_string(),
+            offer,
+            Some(Codec::Av1),
+            &bound,
+            None,
+            &sock,
+            &counters,
+        )
+        .expect("AV1 with level-idx=31 should negotiate");
+
+        assert!(
+            negotiated_param(&viewer.rtc, Mid::from("0"))
+                .is_some_and(|p| p.spec().codec == Codec::Av1)
+        );
+        assert!(answer.contains("a=candidate:"));
+        assert!(answer_has_active_video(&answer));
+    }
+
+    #[test]
+    fn unsupported_h265_viewer_offer_is_rejected() {
+        let (sock, bound) = test_bound_and_socket();
+        let counters = ShardCounters::new();
+        let offer = sample_firefox_offer(
+            "m=video 9 UDP/TLS/RTP/SAVPF 120\r\n\
+             c=IN IP4 0.0.0.0\r\n\
+             a=recvonly\r\n\
+             a=ice-ufrag:testufrag\r\n\
+             a=ice-pwd:testpassword123456789012\r\n\
+             a=mid:0\r\n\
+             a=rtcp-mux\r\n\
+             a=setup:actpass\r\n\
+             a=rtpmap:120 VP8/90000\r\n",
+        );
+
+        let err = build_viewer_session(
+            "v-h265".to_string(),
+            offer,
+            Some(Codec::H265),
+            &bound,
+            None,
+            &sock,
+            &counters,
+        )
+        .err()
+        .expect("viewer without H265 should be rejected");
+
+        assert!(err.contains("Unsupported video codec"));
+    }
 }
