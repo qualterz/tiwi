@@ -16,7 +16,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, trace, warn};
 
-use self::metrics::RelayMetrics;
+use self::metrics::{MetricsRollup, MetricsWriter, RelayMetrics};
 use self::net::{bind_shared_udp, gather_local_candidates};
 use crate::config::Config;
 use crate::signal::{SignalEvent, ViewerOffer};
@@ -24,7 +24,8 @@ use crate::whip::{WhipAccepted, WhipCommand, WhipError};
 
 const VIEWER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 const PLI_COOLDOWN: Duration = Duration::from_millis(500);
-const STATS_LOG_INTERVAL: Duration = Duration::from_secs(5);
+const METRICS_INTERVAL: Duration = Duration::from_secs(1);
+const STDOUT_ROLLUP_TICKS: usize = 5;
 const RTX_CACHE_PACKETS: usize = 2048;
 const RTX_CACHE_AGE: Duration = Duration::from_secs(3);
 const RTX_RATIO_CAP: f32 = 0.15;
@@ -42,6 +43,7 @@ struct IngestSession {
     connected: bool,
     last_media_at: Option<Instant>,
     last_pli_at: Option<Instant>,
+    metrics_rollup: MetricsRollup,
 }
 
 struct ViewerSession {
@@ -76,7 +78,17 @@ pub async fn run(
         }
     };
     let local_port = socket.local_addr().expect("bound UDP socket").port();
-    let candidates = gather_local_candidates(&socket, local_port, &config).await;
+    let loopback_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), local_port);
+    let (candidates, host_addr) = gather_local_candidates(&socket, local_port, &config).await;
+    let mut metrics_writer = config.resolved_metrics_dir().and_then(|dir| {
+        match MetricsWriter::open(&dir) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                warn!(dir = %dir.display(), err = %e, "Could not open metrics file");
+                None
+            }
+        }
+    });
 
     info!(
         media_port = local_port,
@@ -92,7 +104,7 @@ pub async fn run(
 
     loop {
         let now = Instant::now();
-        let next_deadline = compute_next_deadline(now, ingest.as_ref(), &viewers);
+        let next_deadline = compute_next_deadline(now, ingest.as_ref(), &viewers, metrics.last_tick);
         let sleep_dur = next_deadline
             .saturating_duration_since(now)
             .min(Duration::from_secs(1));
@@ -104,7 +116,10 @@ pub async fn run(
                 if *shutdown_rx.borrow() {
                     info!("Media relay shutting down");
                     if ingest.is_some() {
-                        let _ = signal_tx.try_send(SignalEvent::StreamStop);
+                        teardown_ingest(&mut ingest, &mut viewers, &mut metrics, &signal_tx);
+                    }
+                    if let Some(writer) = metrics_writer.take() {
+                        writer.finish();
                     }
                     break;
                 }
@@ -114,7 +129,11 @@ pub async fn run(
                 match recv {
                     Ok((n, source)) => {
                         let recv_time = Instant::now();
-                        let dest = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), local_port);
+                        let dest = if source.ip().is_loopback() {
+                            loopback_addr
+                        } else {
+                            host_addr
+                        };
                         if let Ok(receive) = Receive::new(Protocol::Udp, source, dest, &udp_buf[..n]) {
                             let input = Input::Receive(recv_time, receive);
                             let mut handled = false;
@@ -210,115 +229,125 @@ pub async fn run(
                 let _ = offer.reply.send(res);
             }
 
-            _ = tokio::time::sleep(sleep_dur) => {
-                let now = Instant::now();
+            _ = tokio::time::sleep(sleep_dur) => {}
+        }
 
-                // Drive ingest timeout + check ingest silence timeout
-                let mut ingest_dead = false;
-                if let Some(ing) = ingest.as_mut() {
-                    if now >= ing.next_timeout {
-                        if let Err(e) = ing.rtc.handle_input(Input::Timeout(now)) {
-                            debug!("Ingest timeout error: {e}");
-                        }
-                        drain_ingest(ing, &mut viewers, &socket, &mut metrics, &signal_tx).await;
+        // Run timers and 1s metrics tick outside `select!` so continuous UDP traffic
+        // under `biased` cannot starve timeouts or metrics snapshots.
+        let now = Instant::now();
+        if now >= next_deadline {
+            // Drive ingest timeout + check ingest silence timeout
+            let mut ingest_dead = false;
+            if let Some(ing) = ingest.as_mut() {
+                if now >= ing.next_timeout {
+                    if let Err(e) = ing.rtc.handle_input(Input::Timeout(now)) {
+                        debug!("Ingest timeout error: {e}");
                     }
-                    if !ing.rtc.is_alive() {
-                        ingest_dead = true;
-                    } else if config.ingest_timeout_secs > 0
-                        && let Some(last) = ing.last_media_at
-                        && now.duration_since(last) >= Duration::from_secs(config.ingest_timeout_secs)
-                    {
-                        warn!(
-                            session = %ing.id,
-                            timeout_secs = config.ingest_timeout_secs,
-                            "Ingest media silence timeout"
-                        );
-                        ingest_dead = true;
-                    }
+                    drain_ingest(ing, &mut viewers, &socket, &mut metrics, &signal_tx).await;
                 }
-                if ingest_dead {
-                    teardown_ingest(&mut ingest, &mut viewers, &mut metrics, &signal_tx);
-                }
-
-                // Drive viewer timeouts & prune dead/stalled viewers
-                let mut dead_viewers = Vec::new();
-                let mut want_pli = false;
-                let mut congestion_changed = None;
-
-                for (id, v) in viewers.iter_mut() {
-                    if now >= v.next_timeout {
-                        if let Err(e) = v.rtc.handle_input(Input::Timeout(now)) {
-                            debug!(viewer = %id, "Viewer timeout error: {e}");
-                        }
-                        if drain_viewer(v, &socket, &mut metrics).await {
-                            want_pli = true;
-                        }
-                    }
-
-                    if !v.rtc.is_alive()
-                        || (!v.connected && now.duration_since(v.created_at) >= VIEWER_HANDSHAKE_TIMEOUT)
-                    {
-                        dead_viewers.push(id.clone());
-                    } else if v.connected
-                        && let Some(changed) = metrics.update_congestion(now, v.last_rtt, v.last_loss)
-                    {
-                        congestion_changed = Some(changed);
-                    }
-                }
-
-                for id in dead_viewers {
-                    viewers.remove(&id);
-                    info!(viewer = %id, viewers = viewers.len(), "Viewer disconnected");
-                }
-
-                if let Some(congested) = congestion_changed {
-                    warn!(congested, "Uplink congestion state changed");
-                    let ratio_cap = if congested { Some(0.0) } else { Some(RTX_RATIO_CAP) };
-                    for v in viewers.values_mut() {
-                        if let Some(mid) = v.video_mid
-                            && let Some(tx) = v.rtc.direct_api().stream_tx_by_mid(mid, None)
-                        {
-                            tx.set_rtx_cache(RTX_CACHE_PACKETS, RTX_CACHE_AGE, ratio_cap);
-                        }
-                        let _ = drain_viewer(v, &socket, &mut metrics).await;
-                    }
-                }
-
-                if want_pli
-                    && let Some(ing) = ingest.as_mut()
+                if !ing.rtc.is_alive() {
+                    ingest_dead = true;
+                } else if config.ingest_timeout_secs > 0
+                    && let Some(last) = ing.last_media_at
+                    && now.duration_since(last) >= Duration::from_secs(config.ingest_timeout_secs)
                 {
-                    request_ingest_keyframe(ing, &socket, &mut metrics).await;
+                    warn!(
+                        session = %ing.id,
+                        timeout_secs = config.ingest_timeout_secs,
+                        "Ingest media silence timeout"
+                    );
+                    ingest_dead = true;
+                }
+            }
+            if ingest_dead {
+                teardown_ingest(&mut ingest, &mut viewers, &mut metrics, &signal_tx);
+            }
+
+            // Drive viewer timeouts & prune dead/stalled viewers
+            let mut dead_viewers = Vec::new();
+            let mut want_pli = false;
+            let mut congestion_changed = None;
+
+            for (id, v) in viewers.iter_mut() {
+                if now >= v.next_timeout {
+                    if let Err(e) = v.rtc.handle_input(Input::Timeout(now)) {
+                        debug!(viewer = %id, "Viewer timeout error: {e}");
+                    }
+                    if drain_viewer(v, &socket, &mut metrics).await {
+                        want_pli = true;
+                    }
                 }
 
-                // Periodic derivative metrics snapshot while ingest is active (debug-only).
-                if let Some(ing) = ingest.as_ref()
-                    && now.duration_since(metrics.last_log) >= STATS_LOG_INTERVAL
+                if !v.rtc.is_alive()
+                    || (!v.connected && now.duration_since(v.created_at) >= VIEWER_HANDSHAKE_TIMEOUT)
                 {
-                    metrics.last_log = now;
-                    let max_rtt = viewers.values().filter_map(|v| v.last_rtt).max();
-                    let max_loss = viewers
-                        .values()
-                        .filter_map(|v| v.last_loss)
-                        .reduce(f32::max);
-                    let snap = metrics.take_snapshot(now, viewers.len(), max_rtt, max_loss);
-                    let codec = ing
-                        .video_codec
-                        .map(|c| format!("{c:?}"))
-                        .unwrap_or_else(|| "pending".to_string());
+                    dead_viewers.push(id.clone());
+                } else if v.connected
+                    && let Some(changed) = metrics.update_congestion(now, v.last_rtt, v.last_loss)
+                {
+                    congestion_changed = Some(changed);
+                }
+            }
+
+            for id in dead_viewers {
+                viewers.remove(&id);
+                info!(viewer = %id, viewers = viewers.len(), "Viewer disconnected");
+            }
+
+            if let Some(congested) = congestion_changed {
+                warn!(congested, "Uplink congestion state changed");
+                let ratio_cap = if congested { Some(0.0) } else { Some(RTX_RATIO_CAP) };
+                for v in viewers.values_mut() {
+                    if let Some(mid) = v.video_mid
+                        && let Some(tx) = v.rtc.direct_api().stream_tx_by_mid(mid, None)
+                    {
+                        tx.set_rtx_cache(RTX_CACHE_PACKETS, RTX_CACHE_AGE, ratio_cap);
+                    }
+                    let _ = drain_viewer(v, &socket, &mut metrics).await;
+                }
+            }
+
+            if want_pli
+                && let Some(ing) = ingest.as_mut()
+            {
+                request_ingest_keyframe(ing, &socket, &mut metrics).await;
+            }
+
+            // 1s derivative metrics snapshot to JSONL file, folded into 5s stdout debug rollup.
+            if let Some(ing) = ingest.as_mut()
+                && now.duration_since(metrics.last_tick) >= METRICS_INTERVAL
+            {
+                metrics.last_tick = now;
+                let max_rtt = viewers.values().filter_map(|v| v.last_rtt).max();
+                let max_loss = viewers
+                    .values()
+                    .filter_map(|v| v.last_loss)
+                    .reduce(f32::max);
+                let codec = ing
+                    .video_codec
+                    .map(|c| format!("{c:?}"))
+                    .unwrap_or_else(|| "pending".to_string());
+                let snap = metrics.take_snapshot(now, codec, viewers.len(), max_rtt, max_loss);
+
+                if let Some(writer) = metrics_writer.as_mut() {
+                    writer.write(&snap);
+                }
+
+                if let Some(rollup) = ing.metrics_rollup.push(&snap) {
                     debug!(
-                        codec = %codec,
-                        viewers = snap.viewers,
-                        in_kbps = format_args!("{:.0}", snap.in_kbps),
-                        out_kbps = format_args!("{:.0}", snap.out_kbps),
-                        in_pps = snap.in_pps,
-                        out_pps = snap.out_pps,
-                        rtt_ms = snap.rtt_ms,
-                        rtt_delta_ms = snap.rtt_delta_ms,
-                        loss_pct = format_args!("{:.1}", snap.loss_pct),
-                        pli = snap.pli,
-                        udp_drops = snap.udp_drops,
-                        offers_rejected = snap.offers_rejected,
-                        congested = snap.congested,
+                        codec = %rollup.codec,
+                        viewers = rollup.viewers,
+                        in_kbps = format_args!("{:.0}", rollup.in_kbps),
+                        out_kbps = format_args!("{:.0}", rollup.out_kbps),
+                        in_pps = rollup.in_pps,
+                        out_pps = rollup.out_pps,
+                        rtt_ms = rollup.rtt_ms,
+                        rtt_delta_ms = rollup.rtt_delta_ms,
+                        loss_pct = format_args!("{:.1}", rollup.loss_pct),
+                        pli = rollup.pli,
+                        udp_drops = rollup.udp_drops,
+                        offers_rejected = rollup.offers_rejected,
+                        congested = rollup.congested,
                         "Stream metrics"
                     );
                 }
@@ -331,10 +360,12 @@ fn compute_next_deadline(
     now: Instant,
     ingest: Option<&IngestSession>,
     viewers: &HashMap<String, ViewerSession>,
+    last_metrics_tick: Instant,
 ) -> Instant {
     let mut earliest = now + Duration::from_millis(250);
     if let Some(ing) = ingest {
         earliest = earliest.min(ing.next_timeout);
+        earliest = earliest.min(last_metrics_tick + METRICS_INTERVAL);
     }
     for v in viewers.values() {
         earliest = earliest.min(v.next_timeout);
@@ -379,6 +410,8 @@ async fn handle_whip_offer(
         teardown_ingest(ingest, viewers, metrics, signal_tx);
     }
 
+    metrics.last_tick = now;
+
     let mut session = IngestSession {
         id: session_id.clone(),
         rtc,
@@ -392,6 +425,7 @@ async fn handle_whip_offer(
         connected: false,
         last_media_at: None,
         last_pli_at: None,
+        metrics_rollup: MetricsRollup::new(STDOUT_ROLLUP_TICKS),
     };
 
     drain_ingest(&mut session, viewers, socket, metrics, signal_tx).await;
@@ -775,7 +809,7 @@ async fn request_ingest_keyframe(
     if requested {
         ing.last_pli_at = Some(now);
         metrics.record_pli();
-        debug!(session = %ing.id, "PLI sent");
+        trace!(session = %ing.id, "PLI sent");
         // Drain PLI RTCP packet out to OBS immediately.
         loop {
             match ing.rtc.poll_output() {

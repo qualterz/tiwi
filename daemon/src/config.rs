@@ -70,6 +70,10 @@ pub struct Config {
     #[arg(long)]
     pub ingest_timeout_secs: u64,
 
+    /// Directory for per-session 1s JSONL.gz metrics files (default: appdata/tiwi/metrics)
+    #[arg(long, env = "TIWI_METRICS_DIR")]
+    pub metrics_dir: Option<PathBuf>,
+
     #[arg(skip)]
     #[serde(skip)]
     pub config_path: Option<PathBuf>,
@@ -150,6 +154,12 @@ impl Config {
     pub fn watch_url(&self) -> String {
         let base = self.viewer_url.trim_end_matches('#');
         format!("{base}#{}", self.token)
+    }
+
+    pub fn resolved_metrics_dir(&self) -> Option<PathBuf> {
+        self.metrics_dir
+            .clone()
+            .or_else(|| dirs::data_local_dir().map(|d| d.join("tiwi").join("metrics")))
     }
 }
 

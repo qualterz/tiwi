@@ -30,7 +30,7 @@ pub async fn gather_local_candidates(
     socket: &UdpSocket,
     local_port: u16,
     config: &Config,
-) -> Vec<Candidate> {
+) -> (Vec<Candidate>, SocketAddr) {
     let mut candidates = Vec::new();
 
     // Always add loopback host candidate for local OBS WHIP.
@@ -73,7 +73,7 @@ pub async fn gather_local_candidates(
         }
     }
 
-    candidates
+    (candidates, base_addr)
 }
 
 fn discover_lan_ip() -> Option<IpAddr> {
