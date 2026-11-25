@@ -16,13 +16,16 @@ use str0m::format::Codec;
 use str0m::media::{KeyframeRequestKind, MediaKind, Mid, Pt};
 use str0m::net::{Protocol, Receive};
 use str0m::rtp::{RtpWrite, SeqNo, Ssrc};
-use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
+use str0m::{Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, error, info, trace, warn};
 
 use self::metrics::{MetricsRollup, MetricsWriter, RelayMetrics, ShardCounters};
-use self::net::{BoundCandidates, bind_ingest_udp, bind_shard_udp, gather_all_candidates};
+use self::net::{
+    BoundCandidates, bind_ingest_udp, bind_shard_udp, from_socket_addr, gather_all_candidates,
+    to_socket_addr,
+};
 use crate::config::Config;
 use crate::signal::{SignalEvent, ViewerOffer};
 use crate::whip::{WhipAccepted, WhipCommand, WhipError};
@@ -255,8 +258,7 @@ pub async fn run(
                         handle_ingest_udp(
                             &udp_buf[..n],
                             source,
-                            ingest_bound.loopback_addr,
-                            ingest_bound.host_addr,
+                            &ingest_bound,
                             &mut ingest,
                             &shards,
                             &socket,
@@ -270,8 +272,7 @@ pub async fn run(
                                     handle_ingest_udp(
                                         &udp_buf[..n],
                                         source,
-                                        ingest_bound.loopback_addr,
-                                        ingest_bound.host_addr,
+                                        &ingest_bound,
                                         &mut ingest,
                                         &shards,
                                         &socket,
@@ -298,7 +299,7 @@ pub async fn run(
             Some(()) = pli_rx.recv() => {
                 while pli_rx.try_recv().is_ok() {}
                 if let Some(ing) = ingest.as_mut() {
-                    request_ingest_keyframe(ing, &socket, &mut metrics);
+                    request_ingest_keyframe(ing, &socket, ingest_bound.is_dual_stack, &mut metrics);
                 }
             }
 
@@ -307,7 +308,7 @@ pub async fn run(
                     WhipCommand::Offer { sdp, reply } => {
                         let res = handle_whip_offer(
                             sdp,
-                            &ingest_bound.candidates,
+                            &ingest_bound,
                             &mut next_session_seq,
                             &mut ingest,
                             &shards,
@@ -351,7 +352,14 @@ pub async fn run(
                     if let Err(e) = ing.rtc.handle_input(Input::Timeout(now)) {
                         debug!(session = %ing.id, err = %e, "Ingest timeout error");
                     }
-                    drain_ingest(ing, &shards, &socket, &mut metrics, &signal_tx);
+                    drain_ingest(
+                        ing,
+                        &shards,
+                        &socket,
+                        ingest_bound.is_dual_stack,
+                        &mut metrics,
+                        &signal_tx,
+                    );
                 }
                 if !ing.rtc.is_alive() {
                     ingest_dead = true;
@@ -454,9 +462,8 @@ pub async fn run(
 #[allow(clippy::too_many_arguments)]
 fn handle_ingest_udp(
     buf: &[u8],
-    source: SocketAddr,
-    loopback_addr: SocketAddr,
-    host_addr: SocketAddr,
+    raw_source: SocketAddr,
+    bound: &BoundCandidates,
     ingest: &mut Option<IngestSession>,
     shards: &[ShardHandle],
     socket: &UdpSocket,
@@ -466,11 +473,8 @@ fn handle_ingest_udp(
     let Some(ing) = ingest.as_mut() else {
         return;
     };
-    let dest = if source.ip().is_loopback() {
-        loopback_addr
-    } else {
-        host_addr
-    };
+    let source = from_socket_addr(raw_source);
+    let dest = local_dest_for(source, bound);
     let Ok(receive) = Receive::new(Protocol::Udp, source, dest, buf) else {
         return;
     };
@@ -479,9 +483,20 @@ fn handle_ingest_udp(
         if let Err(e) = ing.rtc.handle_input(input) {
             debug!(session = %ing.id, err = %e, "Ingest handle_input error");
         }
-        drain_ingest(ing, shards, socket, metrics, signal_tx);
+        drain_ingest(ing, shards, socket, bound.is_dual_stack, metrics, signal_tx);
     } else {
         trace!(addr = %source, bytes = buf.len(), "Ignored unmatched ingest UDP packet");
+    }
+}
+
+#[inline]
+fn local_dest_for(source: SocketAddr, bound: &BoundCandidates) -> SocketAddr {
+    if source.is_ipv6() {
+        bound.v6_host_addr.unwrap_or(bound.host_addr)
+    } else if source.ip().is_loopback() {
+        bound.loopback_addr
+    } else {
+        bound.host_addr
     }
 }
 
@@ -501,7 +516,7 @@ fn compute_ingest_deadline(
 #[allow(clippy::too_many_arguments)]
 fn handle_whip_offer(
     sdp: String,
-    candidates: &[Candidate],
+    bound: &BoundCandidates,
     next_session_seq: &mut u64,
     ingest: &mut Option<IngestSession>,
     shards: &[ShardHandle],
@@ -518,7 +533,7 @@ fn handle_whip_offer(
         .set_stats_interval(Some(Duration::from_secs(1)))
         .build(now);
 
-    for c in candidates {
+    for c in &bound.candidates {
         rtc.add_local_candidate(c.clone());
     }
 
@@ -553,7 +568,14 @@ fn handle_whip_offer(
         metrics_rollup: MetricsRollup::new(STDOUT_ROLLUP_TICKS),
     };
 
-    drain_ingest(&mut session, shards, socket, metrics, signal_tx);
+    drain_ingest(
+        &mut session,
+        shards,
+        socket,
+        bound.is_dual_stack,
+        metrics,
+        signal_tx,
+    );
 
     debug!(session = %session_id, "WHIP ingest offer accepted");
     *ingest = Some(session);
@@ -637,6 +659,7 @@ fn drain_ingest(
     ing: &mut IngestSession,
     shards: &[ShardHandle],
     socket: &UdpSocket,
+    is_dual_stack: bool,
     metrics: &mut RelayMetrics,
     signal_tx: &mpsc::Sender<SignalEvent>,
 ) {
@@ -647,7 +670,9 @@ fn drain_ingest(
                 break;
             }
             Ok(Output::Transmit(t)) => {
-                if let Err(e) = socket.try_send_to(&t.contents, t.destination) {
+                if let Err(e) =
+                    socket.try_send_to(&t.contents, to_socket_addr(t.destination, is_dual_stack))
+                {
                     metrics.record_udp_drop();
                     trace!(session = %ing.id, err = %e, "Ingest UDP send_to error");
                 }
@@ -773,6 +798,7 @@ fn drain_ingest(
 fn request_ingest_keyframe(
     ing: &mut IngestSession,
     socket: &UdpSocket,
+    is_dual_stack: bool,
     metrics: &mut RelayMetrics,
 ) {
     let now = Instant::now();
@@ -808,7 +834,8 @@ fn request_ingest_keyframe(
                     break;
                 }
                 Ok(Output::Transmit(t)) => {
-                    let _ = socket.try_send_to(&t.contents, t.destination);
+                    let _ = socket
+                        .try_send_to(&t.contents, to_socket_addr(t.destination, is_dual_stack));
                 }
                 Ok(Output::Event(_)) => {}
                 Err(_) => break,
@@ -863,7 +890,7 @@ fn run_egress_shard(
                         &mut addr_to_viewer,
                         &mut congested,
                         &socket,
-                        &bound.candidates,
+                        &bound,
                         &counters,
                         &pli_tx,
                         dtls_cert.as_ref(),
@@ -880,7 +907,7 @@ fn run_egress_shard(
                                     &mut addr_to_viewer,
                                     &mut congested,
                                     &socket,
-                                    &bound.candidates,
+                                    &bound,
                                     &counters,
                                     &pli_tx,
                                     dtls_cert.as_ref(),
@@ -912,7 +939,7 @@ fn run_egress_shard(
                         &mut addr_to_viewer,
                         &mut congested,
                         &socket,
-                        &bound.candidates,
+                        &bound,
                         &counters,
                         &pli_tx,
                         dtls_cert.as_ref(),
@@ -929,7 +956,7 @@ fn run_egress_shard(
                                     &mut addr_to_viewer,
                                     &mut congested,
                                     &socket,
-                                    &bound.candidates,
+                                    &bound,
                                     &counters,
                                     &pli_tx,
                                     dtls_cert.as_ref(),
@@ -956,8 +983,7 @@ fn run_egress_shard(
         drain_shard_udp(
             &socket,
             &mut udp_buf,
-            bound.loopback_addr,
-            bound.host_addr,
+            &bound,
             &mut viewers,
             &mut addr_to_viewer,
             &counters,
@@ -966,7 +992,7 @@ fn run_egress_shard(
 
         let now = Instant::now();
         if now >= next_deadline {
-            let mut dead_viewers = Vec::new();
+            let mut dead_viewers: Vec<(String, bool)> = Vec::new();
             let mut want_pli = false;
             let mut stats_dirty = false;
 
@@ -975,27 +1001,33 @@ fn run_egress_shard(
                     if let Err(e) = v.rtc.handle_input(Input::Timeout(now)) {
                         debug!(viewer = %id, err = %e, "Viewer timeout error");
                     }
-                    let (pli, dirty) = drain_viewer(v, &socket, &counters);
+                    let (pli, dirty) = drain_viewer(v, &socket, bound.is_dual_stack, &counters);
                     want_pli |= pli;
                     stats_dirty |= dirty;
                 }
 
-                if !v.rtc.is_alive()
-                    || (!v.connected && now.duration_since(v.created_at) >= VIEWER_HANDSHAKE_TIMEOUT)
+                if !v.rtc.is_alive() {
+                    dead_viewers.push((id.clone(), v.connected));
+                } else if !v.connected
+                    && now.duration_since(v.created_at) >= VIEWER_HANDSHAKE_TIMEOUT
                 {
-                    dead_viewers.push(id.clone());
+                    dead_viewers.push((id.clone(), false));
                 }
             }
 
             if !dead_viewers.is_empty() {
                 let removed = dead_viewers.len();
-                for id in dead_viewers {
+                for (id, was_connected) in dead_viewers {
                     if let Some(v) = viewers.remove(&id)
                         && let Some(addr) = v.remote_addr
                     {
                         addr_to_viewer.remove(&addr);
                     }
-                    info!(viewer = %id, "Viewer disconnected");
+                    if was_connected {
+                        info!(viewer = %id, "Viewer disconnected");
+                    } else {
+                        debug!(viewer = %id, "Viewer handshake timed out");
+                    }
                 }
                 counters.viewers.fetch_sub(removed, Ordering::Relaxed);
                 sync_shard_stats(&viewers, &counters);
@@ -1014,8 +1046,7 @@ fn run_egress_shard(
 fn drain_shard_udp(
     socket: &std::net::UdpSocket,
     udp_buf: &mut [u8],
-    loopback_addr: SocketAddr,
-    host_addr: SocketAddr,
+    bound: &BoundCandidates,
     viewers: &mut HashMap<String, ViewerSession>,
     addr_to_viewer: &mut HashMap<SocketAddr, String>,
     counters: &ShardCounters,
@@ -1025,7 +1056,7 @@ fn drain_shard_udp(
     let mut stats_dirty = false;
 
     for _ in 0..MAX_UDP_BATCH {
-        let (n, source) = match socket.recv_from(udp_buf) {
+        let (n, raw_source) = match socket.recv_from(udp_buf) {
             Ok(pair) => pair,
             Err(e) if e.kind() == ErrorKind::WouldBlock => break,
             Err(e) => {
@@ -1035,11 +1066,8 @@ fn drain_shard_udp(
             }
         };
 
-        let dest = if source.ip().is_loopback() {
-            loopback_addr
-        } else {
-            host_addr
-        };
+        let source = from_socket_addr(raw_source);
+        let dest = local_dest_for(source, bound);
         let Ok(receive) = Receive::new(Protocol::Udp, source, dest, &udp_buf[..n]) else {
             continue;
         };
@@ -1053,7 +1081,7 @@ fn drain_shard_udp(
             if let Err(e) = v.rtc.handle_input(input) {
                 debug!(viewer = %vid, err = %e, "Viewer handle_input error");
             }
-            let (pli, dirty) = drain_viewer(v, socket, counters);
+            let (pli, dirty) = drain_viewer(v, socket, bound.is_dual_stack, counters);
             want_pli |= pli;
             stats_dirty |= dirty;
             continue;
@@ -1074,7 +1102,7 @@ fn drain_shard_udp(
             if let Err(e) = v.rtc.handle_input(input) {
                 debug!(viewer = %vid, err = %e, "Viewer handle_input error");
             }
-            let (pli, dirty) = drain_viewer(v, socket, counters);
+            let (pli, dirty) = drain_viewer(v, socket, bound.is_dual_stack, counters);
             want_pli |= pli;
             stats_dirty |= dirty;
         }
@@ -1096,14 +1124,22 @@ fn handle_shard_msg(
     addr_to_viewer: &mut HashMap<SocketAddr, String>,
     congested: &mut bool,
     socket: &std::net::UdpSocket,
-    candidates: &[Candidate],
+    bound: &BoundCandidates,
     counters: &ShardCounters,
     pli_tx: &mpsc::Sender<()>,
     dtls_cert: Option<&DtlsCert>,
 ) -> bool {
     match msg {
         ShardMsg::Rtp(pkt) => {
-            fanout_rtp_shard(&pkt, viewers, *congested, socket, counters, pli_tx);
+            fanout_rtp_shard(
+                &pkt,
+                viewers,
+                *congested,
+                socket,
+                bound.is_dual_stack,
+                counters,
+                pli_tx,
+            );
             true
         }
         ShardMsg::AddViewer {
@@ -1116,7 +1152,7 @@ fn handle_shard_msg(
                 viewer_id.clone(),
                 sdp,
                 video_codec,
-                candidates,
+                bound,
                 dtls_cert,
                 socket,
                 counters,
@@ -1160,7 +1196,7 @@ fn handle_shard_msg(
                 {
                     tx.set_rtx_cache(RTX_CACHE_PACKETS, RTX_CACHE_AGE, ratio_cap);
                 }
-                let (pli, dirty) = drain_viewer(v, socket, counters);
+                let (pli, dirty) = drain_viewer(v, socket, bound.is_dual_stack, counters);
                 want_pli |= pli;
                 stats_dirty |= dirty;
             }
@@ -1197,7 +1233,7 @@ fn build_viewer_session(
     viewer_id: String,
     sdp: String,
     video_codec: Option<Codec>,
-    candidates: &[Candidate],
+    bound: &BoundCandidates,
     dtls_cert: Option<&DtlsCert>,
     socket: &std::net::UdpSocket,
     counters: &ShardCounters,
@@ -1231,7 +1267,7 @@ fn build_viewer_session(
     }
 
     let mut rtc = rtc_cfg.build(now);
-    for c in candidates {
+    for c in &bound.candidates {
         rtc.add_local_candidate(c.clone());
     }
 
@@ -1258,7 +1294,7 @@ fn build_viewer_session(
         last_loss: None,
     };
 
-    let _ = drain_viewer(&mut viewer, socket, counters);
+    let _ = drain_viewer(&mut viewer, socket, bound.is_dual_stack, counters);
     Ok((viewer, answer.to_sdp_string()))
 }
 
@@ -1267,6 +1303,7 @@ fn fanout_rtp_shard(
     viewers: &mut HashMap<String, ViewerSession>,
     congested: bool,
     socket: &std::net::UdpSocket,
+    is_dual_stack: bool,
     counters: &ShardCounters,
     pli_tx: &mpsc::Sender<()>,
 ) {
@@ -1318,7 +1355,7 @@ fn fanout_rtp_shard(
         }
 
         // Single-mutation invariant: drain immediately after write_rtp.
-        let (pli, dirty) = drain_viewer(v, socket, counters);
+        let (pli, dirty) = drain_viewer(v, socket, is_dual_stack, counters);
         want_pli |= pli;
         stats_dirty |= dirty;
     }
@@ -1336,6 +1373,7 @@ fn fanout_rtp_shard(
 fn drain_viewer(
     v: &mut ViewerSession,
     socket: &std::net::UdpSocket,
+    is_dual_stack: bool,
     counters: &ShardCounters,
 ) -> (bool, bool) {
     let mut want_pli = false;
@@ -1348,7 +1386,9 @@ fn drain_viewer(
                 break;
             }
             Ok(Output::Transmit(t)) => {
-                if let Err(e) = socket.send_to(&t.contents, t.destination) {
+                if let Err(e) =
+                    socket.send_to(&t.contents, to_socket_addr(t.destination, is_dual_stack))
+                {
                     counters.record_udp_drop();
                     trace!(viewer = %v.id, err = %e, "Viewer UDP send_to error");
                 }

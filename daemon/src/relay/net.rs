@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::time::{Duration, Instant};
 
 use rand::RngCore;
@@ -22,25 +22,60 @@ pub struct BoundCandidates {
     pub local_port: u16,
     pub loopback_addr: SocketAddr,
     pub host_addr: SocketAddr,
+    pub v6_host_addr: Option<SocketAddr>,
+    pub is_dual_stack: bool,
     pub candidates: Vec<Candidate>,
 }
 
-pub fn bind_ingest_udp(port: u16) -> std::io::Result<UdpSocket> {
-    let std_udp = bind_udp_socket(port, INGEST_RECV_BUFFER_BYTES, INGEST_SEND_BUFFER_BYTES)?;
-    UdpSocket::from_std(std_udp)
+pub fn bind_ingest_udp(port: u16) -> std::io::Result<(UdpSocket, bool)> {
+    let (std_udp, is_dual_stack) =
+        bind_udp_socket(port, INGEST_RECV_BUFFER_BYTES, INGEST_SEND_BUFFER_BYTES)?;
+    Ok((UdpSocket::from_std(std_udp)?, is_dual_stack))
 }
 
-pub fn bind_shard_udp(port: u16) -> std::io::Result<UdpSocket> {
-    let std_udp = bind_udp_socket(port, SHARD_RECV_BUFFER_BYTES, SHARD_SEND_BUFFER_BYTES)?;
-    UdpSocket::from_std(std_udp)
+pub fn bind_shard_udp(port: u16) -> std::io::Result<(UdpSocket, bool)> {
+    let (std_udp, is_dual_stack) =
+        bind_udp_socket(port, SHARD_RECV_BUFFER_BYTES, SHARD_SEND_BUFFER_BYTES)?;
+    Ok((UdpSocket::from_std(std_udp)?, is_dual_stack))
+}
+
+/// Converts an IPv4 destination to an IPv4-mapped IPv6 address when sending on a dual-stack socket.
+#[inline]
+pub fn to_socket_addr(addr: SocketAddr, is_dual_stack: bool) -> SocketAddr {
+    if is_dual_stack && let SocketAddr::V4(v4) = addr {
+        SocketAddr::V6(SocketAddrV6::new(v4.ip().to_ipv6_mapped(), v4.port(), 0, 0))
+    } else {
+        addr
+    }
+}
+
+/// Unwraps IPv4-mapped IPv6 source addresses (`::ffff:a.b.c.d`) back to plain IPv4.
+#[inline]
+pub fn from_socket_addr(addr: SocketAddr) -> SocketAddr {
+    if let SocketAddr::V6(v6) = addr
+        && let Some(v4) = v6.ip().to_ipv4_mapped()
+    {
+        SocketAddr::V4(SocketAddrV4::new(v4, v6.port()))
+    } else {
+        addr
+    }
 }
 
 fn bind_udp_socket(
     port: u16,
     recv_buf: usize,
     send_buf: usize,
-) -> std::io::Result<std::net::UdpSocket> {
-    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(SockProto::UDP))?;
+) -> std::io::Result<(std::net::UdpSocket, bool)> {
+    let (sock, is_dual_stack) = match try_bind_dual_stack(port) {
+        Ok(s) => (s, true),
+        Err(e) => {
+            debug!(port, err = %e, "Dual-stack IPv6 UDP bind failed; falling back to IPv4");
+            let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(SockProto::UDP))?;
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+            s.bind(&addr.into())?;
+            (s, false)
+        }
+    };
     sock.set_nonblocking(true)?;
     #[cfg(windows)]
     disable_udp_connreset(&sock);
@@ -50,9 +85,15 @@ fn bind_udp_socket(
     if let Err(e) = sock.set_send_buffer_size(send_buf) {
         debug!(bytes = send_buf, err = %e, "Could not set UDP SO_SNDBUF");
     }
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+    Ok((sock.into(), is_dual_stack))
+}
+
+fn try_bind_dual_stack(port: u16) -> std::io::Result<Socket> {
+    let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(SockProto::UDP))?;
+    sock.set_only_v6(false)?;
+    let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port);
     sock.bind(&addr.into())?;
-    Ok(sock.into())
+    Ok(sock)
 }
 
 #[cfg(windows)]
@@ -100,12 +141,13 @@ fn disable_udp_connreset(sock: &Socket) {
 }
 
 /// Gathers host + server-reflexive ICE candidates for a batch of UDP sockets in parallel
-/// (single LAN route lookup, single STUN DNS resolution, concurrent STUN probes).
+/// (single LAN/IPv6 route lookup, single STUN DNS resolution, concurrent STUN probes).
 pub async fn gather_all_candidates(
-    sockets: Vec<UdpSocket>,
+    sockets: Vec<(UdpSocket, bool)>,
     config: &Config,
 ) -> Vec<(UdpSocket, BoundCandidates)> {
     let lan_ip = discover_lan_ip();
+    let v6_ip = discover_ipv6_ip();
     let stun_addr = if config.public_ip.is_none() && !config.stun_server.is_empty() {
         match resolve_stun_addr(&config.stun_server).await {
             Ok(addr) => Some(addr),
@@ -127,7 +169,7 @@ pub async fn gather_all_candidates(
     let count = sockets.len();
 
     let mut set = JoinSet::new();
-    for (idx, socket) in sockets.into_iter().enumerate() {
+    for (idx, (socket, is_dual_stack)) in sockets.into_iter().enumerate() {
         let stun_label = stun_label.clone();
         set.spawn(async move {
             let local_port = socket.local_addr().expect("bound UDP socket").port();
@@ -136,14 +178,24 @@ pub async fn gather_all_candidates(
                 lan_ip.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
                 local_port,
             );
+            let v6_host_addr = if is_dual_stack {
+                v6_ip.map(|ip| SocketAddr::new(ip, local_port))
+            } else {
+                None
+            };
 
-            let mut candidates = Vec::with_capacity(3);
+            let mut candidates = Vec::with_capacity(4);
             if let Ok(c) = Candidate::host(loopback_addr, "udp") {
                 candidates.push(c);
             }
             if let Some(ip) = lan_ip
                 && !ip.is_loopback()
                 && let Ok(c) = Candidate::host(SocketAddr::new(ip, local_port), "udp")
+            {
+                candidates.push(c);
+            }
+            if let Some(v6_addr) = v6_host_addr
+                && let Ok(c) = Candidate::host(v6_addr, "udp")
             {
                 candidates.push(c);
             }
@@ -157,7 +209,8 @@ pub async fn gather_all_candidates(
                     candidates.push(c);
                 }
             } else if let Some(stun_addr) = stun_addr {
-                match stun_discover_mapped_addr(&socket, stun_addr).await {
+                let stun_target = to_socket_addr(stun_addr, is_dual_stack);
+                match stun_discover_mapped_addr(&socket, stun_target).await {
                     Ok(mapped) => {
                         if idx == 0 {
                             info!(srflx = %mapped, stun = %stun_label, "Discovered STUN candidate");
@@ -189,6 +242,8 @@ pub async fn gather_all_candidates(
                     local_port,
                     loopback_addr,
                     host_addr,
+                    v6_host_addr,
+                    is_dual_stack,
                     candidates,
                 },
             )
@@ -213,6 +268,19 @@ fn discover_lan_ip() -> Option<IpAddr> {
     let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     sock.connect("8.8.8.8:80").ok()?;
     Some(sock.local_addr().ok()?.ip())
+}
+
+fn discover_ipv6_ip() -> Option<IpAddr> {
+    let sock = std::net::UdpSocket::bind("[::]:0").ok()?;
+    sock.connect("[2001:4860:4860::8888]:80").ok()?;
+    let IpAddr::V6(v6) = sock.local_addr().ok()?.ip() else {
+        return None;
+    };
+    // Skip loopback, link-local (fe80::/10), and ULA (fc00::/7) addresses.
+    if v6.is_loopback() || v6.is_unicast_link_local() || (v6.segments()[0] & 0xfe00) == 0xfc00 {
+        return None;
+    }
+    Some(IpAddr::V6(v6))
 }
 
 async fn resolve_stun_addr(stun_server: &str) -> Result<SocketAddr, String> {
