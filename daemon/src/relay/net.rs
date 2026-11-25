@@ -1,4 +1,5 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rand::RngCore;
@@ -9,21 +10,72 @@ use tracing::{debug, info, warn};
 
 use crate::config::Config;
 
-const UDP_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+// Asymmetric UDP buffers: 4 MB receive avoids multi-second bufferbloat under overload;
+// 16 MB send absorbs high-fanout egress bursts across worker shards.
+const UDP_RECV_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+const UDP_SEND_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 
-pub fn bind_shared_udp(port: u16) -> std::io::Result<UdpSocket> {
+pub fn bind_shared_udp(port: u16) -> std::io::Result<(UdpSocket, Arc<std::net::UdpSocket>)> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(SockProto::UDP))?;
     sock.set_nonblocking(true)?;
-    if let Err(e) = sock.set_recv_buffer_size(UDP_BUFFER_BYTES) {
-        debug!("Could not set UDP SO_RCVBUF to 16MB: {e}");
+    #[cfg(windows)]
+    disable_udp_connreset(&sock);
+    if let Err(e) = sock.set_recv_buffer_size(UDP_RECV_BUFFER_BYTES) {
+        debug!("Could not set UDP SO_RCVBUF to 4MB: {e}");
     }
-    if let Err(e) = sock.set_send_buffer_size(UDP_BUFFER_BYTES) {
+    if let Err(e) = sock.set_send_buffer_size(UDP_SEND_BUFFER_BYTES) {
         debug!("Could not set UDP SO_SNDBUF to 16MB: {e}");
     }
     let addr: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
     sock.bind(&addr.into())?;
     let std_udp: std::net::UdpSocket = sock.into();
-    UdpSocket::from_std(std_udp)
+    let tx_udp = std_udp.try_clone()?;
+    tx_udp.set_nonblocking(true)?;
+    Ok((UdpSocket::from_std(std_udp)?, Arc::new(tx_udp)))
+}
+
+#[cfg(windows)]
+fn disable_udp_connreset(sock: &Socket) {
+    use std::os::windows::io::AsRawSocket;
+
+    const SIO_UDP_CONNRESET: u32 = 0x9800_000C;
+
+    #[link(name = "ws2_32")]
+    unsafe extern "system" {
+        fn WSAIoctl(
+            s: usize,
+            dw_io_control_code: u32,
+            lpv_in_buffer: *const u32,
+            cb_in_buffer: u32,
+            lpv_out_buffer: *mut u8,
+            cb_out_buffer: u32,
+            lpcb_bytes_returned: *mut u32,
+            lp_overlapped: *mut u8,
+            lp_completion_routine: *mut u8,
+        ) -> i32;
+    }
+
+    let flag: u32 = 0; // FALSE
+    let mut bytes_returned: u32 = 0;
+    let res = unsafe {
+        WSAIoctl(
+            sock.as_raw_socket() as usize,
+            SIO_UDP_CONNRESET,
+            &raw const flag,
+            std::mem::size_of::<u32>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &raw mut bytes_returned,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if res != 0 {
+        debug!(
+            err = %std::io::Error::last_os_error(),
+            "Could not disable SIO_UDP_CONNRESET"
+        );
+    }
 }
 
 pub async fn gather_local_candidates(

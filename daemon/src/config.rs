@@ -55,8 +55,8 @@ pub struct Config {
     #[arg(long, env = "TIWI_WHIP_TOKEN")]
     pub whip_token: Option<String>,
 
-    /// Maximum simultaneous viewers
-    #[default(16)]
+    /// Maximum simultaneous viewers (0 = unlimited)
+    #[default(0)]
     #[arg(long)]
     pub max_peers: usize,
 
