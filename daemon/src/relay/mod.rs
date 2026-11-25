@@ -14,7 +14,7 @@ use str0m::rtp::{RtpPacket, RtpWrite, SeqNo, Ssrc};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use self::metrics::RelayMetrics;
 use self::net::{bind_shared_udp, gather_local_candidates};
@@ -71,7 +71,7 @@ pub async fn run(
     let socket = match bind_shared_udp(config.media_port) {
         Ok(s) => s,
         Err(e) => {
-            warn!("Failed to bind media UDP socket: {e}");
+            error!(err = %e, "Failed to bind media UDP socket");
             return;
         }
     };
@@ -149,19 +149,21 @@ pub async fn run(
                                     if want_pli
                                         && let Some(ing) = ingest.as_mut()
                                     {
-                                        request_ingest_keyframe(ing, &socket).await;
+                                        request_ingest_keyframe(ing, &socket, &mut metrics).await;
                                     }
                                 }
                             }
 
                             if !handled {
-                                debug!(from = %source, bytes = n, "Dropped unmatched UDP packet");
+                                metrics.record_udp_drop();
+                                trace!(addr = %source, bytes = n, "Dropped unmatched UDP packet");
                             }
                         }
                     }
                     Err(e) => {
                         // Windows returns WSAECONNRESET (10054) on UDP sockets after ICMP port unreachable
-                        debug!("UDP recv_from error: {e}");
+                        metrics.record_udp_drop();
+                        trace!(err = %e, "UDP recv_from error");
                     }
                 }
             }
@@ -266,7 +268,7 @@ pub async fn run(
 
                 for id in dead_viewers {
                     viewers.remove(&id);
-                    info!(viewer = %id, active_viewers = viewers.len(), "Viewer disconnected");
+                    info!(viewer = %id, viewers = viewers.len(), "Viewer disconnected");
                 }
 
                 if let Some(congested) = congestion_changed {
@@ -285,29 +287,39 @@ pub async fn run(
                 if want_pli
                     && let Some(ing) = ingest.as_mut()
                 {
-                    request_ingest_keyframe(ing, &socket).await;
+                    request_ingest_keyframe(ing, &socket, &mut metrics).await;
                 }
 
-                // Periodic status log when ingest is active
+                // Periodic derivative metrics snapshot while ingest is active (debug-only).
                 if let Some(ing) = ingest.as_ref()
                     && now.duration_since(metrics.last_log) >= STATS_LOG_INTERVAL
                 {
                     metrics.last_log = now;
-                    let in_kbps = metrics.in_kbps(now);
-                    let in_pps = metrics.in_pps(now);
-                    let out_kbps = metrics.out_kbps(now);
+                    let max_rtt = viewers.values().filter_map(|v| v.last_rtt).max();
+                    let max_loss = viewers
+                        .values()
+                        .filter_map(|v| v.last_loss)
+                        .reduce(f32::max);
+                    let snap = metrics.take_snapshot(now, viewers.len(), max_rtt, max_loss);
                     let codec = ing
                         .video_codec
                         .map(|c| format!("{c:?}"))
                         .unwrap_or_else(|| "pending".to_string());
-                    info!(
+                    debug!(
                         codec = %codec,
-                        in_kbps = format_args!("{in_kbps:.0}"),
-                        in_pps,
-                        viewers = viewers.len(),
-                        out_kbps = format_args!("{out_kbps:.0}"),
-                        congested = metrics.congested,
-                        "Stream stats"
+                        viewers = snap.viewers,
+                        in_kbps = format_args!("{:.0}", snap.in_kbps),
+                        out_kbps = format_args!("{:.0}", snap.out_kbps),
+                        in_pps = snap.in_pps,
+                        out_pps = snap.out_pps,
+                        rtt_ms = snap.rtt_ms,
+                        rtt_delta_ms = snap.rtt_delta_ms,
+                        loss_pct = format_args!("{:.1}", snap.loss_pct),
+                        pli = snap.pli,
+                        udp_drops = snap.udp_drops,
+                        offers_rejected = snap.offers_rejected,
+                        congested = snap.congested,
+                        "Stream metrics"
                     );
                 }
             }
@@ -384,7 +396,7 @@ async fn handle_whip_offer(
 
     drain_ingest(&mut session, viewers, socket, metrics, signal_tx).await;
 
-    info!(session = %session_id, "WHIP ingest offer accepted");
+    debug!(session = %session_id, "WHIP ingest offer accepted");
     *ingest = Some(session);
 
     Ok(WhipAccepted {
@@ -405,10 +417,12 @@ async fn handle_viewer_offer(
     socket: &UdpSocket,
 ) -> Result<String, String> {
     let Some(ing) = ingest else {
+        metrics.record_offer_rejected();
         return Err("No active stream".to_string());
     };
 
     if viewers.len() >= config.max_peers && !viewers.contains_key(&viewer_id) {
+        metrics.record_offer_rejected();
         return Err(format!("Max peers reached ({})", config.max_peers));
     }
 
@@ -417,6 +431,7 @@ async fn handle_viewer_offer(
         let in_kbps = metrics.in_kbps(now);
         let projected_mbps = (in_kbps * (viewers.len() + 1) as f64) / 1000.0;
         if projected_mbps > config.max_uplink_mbps {
+            metrics.record_offer_rejected();
             return Err(format!(
                 "Uplink cap reached ({projected_mbps:.1} > {:.1} Mbps)",
                 config.max_uplink_mbps
@@ -424,7 +439,10 @@ async fn handle_viewer_offer(
         }
     }
 
-    let offer = SdpOffer::from_sdp_string(&sdp).map_err(|e| format!("Invalid viewer SDP: {e}"))?;
+    let offer = SdpOffer::from_sdp_string(&sdp).map_err(|e| {
+        metrics.record_offer_rejected();
+        format!("Invalid viewer SDP: {e}")
+    })?;
 
     // Match the ingest's negotiated video codec so the browser negotiates the exact same codec.
     let mut rtc_cfg = RtcConfig::new()
@@ -477,7 +495,7 @@ async fn handle_viewer_offer(
 
     let _ = drain_viewer(&mut viewer, socket, metrics).await;
 
-    info!(viewer = %viewer_id, active_viewers = viewers.len() + 1, "Viewer offer accepted");
+    debug!(viewer = %viewer_id, viewers = viewers.len() + 1, "Viewer offer accepted");
     viewers.insert(viewer_id, viewer);
 
     Ok(answer.to_sdp_string())
@@ -498,7 +516,8 @@ async fn drain_ingest(
             }
             Ok(Output::Transmit(t)) => {
                 if let Err(e) = socket.send_to(&t.contents, t.destination).await {
-                    debug!("Ingest UDP send_to error: {e}");
+                    metrics.record_udp_drop();
+                    trace!(session = %ing.id, err = %e, "Ingest UDP send_to error");
                 }
             }
             Ok(Output::Event(ev)) => match ev {
@@ -525,7 +544,7 @@ async fn drain_ingest(
                             if let Some(p) = first_param {
                                 ing.video_pt = Some(p.pt());
                                 ing.video_codec = Some(p.spec().codec);
-                                info!(
+                                debug!(
                                     session = %ing.id,
                                     codec = ?p.spec().codec,
                                     pt = *p.pt(),
@@ -537,7 +556,7 @@ async fn drain_ingest(
                             ing.audio_mid = Some(m.mid);
                             if let Some(p) = first_param {
                                 ing.audio_pt = Some(p.pt());
-                                info!(
+                                debug!(
                                     session = %ing.id,
                                     codec = ?p.spec().codec,
                                     pt = *p.pt(),
@@ -660,7 +679,7 @@ async fn fanout_rtp(
 async fn drain_viewer(
     v: &mut ViewerSession,
     socket: &UdpSocket,
-    _metrics: &mut RelayMetrics,
+    metrics: &mut RelayMetrics,
 ) -> bool {
     let mut want_pli = false;
 
@@ -672,7 +691,8 @@ async fn drain_viewer(
             }
             Ok(Output::Transmit(t)) => {
                 if let Err(e) = socket.send_to(&t.contents, t.destination).await {
-                    debug!(viewer = %v.id, "Viewer UDP send_to error: {e}");
+                    metrics.record_udp_drop();
+                    trace!(viewer = %v.id, err = %e, "Viewer UDP send_to error");
                 }
             }
             Ok(Output::Event(ev)) => match ev {
@@ -726,7 +746,11 @@ async fn drain_viewer(
     want_pli
 }
 
-async fn request_ingest_keyframe(ing: &mut IngestSession, socket: &UdpSocket) {
+async fn request_ingest_keyframe(
+    ing: &mut IngestSession,
+    socket: &UdpSocket,
+    metrics: &mut RelayMetrics,
+) {
     let now = Instant::now();
     if let Some(last) = ing.last_pli_at
         && now.duration_since(last) < PLI_COOLDOWN
@@ -750,6 +774,8 @@ async fn request_ingest_keyframe(ing: &mut IngestSession, socket: &UdpSocket) {
 
     if requested {
         ing.last_pli_at = Some(now);
+        metrics.record_pli();
+        debug!(session = %ing.id, "PLI sent");
         // Drain PLI RTCP packet out to OBS immediately.
         loop {
             match ing.rtc.poll_output() {

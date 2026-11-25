@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS, Transport};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use self::crypto::{SeenIvs, SignalCrypto};
 
@@ -103,7 +103,7 @@ pub async fn run(
     let opts = match parse_mqtt_options(&mqtt_url, &client_id) {
         Ok(o) => o,
         Err(e) => {
-            warn!("Signaling disabled: {e}");
+            error!(err = %e, "Signaling disabled");
             return;
         }
     };
@@ -113,7 +113,7 @@ pub async fn run(
     let events_topic = crypto.events_topic();
     let mut seen_ivs = SeenIvs::new();
 
-    info!(
+    debug!(
         broker = %mqtt_url,
         stream_id = %crypto.stream_id(),
         "Connecting to MQTT signaling broker"
@@ -202,12 +202,12 @@ fn handle_incoming_offer(
     }
 
     let Ok(plaintext) = crypto.decrypt_bytes(&env.iv, &env.data) else {
-        debug!(viewer_id = %env.viewer_id, "Ignored offer with invalid ciphertext");
+        debug!(viewer = %env.viewer_id, "Ignored offer with invalid ciphertext");
         return;
     };
 
     let Ok(payload) = serde_json::from_slice::<OfferPayload>(&plaintext) else {
-        debug!(viewer_id = %env.viewer_id, "Ignored offer with invalid decrypted JSON");
+        debug!(viewer = %env.viewer_id, "Ignored offer with invalid decrypted JSON");
         return;
     };
 
@@ -215,7 +215,7 @@ fn handle_incoming_offer(
     let delta_ms = (now_epoch_ms() - payload.ts).abs();
     if delta_ms > REPLAY_WINDOW_MS {
         debug!(
-            viewer_id = %env.viewer_id,
+            viewer = %env.viewer_id,
             delta_ms,
             "Rejected offer outside replay window"
         );
@@ -223,7 +223,7 @@ fn handle_incoming_offer(
     }
 
     if !seen_ivs.insert(env.iv) {
-        debug!(viewer_id = %env.viewer_id, "Rejected replayed offer IV");
+        debug!(viewer = %env.viewer_id, "Rejected replayed offer IV");
         return;
     }
 
@@ -236,7 +236,7 @@ fn handle_incoming_offer(
         })
         .is_err()
     {
-        warn!(viewer_id = %env.viewer_id, "Relay offer queue full, dropping offer");
+        warn!(viewer = %env.viewer_id, "Relay offer queue full, dropping offer");
         return;
     }
 
@@ -253,17 +253,17 @@ fn handle_incoming_offer(
                             .publish(&topic, QoS::AtMostOnce, false, encrypted)
                             .await
                         {
-                            warn!(viewer_id = %viewer_id, "Failed to publish answer: {e}");
+                            warn!(viewer = %viewer_id, err = %e, "Failed to publish answer");
                         }
                     }
-                    Err(e) => warn!(viewer_id = %viewer_id, "Failed to encrypt answer: {e}"),
+                    Err(e) => warn!(viewer = %viewer_id, err = %e, "Failed to encrypt answer"),
                 }
             }
             Ok(Err(reason)) => {
-                debug!(viewer_id = %viewer_id, "Offer rejected by relay: {reason}");
+                debug!(viewer = %viewer_id, reason = %reason, "Offer rejected by relay");
             }
             Err(_) => {
-                debug!(viewer_id = %viewer_id, "Relay dropped answer channel");
+                debug!(viewer = %viewer_id, "Relay dropped answer channel");
             }
         }
     });
