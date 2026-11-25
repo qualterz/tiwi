@@ -597,6 +597,7 @@ fn handle_whip_offer(
         metrics_rollup: MetricsRollup::new(STDOUT_ROLLUP_TICKS),
     };
 
+    let _ = session.rtc.handle_input(Input::Timeout(now));
     drain_ingest(
         &mut session,
         shards,
@@ -1366,6 +1367,7 @@ fn build_viewer_session(
         last_loss: None,
     };
 
+    let _ = viewer.rtc.handle_input(Input::Timeout(now));
     let _ = drain_viewer(&mut viewer, socket, bound.is_dual_stack, counters);
 
     Ok((viewer, answer_sdp))
@@ -1782,5 +1784,43 @@ mod tests {
         .expect("viewer without H265 should be rejected");
 
         assert!(err.contains("Unsupported video codec"));
+    }
+
+    #[test]
+    fn viewer_session_arms_ice_timers_immediately() {
+        let (sock, bound) = test_bound_and_socket();
+        let counters = ShardCounters::new();
+        let offer = sample_firefox_offer(
+            "m=video 9 UDP/TLS/RTP/SAVPF 120\r\n\
+             c=IN IP4 0.0.0.0\r\n\
+             a=recvonly\r\n\
+             a=ice-ufrag:testufrag\r\n\
+             a=ice-pwd:testpassword123456789012\r\n\
+             a=mid:0\r\n\
+             a=rtcp-mux\r\n\
+             a=setup:actpass\r\n\
+             a=rtpmap:120 VP8/90000\r\n\
+             a=candidate:1 1 UDP 1685987327 198.51.100.10 50000 typ srflx raddr 0.0.0.0 rport 0\r\n",
+        );
+
+        let before = Instant::now();
+        let (viewer, _) = build_viewer_session(
+            "v-ice".to_string(),
+            offer,
+            Some(Codec::Vp8),
+            &bound,
+            None,
+            &sock,
+            &counters,
+        )
+        .expect("viewer offer should be accepted");
+
+        // str0m's IceAgent returns None (not_happening) until the first Input::Timeout(now).
+        // Verify next_timeout is armed for active ICE pacing, not years in the future.
+        assert!(
+            viewer.next_timeout.saturating_duration_since(before) < Duration::from_secs(5),
+            "ICE timer was not armed: next_timeout = {:?}",
+            viewer.next_timeout.saturating_duration_since(before)
+        );
     }
 }
