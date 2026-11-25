@@ -235,7 +235,14 @@ pub async fn run(
                 if *shutdown_rx.borrow() {
                     debug!("Media relay shutting down");
                     if ingest.is_some() {
-                        teardown_ingest(&mut ingest, &shards, &mut metrics, &signal_tx);
+                        teardown_ingest(
+                            &mut ingest,
+                            &shards,
+                            &socket,
+                            ingest_bound.is_dual_stack,
+                            &mut metrics,
+                            &signal_tx,
+                        );
                     }
                     for shard in &mut shards {
                         let _ = shard.tx.send(ShardMsg::Shutdown);
@@ -322,7 +329,14 @@ pub async fn run(
                         let matched = ingest.as_ref().is_some_and(|i| i.id == session_id);
                         if matched {
                             info!(session = %session_id, "WHIP ingest deleted");
-                            teardown_ingest(&mut ingest, &shards, &mut metrics, &signal_tx);
+                            teardown_ingest(
+                                &mut ingest,
+                                &shards,
+                                &socket,
+                                ingest_bound.is_dual_stack,
+                                &mut metrics,
+                                &signal_tx,
+                            );
                         }
                         let _ = reply.send(matched);
                     }
@@ -376,7 +390,14 @@ pub async fn run(
                 }
             }
             if ingest_dead {
-                teardown_ingest(&mut ingest, &shards, &mut metrics, &signal_tx);
+                teardown_ingest(
+                    &mut ingest,
+                    &shards,
+                    &socket,
+                    ingest_bound.is_dual_stack,
+                    &mut metrics,
+                    &signal_tx,
+                );
             }
 
             // 1s derivative metrics snapshot to JSONL file, folded into 5s stdout debug rollup.
@@ -548,7 +569,14 @@ fn handle_whip_offer(
 
     if let Some(prev) = ingest.as_ref() {
         info!(session = %prev.id, next = %session_id, "Replacing existing WHIP ingest");
-        teardown_ingest(ingest, shards, metrics, signal_tx);
+        teardown_ingest(
+            ingest,
+            shards,
+            socket,
+            bound.is_dual_stack,
+            metrics,
+            signal_tx,
+        );
     }
 
     metrics.last_tick = now;
@@ -849,11 +877,23 @@ fn request_ingest_keyframe(
 fn teardown_ingest(
     ingest: &mut Option<IngestSession>,
     shards: &[ShardHandle],
+    socket: &UdpSocket,
+    is_dual_stack: bool,
     metrics: &mut RelayMetrics,
     signal_tx: &mpsc::Sender<SignalEvent>,
 ) {
     if let Some(mut ing) = ingest.take() {
         let _ = ing.rtc.close();
+        while let Ok(output) = ing.rtc.poll_output() {
+            match output {
+                Output::Timeout(_) => break,
+                Output::Transmit(t) => {
+                    let _ = socket
+                        .try_send_to(&t.contents, to_socket_addr(t.destination, is_dual_stack));
+                }
+                Output::Event(_) => {}
+            }
+        }
     }
     for shard in shards {
         let _ = shard.tx.send(ShardMsg::ClearViewers);
@@ -1020,10 +1060,13 @@ fn run_egress_shard(
             if !dead_viewers.is_empty() {
                 let removed = dead_viewers.len();
                 for (id, was_connected) in dead_viewers {
-                    if let Some(v) = viewers.remove(&id)
-                        && let Some(addr) = v.remote_addr
-                    {
-                        addr_to_viewer.remove(&addr);
+                    if let Some(mut v) = viewers.remove(&id) {
+                        if let Some(addr) = v.remote_addr {
+                            addr_to_viewer.remove(&addr);
+                        }
+                        if v.rtc.is_alive() {
+                            close_viewer(&mut v, &socket, bound.is_dual_stack);
+                        }
                     }
                     if was_connected {
                         info!(viewer = %id, "Viewer disconnected");
@@ -1161,10 +1204,11 @@ fn handle_shard_msg(
             );
             match res {
                 Ok((viewer, answer_sdp)) => {
-                    if let Some(old) = viewers.insert(viewer_id.clone(), viewer) {
+                    if let Some(mut old) = viewers.insert(viewer_id.clone(), viewer) {
                         if let Some(addr) = old.remote_addr {
                             addr_to_viewer.remove(&addr);
                         }
+                        close_viewer(&mut old, socket, bound.is_dual_stack);
                         // Undo extra pre-increment when replacing an existing viewer_id.
                         counters.viewers.fetch_sub(1, Ordering::Relaxed);
                     }
@@ -1212,7 +1256,9 @@ fn handle_shard_msg(
         }
         ShardMsg::ClearViewers => {
             let removed = viewers.len();
-            viewers.clear();
+            for (_, mut v) in viewers.drain() {
+                close_viewer(&mut v, socket, bound.is_dual_stack);
+            }
             addr_to_viewer.clear();
             if removed > 0 {
                 counters.viewers.fetch_sub(removed, Ordering::Relaxed);
@@ -1223,7 +1269,9 @@ fn handle_shard_msg(
             true
         }
         ShardMsg::Shutdown => {
-            viewers.clear();
+            for (_, mut v) in viewers.drain() {
+                close_viewer(&mut v, socket, bound.is_dual_stack);
+            }
             addr_to_viewer.clear();
             counters.reset();
             false
@@ -1462,6 +1510,19 @@ fn drain_viewer(
     }
 
     (want_pli, dirty)
+}
+
+fn close_viewer(v: &mut ViewerSession, socket: &std::net::UdpSocket, is_dual_stack: bool) {
+    let _ = v.rtc.close();
+    while let Ok(output) = v.rtc.poll_output() {
+        match output {
+            Output::Timeout(_) => break,
+            Output::Transmit(t) => {
+                let _ = socket.send_to(&t.contents, to_socket_addr(t.destination, is_dual_stack));
+            }
+            Output::Event(_) => {}
+        }
+    }
 }
 
 fn compute_shard_deadline(now: Instant, viewers: &HashMap<String, ViewerSession>) -> Instant {
