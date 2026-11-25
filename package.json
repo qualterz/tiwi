@@ -2,17 +2,14 @@
   "name": "tiwi",
   "private": true,
   "workspaces": [
-    "packages/*"
+    "viewer"
   ],
   "scripts": {
-    "dev": "bun run --filter '*' dev",
-    "dev:daemon": "bun run --filter @qualterz/tiwi dev",
-    "dev:dashboard": "bun run --filter @tiwi/dashboard dev",
+    "dev": "bun run --filter @tiwi/viewer dev",
     "dev:viewer": "bun run --filter @tiwi/viewer dev",
-    "build": "bun run --filter '*' build",
-    "build:dashboard": "bun run --filter @tiwi/dashboard build",
+    "build": "bun run --filter @tiwi/viewer build",
     "build:viewer": "bun run --filter @tiwi/viewer build",
-    "typecheck": "bun run --filter '*' typecheck",
+    "typecheck": "bun run --filter @tiwi/viewer typecheck",
     "format": "prettier --write . --ignore-path .gitignore --ignore-path .prettierignore",
     "format:check": "prettier --check . --ignore-path .gitignore --ignore-path .prettierignore",
     "prepare": "git config core.hooksPath .githooks"
