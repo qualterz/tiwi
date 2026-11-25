@@ -11,12 +11,13 @@ use tracing::{debug, info, warn};
 use crate::config::Config;
 
 // Ingest receives OBS media (high RX, tiny RTCP/STUN TX).
-const INGEST_RECV_BUFFER_BYTES: usize = 4 * 1024 * 1024;
-const INGEST_SEND_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+// 16 MB matches Bun's buffer sizing to avoid Windows UDP overflows during keyframe bursts.
+const INGEST_RECV_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+const INGEST_SEND_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 // Each egress shard handles viewer media TX (high TX) and viewer STUN/DTLS/RTCP RX (low RX).
-const SHARD_RECV_BUFFER_BYTES: usize = 1024 * 1024;
-const SHARD_SEND_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+const SHARD_RECV_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+const SHARD_SEND_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 
 pub struct BoundCandidates {
     pub local_port: u16,
@@ -24,6 +25,9 @@ pub struct BoundCandidates {
     pub host_addr: SocketAddr,
     pub v6_host_addr: Option<SocketAddr>,
     pub is_dual_stack: bool,
+    pub stun_target: Option<SocketAddr>,
+    pub last_stun_refresh: Option<Instant>,
+    pub rtx_enabled: bool,
     pub candidates: Vec<Candidate>,
 }
 
@@ -165,6 +169,7 @@ pub async fn gather_all_candidates(
     };
 
     let public_ip = config.public_ip;
+    let rtx_enabled = config.rtx;
     let stun_label = config.stun_server.clone();
     let count = sockets.len();
 
@@ -200,6 +205,9 @@ pub async fn gather_all_candidates(
                 candidates.push(c);
             }
 
+            let mut stun_target = None;
+            let mut last_stun_refresh = None;
+
             if let Some(pub_ip) = public_ip {
                 let pub_addr = SocketAddr::new(pub_ip, local_port);
                 if let Ok(c) = Candidate::server_reflexive(pub_addr, host_addr, "udp") {
@@ -209,9 +217,11 @@ pub async fn gather_all_candidates(
                     candidates.push(c);
                 }
             } else if let Some(stun_addr) = stun_addr {
-                let stun_target = to_socket_addr(stun_addr, is_dual_stack);
-                match stun_discover_mapped_addr(&socket, stun_target).await {
+                let target = to_socket_addr(stun_addr, is_dual_stack);
+                stun_target = Some(target);
+                match stun_discover_mapped_addr(&socket, target).await {
                     Ok(mapped) => {
+                        last_stun_refresh = Some(Instant::now());
                         if idx == 0 {
                             info!(srflx = %mapped, stun = %stun_label, "Discovered STUN candidate");
                         } else {
@@ -244,6 +254,9 @@ pub async fn gather_all_candidates(
                     host_addr,
                     v6_host_addr,
                     is_dual_stack,
+                    stun_target,
+                    last_stun_refresh,
+                    rtx_enabled,
                     candidates,
                 },
             )
@@ -291,6 +304,81 @@ async fn resolve_stun_addr(stun_server: &str) -> Result<SocketAddr, String> {
         .ok_or_else(|| "no IPv4 address for STUN server".to_string())
 }
 
+/// Sends a non-blocking RFC 5389 STUN Binding Request on a synchronous shard UDP socket.
+pub fn send_stun_binding_request(
+    socket: &std::net::UdpSocket,
+    stun_target: SocketAddr,
+) -> Option<[u8; 12]> {
+    let mut tx_id = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut tx_id);
+    let req = build_stun_binding_request(&tx_id);
+    socket.send_to(&req, stun_target).ok()?;
+    Some(tx_id)
+}
+
+/// Synchronously refreshes the shard's `srflx` candidate when the shard is idle and its
+/// NAT mapping may have expired, bounded by `timeout`.
+pub fn refresh_srflx_on_idle(
+    socket: &std::net::UdpSocket,
+    bound: &mut BoundCandidates,
+    timeout: Duration,
+) {
+    let Some(stun_target) = bound.stun_target else {
+        return;
+    };
+    let Some(tx_id) = send_stun_binding_request(socket, stun_target) else {
+        return;
+    };
+
+    let mut buf = [0u8; 512];
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match socket.recv_from(&mut buf) {
+            Ok((n, _)) => {
+                if let Some(mapped) = parse_stun_binding_response(&buf[..n], &tx_id) {
+                    update_srflx_candidate(bound, mapped);
+                    return;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+/// Replaces or appends the `srflx` candidate on `bound` with `mapped`.
+pub fn update_srflx_candidate(bound: &mut BoundCandidates, mapped: SocketAddr) {
+    bound.last_stun_refresh = Some(Instant::now());
+    let Ok(new_cand) = Candidate::server_reflexive(mapped, bound.host_addr, "udp") else {
+        return;
+    };
+    if let Some(existing) = bound
+        .candidates
+        .iter_mut()
+        .find(|c| c.kind() == str0m::CandidateKind::ServerReflexive)
+    {
+        if existing.addr() != mapped {
+            debug!(old = %existing.addr(), new = %mapped, "Updated shard STUN srflx candidate");
+        }
+        *existing = new_cand;
+    } else {
+        debug!(srflx = %mapped, "Discovered shard STUN srflx candidate");
+        bound.candidates.push(new_cand);
+    }
+}
+
+fn build_stun_binding_request(tx_id: &[u8; 12]) -> [u8; 20] {
+    // 20-byte STUN Binding Request: type 0x0001, length 0, magic cookie 0x2112A442, tx_id
+    let mut req = [0u8; 20];
+    req[0..2].copy_from_slice(&0x0001u16.to_be_bytes());
+    req[2..4].copy_from_slice(&0u16.to_be_bytes());
+    req[4..8].copy_from_slice(&0x2112A442u32.to_be_bytes());
+    req[8..20].copy_from_slice(tx_id);
+    req
+}
+
 /// Minimal RFC 5389 STUN Binding Request on a bound UDP socket so the NAT mapping
 /// matches the exact port used for WebRTC media.
 async fn stun_discover_mapped_addr(
@@ -299,13 +387,7 @@ async fn stun_discover_mapped_addr(
 ) -> Result<SocketAddr, String> {
     let mut tx_id = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut tx_id);
-
-    // 20-byte STUN Binding Request: type 0x0001, length 0, magic cookie 0x2112A442, tx_id
-    let mut req = [0u8; 20];
-    req[0..2].copy_from_slice(&0x0001u16.to_be_bytes());
-    req[2..4].copy_from_slice(&0u16.to_be_bytes());
-    req[4..8].copy_from_slice(&0x2112A442u32.to_be_bytes());
-    req[8..20].copy_from_slice(&tx_id);
+    let req = build_stun_binding_request(&tx_id);
 
     socket
         .send_to(&req, stun_addr)
@@ -331,7 +413,7 @@ async fn stun_discover_mapped_addr(
     Err("timed out waiting for STUN response".to_string())
 }
 
-fn parse_stun_binding_response(buf: &[u8], expected_tx_id: &[u8; 12]) -> Option<SocketAddr> {
+pub fn parse_stun_binding_response(buf: &[u8], expected_tx_id: &[u8; 12]) -> Option<SocketAddr> {
     if buf.len() < 20 {
         return None;
     }

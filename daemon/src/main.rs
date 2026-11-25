@@ -79,13 +79,12 @@ async fn main() {
         })
         .expect("failed to spawn media thread");
 
-    // Control-plane MQTT signaling task.
+    // Control-plane MQTT signaling task (exits cleanly once relay closes signal_tx).
     let signal_task = tokio::spawn(signal::run(
         cfg.mqtt_url.clone(),
         cfg.token.clone(),
         offer_tx,
         signal_rx,
-        shutdown_rx.clone(),
     ));
 
     // Control-plane WHIP HTTP server.
@@ -97,6 +96,7 @@ async fn main() {
             error!(addr = %bind_addr, err = %e, "Failed to bind WHIP HTTP listener");
             let _ = shutdown_tx.send(true);
             let _ = media_handle.join();
+            let _ = signal_task.await;
             std::process::exit(1);
         }
     };
@@ -117,9 +117,10 @@ async fn main() {
         }
     }
 
+    // Stop relay first so StreamStop is queued on signal_tx, then let signal_task flush & disconnect.
     let _ = shutdown_tx.send(true);
-    let _ = signal_task.await;
     let _ = media_handle.join();
+    let _ = signal_task.await;
     info!("Stopped cleanly");
 }
 

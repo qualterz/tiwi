@@ -9,6 +9,7 @@ use crate::config::Config;
 #[command(
     name = "tiwi",
     version,
+    disable_version_flag = true,
     about = "Zero-infrastructure P2P live streaming daemon"
 )]
 pub struct Cli {
@@ -20,8 +21,12 @@ pub struct Cli {
     #[arg(long, conflicts_with = "token")]
     pub new_token: bool,
 
+    /// Print version
+    #[arg(long, action = clap::ArgAction::Version)]
+    pub version: Option<bool>,
+
     /// Enable verbose debug logging
-    #[arg(short, long)]
+    #[arg(long)]
     pub verbose: bool,
 
     #[command(flatten)]

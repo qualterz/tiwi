@@ -3,14 +3,15 @@ mod crypto;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS, Transport};
+use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, Outgoing, QoS, Transport};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 use self::crypto::{SeenIvs, SignalCrypto};
 
-const REPLAY_WINDOW_MS: i64 = 60_000;
+const CLOCK_SKEW_WARN_MS: i64 = 30_000;
+const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug)]
 pub struct ViewerOffer {
@@ -92,7 +93,6 @@ pub async fn run(
     token: String,
     offer_tx: mpsc::Sender<ViewerOffer>,
     mut event_rx: mpsc::Receiver<SignalEvent>,
-    mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let crypto = Arc::new(SignalCrypto::from_token(&token));
     let client_id = format!(
@@ -112,6 +112,8 @@ pub async fn run(
     let offer_topic = crypto.offer_topic();
     let events_topic = crypto.events_topic();
     let mut seen_ivs = SeenIvs::new();
+    let mut is_live = false;
+    let mut pending_stop_flush = false;
 
     debug!(
         broker = %mqtt_url,
@@ -123,27 +125,47 @@ pub async fn run(
         tokio::select! {
             biased;
 
-            _ = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() {
-                    let _ = client.disconnect().await;
-                    break;
-                }
-            }
-
-            Some(ev) = event_rx.recv() => {
-                let kind = match ev {
-                    SignalEvent::StreamStart => "start",
-                    SignalEvent::StreamStop => "stop",
-                };
-                match crypto.encrypt_json(&StreamEventPayload { event_type: kind }) {
-                    Ok(payload) => {
-                        if let Err(e) =
-                            client.try_publish(&events_topic, QoS::AtMostOnce, false, payload)
+            ev = event_rx.recv() => {
+                match ev {
+                    Some(ev) => {
+                        let kind = match ev {
+                            SignalEvent::StreamStart => {
+                                is_live = true;
+                                "start"
+                            }
+                            SignalEvent::StreamStop => {
+                                is_live = false;
+                                "stop"
+                            }
+                        };
+                        if publish_stream_event(&client, &crypto, &events_topic, kind)
+                            && matches!(ev, SignalEvent::StreamStop)
                         {
-                            debug!(event = kind, err = %e, "Failed to enqueue stream event");
+                            pending_stop_flush = true;
                         }
                     }
-                    Err(e) => warn!(event = kind, err = %e, "Failed to encrypt stream event"),
+                    None => {
+                        // Relay has shut down and dropped signal_tx; flush any queued StreamStop
+                        // and Disconnect before exiting.
+                        let _ = client.try_disconnect();
+                        let deadline = tokio::time::Instant::now() + SHUTDOWN_FLUSH_TIMEOUT;
+                        loop {
+                            let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+                            if rem.is_zero() {
+                                break;
+                            }
+                            match tokio::time::timeout(rem, eventloop.poll()).await {
+                                Ok(Ok(Event::Outgoing(Outgoing::Disconnect))) => break,
+                                Ok(Ok(Event::Outgoing(Outgoing::Publish(_)))) => {
+                                    pending_stop_flush = false;
+                                }
+                                Ok(Ok(_)) => {}
+                                Ok(Err(_)) | Err(_) => break,
+                            }
+                        }
+                        let _ = pending_stop_flush;
+                        break;
+                    }
                 }
             }
 
@@ -159,6 +181,9 @@ pub async fn run(
                                 warn!(err = %e, "Failed to subscribe to offer topic");
                             }
                         });
+                        if is_live {
+                            publish_stream_event(&client, &crypto, &events_topic, "start");
+                        }
                     }
                     Ok(Event::Incoming(Incoming::Publish(p))) if p.topic == offer_topic => {
                         handle_incoming_offer(
@@ -169,20 +194,46 @@ pub async fn run(
                             &client,
                         );
                     }
+                    Ok(Event::Outgoing(Outgoing::Publish(_))) => {
+                        pending_stop_flush = false;
+                    }
                     Ok(_) => {}
                     Err(e) => {
                         warn!(err = %e, retry_secs = 2, "MQTT signaling error");
                         tokio::select! {
                             _ = tokio::time::sleep(Duration::from_secs(2)) => {}
-                            _ = shutdown_rx.changed() => {
-                                if *shutdown_rx.borrow() {
-                                    break;
+                            ev = event_rx.recv() => {
+                                match ev {
+                                    Some(SignalEvent::StreamStart) => is_live = true,
+                                    Some(SignalEvent::StreamStop) => is_live = false,
+                                    None => break,
                                 }
                             }
                         }
                     }
                 }
             }
+        }
+    }
+}
+
+fn publish_stream_event(
+    client: &AsyncClient,
+    crypto: &SignalCrypto,
+    events_topic: &str,
+    kind: &str,
+) -> bool {
+    match crypto.encrypt_json(&StreamEventPayload { event_type: kind }) {
+        Ok(payload) => match client.try_publish(events_topic, QoS::AtMostOnce, false, payload) {
+            Ok(()) => true,
+            Err(e) => {
+                debug!(event = kind, err = %e, "Failed to enqueue stream event");
+                false
+            }
+        },
+        Err(e) => {
+            warn!(event = kind, err = %e, "Failed to encrypt stream event");
+            false
         }
     }
 }
@@ -215,15 +266,14 @@ fn handle_incoming_offer(
         return;
     };
 
-    // Replay window check (+-60s) and IV deduplication.
-    let delta_ms = (now_epoch_ms() - payload.ts).abs();
-    if delta_ms > REPLAY_WINDOW_MS {
-        debug!(
+    // Warn on large wall-clock skew (matching Bun) and deduplicate IVs.
+    let skew_ms = now_epoch_ms() - payload.ts;
+    if skew_ms.abs() > CLOCK_SKEW_WARN_MS {
+        warn!(
             viewer = %env.viewer_id,
-            delta_ms,
-            "Rejected offer outside replay window"
+            skew_ms,
+            "Large viewer wall-clock skew"
         );
-        return;
     }
 
     if !seen_ivs.insert(env.iv) {

@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -10,12 +9,30 @@ use flate2::write::GzEncoder;
 use serde::Serialize;
 use tracing::{debug, info, warn};
 
-const MIN_RTT_WINDOW: Duration = Duration::from_secs(30);
 const CONGESTION_RTT_INCREASE: Duration = Duration::from_millis(40);
 const CONGESTION_SEVERE_RTT_INCREASE: Duration = Duration::from_millis(150);
 const CONGESTION_LOSS_THRESHOLD: f32 = 0.02;
+const CONGESTION_SEVERE_LOSS_THRESHOLD: f32 = 0.05;
 const CONGESTION_RECOVERY_HOLD: Duration = Duration::from_secs(5);
 const MAX_METRICS_FILES: usize = 20;
+
+/// Evaluates whether a single viewer is experiencing congestion against its own RTT baseline.
+pub fn is_viewer_congested(
+    rtt: Option<Duration>,
+    min_rtt: Option<Duration>,
+    loss: Option<f32>,
+) -> bool {
+    let (rtt_spiked, rtt_severe) = match (rtt, min_rtt) {
+        (Some(cur), Some(min)) => (
+            cur > min + CONGESTION_RTT_INCREASE,
+            cur > min + CONGESTION_SEVERE_RTT_INCREASE,
+        ),
+        _ => (false, false),
+    };
+    let high_loss = loss.is_some_and(|l| l > CONGESTION_LOSS_THRESHOLD);
+    let severe_loss = loss.is_some_and(|l| l >= CONGESTION_SEVERE_LOSS_THRESHOLD);
+    rtt_severe || severe_loss || (rtt_spiked && high_loss)
+}
 
 /// Derivative metrics snapshot for a single reporting window (1s for JSONL, 5s rollup for stdout).
 #[derive(Debug, Clone, Serialize)]
@@ -277,11 +294,16 @@ fn format_utc_filename_ts(now: SystemTime) -> String {
 pub struct ShardCounters {
     pub viewers: AtomicUsize,
     pub connected_viewers: AtomicUsize,
+    pub congested_viewers: AtomicUsize,
+    /// Set when a viewer connects; consumed by the relay to send an unthrottled PLI.
+    pub force_pli: std::sync::atomic::AtomicBool,
     out_bytes: AtomicU64,
     out_pkts: AtomicU64,
     udp_drops: AtomicU64,
     /// Max viewer RTT in microseconds (0 = none reported yet).
     max_rtt_us: AtomicU64,
+    /// Max per-viewer RTT inflation above its own baseline in microseconds.
+    max_rtt_delta_us: AtomicU64,
     /// Max viewer egress loss in basis points (10_000 = 100%).
     max_loss_bps: AtomicU32,
 }
@@ -291,10 +313,13 @@ impl ShardCounters {
         Self {
             viewers: AtomicUsize::new(0),
             connected_viewers: AtomicUsize::new(0),
+            congested_viewers: AtomicUsize::new(0),
+            force_pli: std::sync::atomic::AtomicBool::new(false),
             out_bytes: AtomicU64::new(0),
             out_pkts: AtomicU64::new(0),
             udp_drops: AtomicU64::new(0),
             max_rtt_us: AtomicU64::new(0),
+            max_rtt_delta_us: AtomicU64::new(0),
             max_loss_bps: AtomicU32::new(0),
         }
     }
@@ -310,47 +335,75 @@ impl ShardCounters {
         self.udp_drops.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn set_peer_stats(&self, max_rtt: Option<Duration>, max_loss: Option<f32>) {
-        let rtt_us = max_rtt.map(|d| d.as_micros().min(u64::MAX as u128) as u64).unwrap_or(0);
+    pub fn set_peer_stats(
+        &self,
+        max_rtt: Option<Duration>,
+        max_rtt_delta: Option<Duration>,
+        max_loss: Option<f32>,
+        congested: usize,
+    ) {
+        let rtt_us = max_rtt
+            .map(|d| d.as_micros().min(u64::MAX as u128) as u64)
+            .unwrap_or(0);
+        let delta_us = max_rtt_delta
+            .map(|d| d.as_micros().min(u64::MAX as u128) as u64)
+            .unwrap_or(0);
         let loss_bps = max_loss
             .map(|l| (l.clamp(0.0, 1.0) * 10_000.0).round() as u32)
             .unwrap_or(0);
         self.max_rtt_us.store(rtt_us, Ordering::Relaxed);
+        self.max_rtt_delta_us.store(delta_us, Ordering::Relaxed);
         self.max_loss_bps.store(loss_bps, Ordering::Relaxed);
+        self.congested_viewers.store(congested, Ordering::Relaxed);
     }
 
-    pub fn take_interval(&self) -> (u64, u64, u64, Option<Duration>, Option<f32>) {
+    #[allow(clippy::type_complexity)]
+    pub fn take_interval(
+        &self,
+    ) -> (
+        u64,
+        u64,
+        u64,
+        Option<Duration>,
+        Option<Duration>,
+        Option<f32>,
+        usize,
+        usize,
+    ) {
         let bytes = self.out_bytes.swap(0, Ordering::Relaxed);
         let pkts = self.out_pkts.swap(0, Ordering::Relaxed);
         let drops = self.udp_drops.swap(0, Ordering::Relaxed);
+        let connected = self.connected_viewers.load(Ordering::Relaxed);
+        let congested = self.congested_viewers.load(Ordering::Relaxed);
         let rtt_us = self.max_rtt_us.load(Ordering::Relaxed);
+        let delta_us = self.max_rtt_delta_us.load(Ordering::Relaxed);
         let loss_bps = self.max_loss_bps.load(Ordering::Relaxed);
         let rtt = (rtt_us > 0).then(|| Duration::from_micros(rtt_us));
-        let loss = (self.connected_viewers.load(Ordering::Relaxed) > 0)
-            .then(|| loss_bps as f32 / 10_000.0);
-        (bytes, pkts, drops, rtt, loss)
+        let rtt_delta = (rtt_us > 0).then(|| Duration::from_micros(delta_us));
+        let loss = (connected > 0).then(|| loss_bps as f32 / 10_000.0);
+        (bytes, pkts, drops, rtt, rtt_delta, loss, connected, congested)
     }
 
     pub fn reset(&self) {
         self.viewers.store(0, Ordering::Relaxed);
         self.connected_viewers.store(0, Ordering::Relaxed);
+        self.congested_viewers.store(0, Ordering::Relaxed);
         self.out_bytes.store(0, Ordering::Relaxed);
         self.out_pkts.store(0, Ordering::Relaxed);
         self.udp_drops.store(0, Ordering::Relaxed);
         self.max_rtt_us.store(0, Ordering::Relaxed);
+        self.max_rtt_delta_us.store(0, Ordering::Relaxed);
         self.max_loss_bps.store(0, Ordering::Relaxed);
     }
 }
 
-/// Real-time 1-second derivative rate tracker, windowed min-RTT congestion detector,
+/// Real-time 1-second derivative rate tracker, majority-peer congestion detector,
 /// and per-interval delta counters (O(1) hot path with zero per-packet allocations).
 pub struct RelayMetrics {
     in_bytes: u64,
     in_pkts: u64,
     last_in_kbps: f64,
 
-    // Windowed min-RTT samples (fixes monotonic min_rtt never decaying)
-    rtt_samples: VecDeque<(Instant, Duration)>,
     pub congested: bool,
     clean_since: Option<Instant>,
     pub last_tick: Instant,
@@ -367,24 +420,12 @@ impl RelayMetrics {
             in_bytes: 0,
             in_pkts: 0,
             last_in_kbps: 0.0,
-            rtt_samples: VecDeque::new(),
             congested: false,
             clean_since: None,
             last_tick: now,
             pli_sent: 0,
             udp_drops: 0,
             offers_rejected: 0,
-        }
-    }
-
-    fn prune_rtt(&mut self, now: Instant) {
-        let rtt_cutoff = now.checked_sub(MIN_RTT_WINDOW).unwrap_or(now);
-        while let Some(&(ts, _)) = self.rtt_samples.front() {
-            if ts < rtt_cutoff {
-                self.rtt_samples.pop_front();
-            } else {
-                break;
-            }
         }
     }
 
@@ -421,37 +462,30 @@ impl RelayMetrics {
         }
     }
 
-    /// Updates windowed min-RTT and wall-time congestion state once per tick.
-    /// Triggers on either severe RTT inflation alone (queueing/bufferbloat) or
-    /// moderate RTT inflation combined with packet loss.
+    /// Updates host uplink congestion state once per tick.
+    /// Requires a majority of connected viewers (>=2) to be congested so a single slow
+    /// mobile viewer cannot falsely flag host uplink saturation.
     pub fn update_congestion(
         &mut self,
         now: Instant,
-        rtt: Option<Duration>,
-        loss: Option<f32>,
+        connected_viewers: usize,
+        congested_viewers: usize,
     ) -> Option<bool> {
-        self.prune_rtt(now);
-        if let Some(r) = rtt {
-            self.rtt_samples.push_back((now, r));
-        }
+        let is_congested_now =
+            connected_viewers >= 2 && congested_viewers * 2 > connected_viewers;
 
-        let min_rtt = self.rtt_samples.iter().map(|&(_, r)| r).min();
-        let (rtt_spiked, rtt_severe) = match (rtt, min_rtt) {
-            (Some(cur), Some(min)) => (
-                cur > min + CONGESTION_RTT_INCREASE,
-                cur > min + CONGESTION_SEVERE_RTT_INCREASE,
-            ),
-            _ => (false, false),
-        };
-        let high_loss = loss.is_some_and(|l| l > CONGESTION_LOSS_THRESHOLD);
-
-        if rtt_severe || (rtt_spiked && high_loss) {
+        if is_congested_now {
             self.clean_since = None;
             if !self.congested {
                 self.congested = true;
                 return Some(true);
             }
         } else if self.congested {
+            if connected_viewers < 2 {
+                self.congested = false;
+                self.clean_since = None;
+                return Some(false);
+            }
             let clean_start = *self.clean_since.get_or_insert(now);
             if now.duration_since(clean_start) >= CONGESTION_RECOVERY_HOLD {
                 self.congested = false;
@@ -466,7 +500,6 @@ impl RelayMetrics {
     #[allow(clippy::too_many_arguments)]
     pub fn take_snapshot(
         &mut self,
-        now: Instant,
         elapsed: Duration,
         codec: String,
         viewers: usize,
@@ -474,16 +507,12 @@ impl RelayMetrics {
         out_pkts: u64,
         shard_udp_drops: u64,
         max_rtt: Option<Duration>,
+        max_rtt_delta: Option<Duration>,
         max_loss: Option<f32>,
     ) -> MetricsSnapshot {
-        self.prune_rtt(now);
         let secs = elapsed.as_secs_f64().max(0.001);
-        let min_rtt = self.rtt_samples.iter().map(|&(_, r)| r).min();
         let rtt_ms = max_rtt.map(|d| d.as_millis() as u64);
-        let rtt_delta_ms = match (max_rtt, min_rtt) {
-            (Some(cur), Some(min)) => Some(cur.saturating_sub(min).as_millis() as u64),
-            _ => None,
-        };
+        let rtt_delta_ms = max_rtt_delta.map(|d| d.as_millis() as u64);
 
         let raw_in_kbps = (self.in_bytes as f64 * 8.0) / (secs * 1000.0);
         let raw_out_kbps = (out_bytes as f64 * 8.0) / (secs * 1000.0);
@@ -524,7 +553,6 @@ impl RelayMetrics {
         self.in_bytes = 0;
         self.in_pkts = 0;
         self.last_in_kbps = 0.0;
-        self.rtt_samples.clear();
         self.congested = false;
         self.clean_since = None;
         self.pli_sent = 0;

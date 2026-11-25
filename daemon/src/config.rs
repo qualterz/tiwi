@@ -23,7 +23,7 @@ pub struct Config {
     #[arg(short, long, env = "TIWI_PORT")]
     pub port: u16,
 
-    /// Fixed UDP port for WebRTC media (0 = OS-assigned)
+    /// Base fixed UDP port for WebRTC media (0 = OS-assigned; binds base + 1..=shards)
     #[default(0)]
     #[arg(long, env = "TIWI_MEDIA_PORT")]
     pub media_port: u16,
@@ -62,8 +62,13 @@ pub struct Config {
 
     /// Maximum total viewer egress bitrate in Mbps (0 = unlimited)
     #[default(0.0)]
-    #[arg(long)]
+    #[arg(long, alias = "max-uplink")]
     pub max_uplink_mbps: f64,
+
+    /// Enable RTP retransmission (NACK/RTX) for video
+    #[default(true)]
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub rtx: bool,
 
     /// Ingest media silence timeout in seconds (0 = disabled)
     #[default(15)]
@@ -165,7 +170,7 @@ impl Config {
 }
 
 pub fn generate_token() -> String {
-    let mut bytes = [0u8; 24];
+    let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
 }
