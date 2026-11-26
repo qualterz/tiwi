@@ -21,6 +21,10 @@ pub struct Cli {
     #[arg(long, conflicts_with = "token")]
     pub new_token: bool,
 
+    /// Print default config.toml and exit
+    #[arg(long)]
+    pub default_config: bool,
+
     /// Print version
     #[arg(long, action = clap::ArgAction::Version)]
     pub version: Option<bool>,

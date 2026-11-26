@@ -1,81 +1,140 @@
+use std::fmt::Write as _;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use clap::Args as _;
 use clap_serde_derive::ClapSerde;
 use rand::RngCore;
+use serde::Serialize;
 use tracing::warn;
 
 use crate::cli::Cli;
 
-#[derive(ClapSerde, Debug, Clone)]
+#[derive(ClapSerde, Serialize, Debug, Clone)]
 pub struct Config {
     /// HTTP bind address for WHIP ingest
+    ///
+    /// Local network interface the WHIP server listens on (http://<bind>:<port>/whip).
+    ///
+    /// Values: IPv4 or IPv6 address (e.g. "127.0.0.1" for local-only, "0.0.0.0" for all interfaces, "::1").
     #[default(IpAddr::V4(Ipv4Addr::LOCALHOST))]
     #[arg(long, env = "TIWI_BIND")]
     pub bind: IpAddr,
 
     /// HTTP port for WHIP ingest
+    ///
+    /// TCP port for OBS or other WHIP broadcasters to push streams to (http://<bind>:<port>/whip).
+    ///
+    /// Values: 1-65535.
     #[default(2000)]
     #[arg(short, long, env = "TIWI_PORT")]
     pub port: u16,
 
-    /// Base fixed UDP port for WebRTC media (0 = OS-assigned; binds base + 1..=shards)
+    /// Base fixed UDP port for WebRTC media
+    ///
+    /// Set a fixed port when forwarding UDP through a firewall or NAT. Binds media_port for ingest and media_port + 1..=shards for viewers.
+    ///
+    /// Values: 0 (OS-assigned ephemeral ports) or 1-65535.
     #[default(0)]
     #[arg(long, env = "TIWI_MEDIA_PORT")]
     pub media_port: u16,
 
-    /// Static public IP to advertise in ICE candidates (skips STUN when set)
-    #[arg(long, env = "TIWI_PUBLIC_IP")]
+    /// Static public IP advertised in WebRTC ICE candidates
+    ///
+    /// Use when running behind a known static IP or port-forwarded router; skips STUN discovery when set.
+    ///
+    /// Values: IPv4 or IPv6 address (e.g. "203.0.113.10"). Leave unset to auto-discover via stun_server.
+    #[arg(long, env = "TIWI_PUBLIC_IP", value_name = "IP")]
     pub public_ip: Option<IpAddr>,
 
-    /// STUN server address (host:port) for public IP discovery
+    /// STUN server used for public IP discovery
+    ///
+    /// Queried to discover your external IP for WebRTC ICE candidates. Ignored when public_ip is set.
+    ///
+    /// Values: "host:port" (e.g. "stun.l.google.com:19302", "stun.cloudflare.com:3478").
     #[default("stun.l.google.com:19302".to_string())]
     #[arg(long)]
     pub stun_server: String,
 
     /// MQTT over WebSocket broker URL for viewer signaling
+    ///
+    /// Public or self-hosted MQTT broker used to exchange encrypted WebRTC SDP offers/answers with viewers.
+    ///
+    /// Values: "ws://..." or "wss://..." URL.
     #[default("wss://broker.emqx.io:8084/mqtt".to_string())]
     #[arg(long, env = "TIWI_MQTT_URL")]
     pub mqtt_url: String,
 
-    /// Base viewer URL used when printing the shareable watch link
+    /// Base viewer URL used for the shareable watch link
+    ///
+    /// Printed at startup as "<viewer_url>#<token>". Point this to your own hosted viewer if self-hosting.
+    ///
+    /// Values: "http://..." or "https://..." URL.
     #[default("https://qualterz.github.io/tiwi/".to_string())]
     #[arg(long)]
     pub viewer_url: String,
 
-    /// Stream token for this session only (does not modify config.toml)
+    /// Stream token used in the shareable watch link
+    ///
+    /// Shared secret identifying your stream and encrypting signaling. Passing --token or TIWI_TOKEN overrides for one session without editing config.toml.
+    ///
+    /// Values: non-empty URL-safe string. Leave empty ("") to auto-generate and save a random token on first run.
     #[arg(long, env = "TIWI_TOKEN")]
     pub token: String,
 
-    /// Optional Bearer token required on WHIP POST/DELETE requests
-    #[arg(long, env = "TIWI_WHIP_TOKEN")]
+    /// Optional Bearer token required for WHIP ingest requests
+    ///
+    /// When set, broadcasters must send "Authorization: Bearer <token>" on WHIP POST/DELETE requests. Recommended if bind is not loopback.
+    ///
+    /// Values: non-empty string. Leave unset to allow unauthenticated WHIP ingest.
+    #[arg(long, env = "TIWI_WHIP_TOKEN", value_name = "TOKEN")]
     pub whip_token: Option<String>,
 
-    /// Maximum simultaneous viewers (0 = unlimited)
+    /// Maximum simultaneous viewers
+    ///
+    /// Rejects new viewer connections once this many viewers are connected.
+    ///
+    /// Values: 0 (unlimited) or positive integer (e.g. 10).
     #[default(0)]
     #[arg(long)]
     pub max_peers: usize,
 
-    /// Maximum total viewer egress bitrate in Mbps (0 = unlimited)
+    /// Maximum total viewer egress bitrate in Mbps
+    ///
+    /// Caps combined outbound bandwidth across all viewers to avoid saturating your upload link.
+    ///
+    /// Values: 0.0 (unlimited) or positive float in Mbps (e.g. 25.0).
     #[default(0.0)]
     #[arg(long, alias = "max-uplink")]
     pub max_uplink_mbps: f64,
 
-    /// Enable RTP retransmission (NACK/RTX) for video
+    /// RTP retransmission (NACK/RTX) for video
+    ///
+    /// Resends lost video packets requested by viewers; disable to reduce latency and bandwidth overhead on poor links.
+    ///
+    /// Values: true (enabled) or false (disabled).
     #[default(true)]
     #[arg(long, action = clap::ArgAction::Set)]
     pub rtx: bool,
 
-    /// Ingest media silence timeout in seconds (0 = disabled)
+    /// Ingest media silence timeout in seconds
+    ///
+    /// Closes the active WHIP session if no media packets arrive from the broadcaster for this long.
+    ///
+    /// Values: 0 (disabled) or positive integer in seconds (e.g. 15).
     #[default(15)]
     #[arg(long)]
     pub ingest_timeout_secs: u64,
 
-    /// Directory for per-session 1s JSONL.gz metrics files (default: appdata/tiwi/metrics)
-    #[arg(long, env = "TIWI_METRICS_DIR")]
+    /// Folder where stream stats logs are saved
+    ///
+    /// Saves one compressed log file (.jsonl.gz) per stream session with once-per-second stats (viewer count, bitrate, latency, packet loss). Keeps the 20 most recent files.
+    ///
+    /// Values: folder path (e.g. "C:/logs/tiwi" or "/var/log/tiwi"). Leave unset to use the OS local app data folder (tiwi/metrics).
+    #[arg(long, env = "TIWI_METRICS_DIR", value_name = "PATH")]
     pub metrics_dir: Option<PathBuf>,
 
     #[arg(skip)]
@@ -166,6 +225,58 @@ impl Config {
             .clone()
             .or_else(|| dirs::data_local_dir().map(|d| d.join("tiwi").join("metrics")))
     }
+
+    /// Generates a documented default `config.toml` directly from `Config` metadata and defaults.
+    pub fn default_toml() -> String {
+        let defaults = toml::Value::try_from(Self::from(<Self as ClapSerde>::Opt::default()))
+            .expect("Config default must serialize to TOML");
+        let table = defaults
+            .as_table()
+            .expect("Config default must serialize to a TOML table");
+        let cmd = <Self as ClapSerde>::Opt::augment_args(clap::Command::new("config"));
+
+        let mut out = String::from(
+            "# Tiwi Daemon Configuration\n\
+             #\n\
+             # Discovery order:\n\
+             #   1. --config <path>\n\
+             #   2. config.toml next to the tiwi executable (portable mode)\n\
+             #   3. User config directory (e.g. %APPDATA%\\tiwi\\config.toml, ~/.config/tiwi/config.toml)\n\
+             #\n\
+             # Precedence: defaults < config.toml < CLI flags / environment variables.\n\
+             # Optional settings are commented out; uncomment a line to enable them.\n",
+        );
+
+        for arg in cmd.get_arguments() {
+            let key = arg.get_id().as_str();
+            out.push('\n');
+
+            if let Some(help) = arg.get_long_help().or_else(|| arg.get_help()) {
+                for line in help.to_string().lines() {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let _ = writeln!(out, "# {line}");
+                }
+            }
+            if let Some(env) = arg.get_env() {
+                let _ = writeln!(out, "# Env: {}", env.to_string_lossy());
+            }
+
+            if let Some(val) = table.get(key) {
+                let _ = writeln!(out, "{key} = {val}");
+            } else {
+                let placeholder = arg
+                    .get_value_names()
+                    .and_then(|names| names.first())
+                    .map(|n| n.as_str())
+                    .unwrap_or("");
+                let _ = writeln!(out, "# {key} = \"<{placeholder}>\"");
+            }
+        }
+
+        out
+    }
 }
 
 pub fn generate_token() -> String {
@@ -182,11 +293,12 @@ fn persist_token(path: &Path, token: &str) -> std::io::Result<()> {
     }
 
     let token_line = format!("token = \"{token}\"");
-    if !path.exists() {
-        return fs::write(path, format!("{token_line}\n"));
-    }
+    let existing = if path.exists() {
+        fs::read_to_string(path)?
+    } else {
+        Config::default_toml()
+    };
 
-    let existing = fs::read_to_string(path)?;
     let mut replaced = false;
     let mut lines: Vec<String> = existing
         .lines()
@@ -215,4 +327,32 @@ fn is_token_key_line(trimmed: &str) -> bool {
         return false;
     };
     rest.trim_start().starts_with('=')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_toml_roundtrips() {
+        let generated = Config::default_toml();
+        let parsed: <Config as ClapSerde>::Opt =
+            toml::from_str(&generated).expect("generated config.toml must be valid TOML");
+        let cfg = Config::from(parsed);
+        let expected = Config::from(<Config as ClapSerde>::Opt::default());
+        assert_eq!(cfg.bind, expected.bind);
+        assert_eq!(cfg.port, expected.port);
+        assert_eq!(cfg.media_port, expected.media_port);
+        assert_eq!(cfg.public_ip, expected.public_ip);
+        assert_eq!(cfg.stun_server, expected.stun_server);
+        assert_eq!(cfg.mqtt_url, expected.mqtt_url);
+        assert_eq!(cfg.viewer_url, expected.viewer_url);
+        assert_eq!(cfg.token, expected.token);
+        assert_eq!(cfg.whip_token, expected.whip_token);
+        assert_eq!(cfg.max_peers, expected.max_peers);
+        assert_eq!(cfg.max_uplink_mbps, expected.max_uplink_mbps);
+        assert_eq!(cfg.rtx, expected.rtx);
+        assert_eq!(cfg.ingest_timeout_secs, expected.ingest_timeout_secs);
+        assert_eq!(cfg.metrics_dir, expected.metrics_dir);
+    }
 }

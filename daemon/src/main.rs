@@ -17,6 +17,10 @@ use crate::config::Config;
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    if cli.default_config {
+        print!("{}", Config::default_toml());
+        return;
+    }
     let default_filter = if cli.verbose {
         "tiwi=debug,str0m=info"
     } else {
