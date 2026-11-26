@@ -5,12 +5,12 @@ use clap_serde_derive::ClapSerde;
 
 use crate::config::Config;
 
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(
     name = "tiwi",
     version,
     disable_version_flag = true,
-    about = "Zero-infrastructure P2P live streaming daemon"
+    about = "Zero-infrastructure peer-to-peer live streaming daemon"
 )]
 pub struct Cli {
     /// Path to config.toml (overrides automatic discovery)
