@@ -22,7 +22,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, error, info, trace, warn};
 
 use self::metrics::{
-    MetricsRollup, MetricsWriter, RelayMetrics, ShardCounters, is_viewer_congested,
+    MetricsRollup, MetricsSnapshot, MetricsWriter, RelayMetrics, ShardCounters, is_viewer_congested,
 };
 use self::net::{
     BoundCandidates, bind_ingest_udp, bind_shard_udp, from_socket_addr, gather_all_candidates,
@@ -114,6 +114,7 @@ struct ShardHandle {
 pub async fn run(
     config: Config,
     mut metrics_writer: Option<MetricsWriter>,
+    status_tx: watch::Sender<Option<MetricsSnapshot>>,
     mut whip_rx: mpsc::Receiver<WhipCommand>,
     mut offer_rx: mpsc::Receiver<ViewerOffer>,
     signal_tx: mpsc::Sender<SignalEvent>,
@@ -517,6 +518,7 @@ pub async fn run(
                 if let Some(writer) = metrics_writer.as_mut() {
                     writer.write(&snap);
                 }
+                status_tx.send_replace(Some(snap.clone()));
 
                 if let Some(rollup) = ing.metrics_rollup.push(&snap) {
                     debug!(
@@ -536,6 +538,8 @@ pub async fn run(
                         "Stream metrics"
                     );
                 }
+            } else if ingest.is_none() && status_tx.borrow().is_some() {
+                status_tx.send_replace(None);
             }
         }
     }

@@ -178,6 +178,10 @@ impl MetricsWriter {
         })
     }
 
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn write(&mut self, snap: &MetricsSnapshot) {
         if self.failed {
             return;

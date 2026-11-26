@@ -8,7 +8,7 @@ use crate::config::Config;
 #[derive(Parser)]
 #[command(
     name = "tiwi",
-    version,
+    version = env!("TIWI_FULL_VERSION"),
     disable_version_flag = true,
     about = "Zero-infrastructure peer-to-peer live streaming daemon"
 )]
@@ -25,7 +25,7 @@ pub struct Cli {
     #[arg(long)]
     pub default_config: bool,
 
-    /// Enable verbose debug logging
+    /// Print full logs to stdout instead of the TUI
     #[arg(long)]
     pub verbose: bool,
 

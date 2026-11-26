@@ -2,9 +2,11 @@ mod cli;
 mod config;
 mod relay;
 mod signal;
+mod tui;
 mod whip;
 
 use std::fs::{self, File};
+use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -48,13 +50,10 @@ async fn main() {
         }
     };
 
-    let default_filter = if verbose {
-        "tiwi=debug,str0m=info"
-    } else {
-        "tiwi=info"
-    };
+    let use_tui = std::io::stdout().is_terminal() && !verbose;
+
     let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("tiwi=info"));
 
     let run_ts = relay::metrics::format_utc_filename_ts(SystemTime::now());
     let logs_dir = cfg.resolved_logs_dir();
@@ -78,9 +77,11 @@ async fn main() {
             }
         });
 
+    let stdout_layer = (!use_tui).then(|| tracing_subscriber::fmt::layer().with_target(false));
+
     tracing_subscriber::registry()
         .with(env_filter)
-        .with(tracing_subscriber::fmt::layer().with_target(false))
+        .with(stdout_layer)
         .with(file_layer)
         .init();
 
@@ -94,25 +95,33 @@ async fn main() {
         info!(path = %path.display(), "Log file");
     }
 
-    if !cfg.bind.is_loopback() && cfg.whip_token.is_none() {
-        warn!(
-            bind = %cfg.bind,
-            "WHIP endpoint is exposed on a non-loopback address without whip_token; set whip_token in config.toml or --whip-token to protect ingest"
-        );
-    }
+    let expose_warning = if !cfg.bind.is_loopback() && cfg.whip_token.is_none() {
+        let msg = "WHIP endpoint is exposed on a non-loopback address without whip_token; set whip_token in config.toml or --whip-token to protect ingest";
+        warn!(bind = %cfg.bind, "{msg}");
+        Some(msg.to_string())
+    } else {
+        None
+    };
 
     let bind_addr = SocketAddr::new(cfg.bind, cfg.port);
     let listener = match tokio::net::TcpListener::bind(bind_addr).await {
         Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            error!(
+            let msg = format!(
                 "Port {} is already in use. Is another tiwi instance running? (Use --port <port> to pick another)",
                 cfg.port
             );
+            error!("{msg}");
+            if use_tui {
+                eprintln!("{msg}");
+            }
             std::process::exit(1);
         }
         Err(e) => {
             error!(addr = %bind_addr, err = %e, "Failed to bind WHIP HTTP listener");
+            if use_tui {
+                eprintln!("Failed to bind WHIP HTTP listener ({bind_addr}): {e}");
+            }
             std::process::exit(1);
         }
     };
@@ -126,9 +135,11 @@ async fn main() {
             }
         }
     });
+    let metrics_path = metrics_writer.as_ref().map(|w| w.path().to_path_buf());
 
+    let whip_url = format!("http://{}:{}/whip", cfg.bind, cfg.port);
     info!(
-        whip = %format!("http://{}:{}/whip", cfg.bind, cfg.port),
+        whip = %whip_url,
         auth = cfg.whip_token.is_some(),
         "WHIP ingest endpoint"
     );
@@ -137,7 +148,26 @@ async fn main() {
     let (whip_tx, whip_rx) = mpsc::channel(32);
     let (offer_tx, offer_rx) = mpsc::channel(64);
     let (signal_tx, signal_rx) = mpsc::channel(32);
+    let (status_tx, status_rx) = watch::channel(None);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let tui_task = use_tui.then(|| {
+        let header = tui::TuiHeader {
+            version: env!("TIWI_FULL_VERSION"),
+            watch_url: cfg.watch_url(),
+            whip_url,
+            whip_auth: cfg.whip_token.is_some(),
+            config_path: cfg.config_path.clone(),
+            log_path: log_file_path.clone(),
+            metrics_path,
+            warning: expose_warning,
+        };
+        let limits = tui::TuiLimits {
+            max_peers: cfg.max_peers,
+            max_uplink_mbps: cfg.max_uplink_mbps,
+        };
+        tokio::spawn(tui::run(header, limits, status_rx, shutdown_rx.clone()))
+    });
 
     // Dedicated OS thread running a single-threaded tokio reactor for str0m media I/O.
     let media_cfg = cfg.clone();
@@ -152,6 +182,7 @@ async fn main() {
             rt.block_on(relay::run(
                 media_cfg,
                 metrics_writer,
+                status_tx,
                 whip_rx,
                 offer_rx,
                 signal_tx,
@@ -191,6 +222,9 @@ async fn main() {
     let _ = shutdown_tx.send(true);
     let _ = media_handle.join();
     let _ = signal_task.await;
+    if let Some(task) = tui_task {
+        let _ = task.await;
+    }
     info!("Stopped cleanly");
 }
 

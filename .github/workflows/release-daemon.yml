@@ -90,6 +90,8 @@ jobs:
         run: cargo test --manifest-path daemon/Cargo.toml
 
       - name: Build release binary
+        env:
+          TIWI_VERSION: ${{ needs.prepare.outputs.tag }}
         run: cargo build --manifest-path daemon/Cargo.toml --release --target ${{ matrix.target }}
 
       - name: Smoke test binary

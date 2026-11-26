@@ -1,6 +1,5 @@
 [package]
 name = "tiwi-daemon"
-version = "0.1.0"
 edition = "2024"
 
 [[bin]]
@@ -13,6 +12,7 @@ axum = "0.8"
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 clap-serde-derive = "1.0.0"
+crossterm = "0.28"
 dirs = "6"
 flate2 = "1"
 hmac = "0.12"
