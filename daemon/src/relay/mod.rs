@@ -1,4 +1,4 @@
-mod metrics;
+pub(crate) mod metrics;
 mod net;
 
 use std::collections::HashMap;
@@ -169,7 +169,7 @@ pub async fn run(
 
     let mut metrics_writer =
         config
-            .resolved_metrics_dir()
+            .resolved_logs_dir()
             .and_then(|dir| match MetricsWriter::open(&dir) {
                 Ok(w) => Some(w),
                 Err(e) => {

@@ -129,13 +129,22 @@ pub struct Config {
     #[arg(long)]
     pub ingest_timeout_secs: u64,
 
-    /// Folder where stream stats logs are saved
+    /// Save daemon logs and per-session stream stats to disk
     ///
-    /// Saves one compressed log file (.jsonl.gz) per stream session with once-per-second stats (viewer count, bitrate, latency, packet loss). Keeps the 20 most recent files.
+    /// Writes a plain-text .log file and a compressed .metrics.jsonl.gz stats file per run to logs_dir, keeping the 20 most recent of each. Set to false for stdout-only logging (e.g. under systemd).
     ///
-    /// Values: folder path (e.g. "C:/logs/tiwi" or "/var/log/tiwi"). Leave unset to use the OS local app data folder (tiwi/metrics).
-    #[arg(long, env = "TIWI_METRICS_DIR", value_name = "PATH")]
-    pub metrics_dir: Option<PathBuf>,
+    /// Values: true (enabled) or false (stdout-only).
+    #[default(true)]
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub logs: bool,
+
+    /// Folder where daemon logs and stream stats are saved
+    ///
+    /// Stores plain-text .log files and compressed .metrics.jsonl.gz stats (viewer count, bitrate, latency, packet loss) when logs = true.
+    ///
+    /// Values: folder path (e.g. "C:/logs/tiwi" or "/var/log/tiwi"). Leave unset or "" to use the OS local app data folder (tiwi/logs).
+    #[arg(long, env = "TIWI_LOGS_DIR", value_name = "PATH")]
+    pub logs_dir: Option<PathBuf>,
 
     #[arg(skip)]
     #[serde(skip)]
@@ -183,9 +192,16 @@ impl Config {
         };
         cfg.config_path = discovered;
 
-        // Normalize empty whip_token
+        // Normalize empty optional values
         if cfg.whip_token.as_deref().is_some_and(str::is_empty) {
             cfg.whip_token = None;
+        }
+        if cfg
+            .logs_dir
+            .as_deref()
+            .is_some_and(|p| p.as_os_str().is_empty())
+        {
+            cfg.logs_dir = None;
         }
 
         // 3. Resolve stream token
@@ -220,10 +236,13 @@ impl Config {
         format!("{base}#{}", self.token)
     }
 
-    pub fn resolved_metrics_dir(&self) -> Option<PathBuf> {
-        self.metrics_dir
+    pub fn resolved_logs_dir(&self) -> Option<PathBuf> {
+        if !self.logs {
+            return None;
+        }
+        self.logs_dir
             .clone()
-            .or_else(|| dirs::data_local_dir().map(|d| d.join("tiwi").join("metrics")))
+            .or_else(|| dirs::data_local_dir().map(|d| d.join("tiwi").join("logs")))
     }
 
     /// Generates a documented default `config.toml` directly from `Config` metadata and defaults.
@@ -353,6 +372,7 @@ mod tests {
         assert_eq!(cfg.max_uplink_mbps, expected.max_uplink_mbps);
         assert_eq!(cfg.rtx, expected.rtx);
         assert_eq!(cfg.ingest_timeout_secs, expected.ingest_timeout_secs);
-        assert_eq!(cfg.metrics_dir, expected.metrics_dir);
+        assert_eq!(cfg.logs, expected.logs);
+        assert_eq!(cfg.logs_dir, expected.logs_dir);
     }
 }

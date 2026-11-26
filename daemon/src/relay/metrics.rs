@@ -235,16 +235,18 @@ fn gzip_file(src: &Path, dst: &Path) -> io::Result<()> {
 }
 
 fn prune_old_metrics(dir: &Path, max_files: usize) {
+    prune_old_files(dir, max_files, |n| {
+        n.ends_with(".metrics.jsonl") || n.ends_with(".metrics.jsonl.gz")
+    });
+}
+
+pub(crate) fn prune_old_files(dir: &Path, max_files: usize, matches: impl Fn(&str) -> bool) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     let mut files: Vec<PathBuf> = entries
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.ends_with(".metrics.jsonl") || n.ends_with(".metrics.jsonl.gz"))
-        })
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(&matches))
         .collect();
     if files.len() <= max_files {
         return;
@@ -264,7 +266,7 @@ fn unix_ms(now: SystemTime) -> u64 {
 }
 
 /// Formats a UTC `SystemTime` as `YYYY-MM-DDTHH-MM-SSZ` (safe on Windows and Unix filenames).
-fn format_utc_filename_ts(now: SystemTime) -> String {
+pub(crate) fn format_utc_filename_ts(now: SystemTime) -> String {
     let secs = now
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())

@@ -4,15 +4,33 @@ mod relay;
 mod signal;
 mod whip;
 
+use std::fs::{self, File};
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::SystemTime;
 
 use clap::Parser;
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::cli::Cli;
 use crate::config::Config;
+
+const MAX_LOG_FILES: usize = 20;
+
+fn open_log_file(dir: &Path) -> std::io::Result<(PathBuf, File)> {
+    fs::create_dir_all(dir)?;
+    let ts = relay::metrics::format_utc_filename_ts(SystemTime::now());
+    let raw_path = dir.join(format!("{ts}.log"));
+    let path = std::path::absolute(&raw_path).unwrap_or(raw_path);
+    let file = File::create(&path)?;
+    relay::metrics::prune_old_files(dir, MAX_LOG_FILES, |n| n.ends_with(".log"));
+    Ok((path, file))
+}
 
 #[tokio::main]
 async fn main() {
@@ -21,25 +39,56 @@ async fn main() {
         print!("{}", Config::default_toml());
         return;
     }
-    let default_filter = if cli.verbose {
-        "tiwi=debug,str0m=info"
-    } else {
-        "tiwi=info"
-    };
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter)),
-        )
-        .with_target(false)
-        .init();
+    let verbose = cli.verbose;
 
     let cfg = match Config::load(cli) {
         Ok(c) => c,
         Err(e) => {
-            error!(err = %e, "Failed to load configuration");
+            eprintln!("Failed to load configuration: {e}");
             std::process::exit(1);
         }
     };
+
+    let default_filter = if verbose {
+        "tiwi=debug,str0m=info"
+    } else {
+        "tiwi=info"
+    };
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
+
+    let mut log_file_err = None;
+    let mut log_file_path = None;
+    let file_layer = cfg
+        .resolved_logs_dir()
+        .and_then(|dir| match open_log_file(&dir) {
+            Ok((path, file)) => {
+                log_file_path = Some(path);
+                Some(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_target(false)
+                        .with_writer(Mutex::new(file)),
+                )
+            }
+            Err(e) => {
+                log_file_err = Some((dir, e));
+                None
+            }
+        });
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(tracing_subscriber::fmt::layer().with_target(false))
+        .with(file_layer)
+        .init();
+
+    if let Some((dir, err)) = log_file_err {
+        warn!(dir = %dir.display(), err = %err, "Could not open log file");
+    }
+    if let Some(path) = &log_file_path {
+        info!(path = %path.display(), "Log file");
+    }
 
     if !cfg.bind.is_loopback() && cfg.whip_token.is_none() {
         warn!(
