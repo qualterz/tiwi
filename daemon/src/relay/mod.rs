@@ -54,7 +54,7 @@ struct IngestSession {
     next_timeout: Instant,
     video_mid: Option<Mid>,
     audio_mid: Option<Mid>,
-    video_codec: Option<Codec>,
+    video_spec: Option<(Codec, FormatParams)>,
     video_pt: Option<Pt>,
     audio_pt: Option<Pt>,
     video_ssrc: Option<Ssrc>,
@@ -97,7 +97,7 @@ enum ShardMsg {
     AddViewer {
         viewer_id: String,
         sdp: String,
-        video_codec: Option<Codec>,
+        video_spec: Option<(Codec, FormatParams)>,
         reply: oneshot::Sender<Result<String, String>>,
     },
     SetCongested(bool),
@@ -511,8 +511,8 @@ pub async fn run(
                 }
 
                 let codec = ing
-                    .video_codec
-                    .map(|c| c.to_string())
+                    .video_spec
+                    .map(|(c, _)| c.to_string())
                     .unwrap_or_else(|| "pending".to_string());
                 let snap = metrics.take_snapshot(
                     elapsed,
@@ -664,7 +664,7 @@ fn handle_whip_offer(
         next_timeout: now,
         video_mid: None,
         audio_mid: None,
-        video_codec: None,
+        video_spec: None,
         video_pt: None,
         audio_pt: None,
         video_ssrc: None,
@@ -750,7 +750,7 @@ fn dispatch_viewer_offer(
     let msg = ShardMsg::AddViewer {
         viewer_id: offer.viewer_id,
         sdp: offer.sdp,
-        video_codec: ing.video_codec,
+        video_spec: ing.video_spec,
         reply: offer.reply,
     };
 
@@ -807,7 +807,7 @@ fn drain_ingest(
                             if let Some(p) = param {
                                 ing.video_mid = Some(m.mid);
                                 ing.video_pt = Some(p.pt());
-                                ing.video_codec = Some(p.spec().codec);
+                                ing.video_spec = Some((p.spec().codec, p.spec().format));
                                 info!(
                                     session = %ing.id,
                                     codec = %p.spec().codec,
@@ -846,10 +846,10 @@ fn drain_ingest(
                     let is_video = match matched_param {
                         Some(p) => {
                             let v = p.spec().codec.kind() == MediaKind::Video;
-                            if v && ing.video_codec != Some(p.spec().codec) {
-                                let prev_codec = ing.video_codec;
+                            let next_spec = (p.spec().codec, p.spec().format);
+                            if v && ing.video_spec != Some(next_spec) {
                                 ing.video_pt = Some(p.pt());
-                                ing.video_codec = Some(p.spec().codec);
+                                ing.video_spec = Some(next_spec);
                                 info!(
                                     session = %ing.id,
                                     codec = %p.spec().codec,
@@ -857,7 +857,6 @@ fn drain_ingest(
                                     "Active ingest video codec detected"
                                 );
                                 // Any viewer negotiated against a stale/unknown codec must reconnect.
-                                let _ = prev_codec;
                                 for shard in shards {
                                     let _ = shard.tx.send(ShardMsg::ClearViewers);
                                 }
@@ -1299,22 +1298,23 @@ fn handle_shard_msg(
         ShardMsg::AddViewer {
             viewer_id,
             sdp,
-            video_codec,
+            video_spec,
             reply,
         } => {
-            // An idle shard sees no traffic, so its NAT pinhole may have expired; re-probe STUN
-            // before advertising the cached srflx candidate to a new viewer.
+            // An idle shard sees no traffic, so its NAT pinhole may have expired (or startup STUN
+            // may have failed); re-probe STUN before advertising the cached srflx candidate.
             if viewers.is_empty()
+                && bound.stun_target.is_some()
                 && bound
                     .last_stun_refresh
-                    .is_some_and(|t| t.elapsed() >= STUN_REFRESH_AGE)
+                    .is_none_or(|t| t.elapsed() >= STUN_REFRESH_AGE)
             {
                 refresh_srflx_on_idle(socket, bound, Duration::from_millis(800));
             }
             let res = build_viewer_session(
                 viewer_id.clone(),
                 sdp,
-                video_codec,
+                video_spec,
                 bound,
                 dtls_cert,
                 socket,
@@ -1402,7 +1402,7 @@ fn handle_shard_msg(
 fn build_viewer_session(
     viewer_id: String,
     sdp: String,
-    video_codec: Option<Codec>,
+    video_spec: Option<(Codec, FormatParams)>,
     bound: &BoundCandidates,
     dtls_cert: Option<&DtlsCert>,
     socket: &std::net::UdpSocket,
@@ -1419,7 +1419,7 @@ fn build_viewer_session(
         rtc_cfg = rtc_cfg.set_dtls_cert(cert.clone());
     }
 
-    if let Some(codec) = video_codec {
+    if let Some((codec, format)) = video_spec {
         rtc_cfg = rtc_cfg.clear_codecs().enable_opus(true, false);
         rtc_cfg = match codec {
             Codec::Av1 => {
@@ -1427,7 +1427,21 @@ fn build_viewer_session(
                 register_offer_av1_formats(rtc_cfg.codec_config(), &sdp);
                 rtc_cfg
             }
-            Codec::H264 => rtc_cfg.enable_h264(true),
+            Codec::H264 => {
+                if format != FormatParams::default() {
+                    rtc_cfg.codec_config().add_config(
+                        Pt::new_with_value(108),
+                        Some(Pt::new_with_value(109)),
+                        Codec::H264,
+                        Frequency::NINETY_KHZ,
+                        None,
+                        format,
+                    );
+                    rtc_cfg
+                } else {
+                    rtc_cfg.enable_h264(true)
+                }
+            }
             Codec::H265 => rtc_cfg.enable_h265(true),
             Codec::Vp8 => rtc_cfg.enable_vp8(true),
             Codec::Vp9 => rtc_cfg.enable_vp9(true),
@@ -1457,7 +1471,7 @@ fn build_viewer_session(
         .map_err(|e| format!("Failed to accept viewer offer: {e}"))?;
     let answer_sdp = answer.to_sdp_string();
 
-    if let Some(codec) = video_codec
+    if let Some((codec, _)) = video_spec
         && !answer_has_active_video(&answer_sdp)
     {
         warn!(
@@ -1881,7 +1895,7 @@ mod tests {
         let (viewer, answer) = build_viewer_session(
             "v-av1".to_string(),
             offer,
-            Some(Codec::Av1),
+            Some((Codec::Av1, FormatParams::default())),
             &bound,
             None,
             &sock,
@@ -1895,6 +1909,79 @@ mod tests {
         );
         assert!(answer.contains("a=candidate:"));
         assert!(answer_has_active_video(&answer));
+    }
+
+    #[test]
+    fn h264_fmtp_profile_and_packetization_mode_are_forwarded() {
+        let (sock, bound) = test_bound_and_socket();
+        let counters = ShardCounters::new();
+        let high_pm1 = FormatParams {
+            level_asymmetry_allowed: Some(true),
+            packetization_mode: Some(1),
+            profile_level_id: Some(0x64001f),
+            ..Default::default()
+        };
+
+        // Viewer offers Baseline (96) first and High pm=1 (102) second; must pick High pm=1.
+        let dual_offer = sample_firefox_offer(
+            "m=video 9 UDP/TLS/RTP/SAVPF 96 102\r\n\
+             c=IN IP4 0.0.0.0\r\n\
+             a=recvonly\r\n\
+             a=ice-ufrag:testufrag\r\n\
+             a=ice-pwd:testpassword123456789012\r\n\
+             a=mid:0\r\n\
+             a=rtcp-mux\r\n\
+             a=setup:actpass\r\n\
+             a=rtpmap:96 H264/90000\r\n\
+             a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f\r\n\
+             a=rtpmap:102 H264/90000\r\n\
+             a=fmtp:102 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=64001f\r\n",
+        );
+
+        let (viewer, answer) = build_viewer_session(
+            "v-h264-high".to_string(),
+            dual_offer,
+            Some((Codec::H264, high_pm1)),
+            &bound,
+            None,
+            &sock,
+            &counters,
+        )
+        .expect("viewer offering matching H264 High pm=1 should negotiate");
+
+        let negotiated = negotiated_param(&viewer.rtc, Mid::from("0")).expect("negotiated H264");
+        assert_eq!(negotiated.spec().codec, Codec::H264);
+        assert_eq!(negotiated.spec().format.profile_level_id, Some(0x64001f));
+        assert_eq!(negotiated.spec().format.packetization_mode, Some(1));
+        assert!(answer.contains("profile-level-id=64001f"));
+        assert!(!answer.contains("profile-level-id=42001f"));
+
+        // Viewer offering only Baseline (42001f) must be rejected when ingest is High (64001f).
+        let baseline_only = sample_firefox_offer(
+            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+             c=IN IP4 0.0.0.0\r\n\
+             a=recvonly\r\n\
+             a=ice-ufrag:testufrag\r\n\
+             a=ice-pwd:testpassword123456789012\r\n\
+             a=mid:0\r\n\
+             a=rtcp-mux\r\n\
+             a=setup:actpass\r\n\
+             a=rtpmap:96 H264/90000\r\n\
+             a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f\r\n",
+        );
+
+        let err = build_viewer_session(
+            "v-h264-mismatch".to_string(),
+            baseline_only,
+            Some((Codec::H264, high_pm1)),
+            &bound,
+            None,
+            &sock,
+            &counters,
+        )
+        .err()
+        .expect("viewer with mismatched H264 profile should be rejected");
+        assert!(err.contains("Unsupported video codec"));
     }
 
     #[test]
@@ -1916,7 +2003,7 @@ mod tests {
         let err = build_viewer_session(
             "v-h265".to_string(),
             offer,
-            Some(Codec::H265),
+            Some((Codec::H265, FormatParams::default())),
             &bound,
             None,
             &sock,
@@ -1949,7 +2036,7 @@ mod tests {
         let (viewer, _) = build_viewer_session(
             "v-ice".to_string(),
             offer,
-            Some(Codec::Vp8),
+            Some((Codec::Vp8, FormatParams::default())),
             &bound,
             None,
             &sock,
@@ -1985,7 +2072,7 @@ mod tests {
         let (mut viewer, _) = build_viewer_session(
             "v-dead".to_string(),
             offer,
-            Some(Codec::Vp8),
+            Some((Codec::Vp8, FormatParams::default())),
             &bound,
             None,
             &sock,

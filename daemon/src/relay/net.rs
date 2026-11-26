@@ -329,6 +329,7 @@ pub fn refresh_srflx_on_idle(
     let Some(tx_id) = send_stun_binding_request(socket, stun_target) else {
         return;
     };
+    bound.last_stun_refresh = Some(Instant::now());
 
     let mut buf = [0u8; 512];
     let deadline = Instant::now() + timeout;

@@ -47,6 +47,23 @@ async fn main() {
     if let Some(path) = &cfg.config_path {
         info!(config = %path.display(), "Loaded configuration");
     }
+
+    let bind_addr = SocketAddr::new(cfg.bind, cfg.port);
+    let listener = match tokio::net::TcpListener::bind(bind_addr).await {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            error!(
+                "Port {} is already in use. Is another tiwi instance running? (Use --port <port> to pick another)",
+                cfg.port
+            );
+            std::process::exit(1);
+        }
+        Err(e) => {
+            error!(addr = %bind_addr, err = %e, "Failed to bind WHIP HTTP listener");
+            std::process::exit(1);
+        }
+    };
+
     info!(
         whip = %format!("http://{}:{}/whip", cfg.bind, cfg.port),
         auth = cfg.whip_token.is_some(),
@@ -89,17 +106,6 @@ async fn main() {
 
     // Control-plane WHIP HTTP server.
     let app = whip::router(whip_tx, cfg.whip_token.clone());
-    let bind_addr = SocketAddr::new(cfg.bind, cfg.port);
-    let listener = match tokio::net::TcpListener::bind(bind_addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            error!(addr = %bind_addr, err = %e, "Failed to bind WHIP HTTP listener");
-            let _ = shutdown_tx.send(true);
-            let _ = media_handle.join();
-            let _ = signal_task.await;
-            std::process::exit(1);
-        }
-    };
 
     let mut http_shutdown = shutdown_rx.clone();
     let server = axum::serve(listener, app).with_graceful_shutdown(async move {
