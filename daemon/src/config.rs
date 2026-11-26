@@ -15,136 +15,133 @@ use crate::cli::Cli;
 
 #[derive(ClapSerde, Serialize, Debug, Clone)]
 pub struct Config {
-    /// HTTP bind address for WHIP ingest
+    /// Stream token for the watch link
     ///
-    /// Local network interface the WHIP server listens on (http://<bind>:<port>/whip).
+    /// This shared secret identifies your stream and encrypts signaling. Passing --token or TIWI_TOKEN overrides it for one run without changing config.toml.
+    ///
+    /// Values: non-empty URL-safe string. Leave empty ("") to generate and save a random token on first run.
+    #[arg(long, env = "TIWI_TOKEN", help_heading = "Stream")]
+    pub token: String,
+
+    /// Optional Bearer token for WHIP ingest
+    ///
+    /// When set, broadcasters must send "Authorization: Bearer <token>" on WHIP POST and DELETE requests. Set this if bind is not a loopback address.
+    ///
+    /// Values: non-empty string. Leave unset to allow unauthenticated WHIP ingest.
+    #[arg(
+        long,
+        env = "TIWI_WHIP_TOKEN",
+        value_name = "TOKEN",
+        help_heading = "Stream"
+    )]
+    pub whip_token: Option<String>,
+
+    /// Local IP address for WHIP ingest
+    ///
+    /// Network interface where the WHIP server listens (http://<bind>:<port>/whip).
     ///
     /// Values: IPv4 or IPv6 address (e.g. "127.0.0.1" for local-only, "0.0.0.0" for all interfaces, "::1").
     #[default(IpAddr::V4(Ipv4Addr::LOCALHOST))]
-    #[arg(long, env = "TIWI_BIND")]
+    #[arg(long, env = "TIWI_BIND", help_heading = "Networking")]
     pub bind: IpAddr,
 
     /// HTTP port for WHIP ingest
     ///
-    /// TCP port for OBS or other WHIP broadcasters to push streams to (http://<bind>:<port>/whip).
+    /// TCP port where OBS or other WHIP broadcasters push streams (http://<bind>:<port>/whip).
     ///
     /// Values: 1-65535.
     #[default(2000)]
-    #[arg(short, long, env = "TIWI_PORT")]
+    #[arg(short, long, env = "TIWI_PORT", help_heading = "Networking")]
     pub port: u16,
+
+    /// Static public IP for WebRTC ICE candidates
+    ///
+    /// Set this if you run behind a static IP or port-forwarded router. When set, tiwi skips STUN discovery.
+    ///
+    /// Values: IPv4 or IPv6 address (e.g. "203.0.113.10"). Leave unset to find your public IP via stun_server.
+    #[arg(
+        long,
+        env = "TIWI_PUBLIC_IP",
+        value_name = "IP",
+        help_heading = "Networking"
+    )]
+    pub public_ip: Option<IpAddr>,
 
     /// Base fixed UDP port for WebRTC media
     ///
-    /// Set a fixed port when forwarding UDP through a firewall or NAT. Binds media_port for ingest and media_port + 1..=shards for viewers.
+    /// If you forward UDP ports through a firewall or NAT, set a fixed port. tiwi binds media_port for ingest and media_port + 1..=shards for viewers.
     ///
-    /// Values: 0 (OS-assigned ephemeral ports) or 1-65535.
+    /// Values: 0 (OS-assigned ports) or 1-65535.
     #[default(0)]
-    #[arg(long, env = "TIWI_MEDIA_PORT")]
+    #[arg(long, env = "TIWI_MEDIA_PORT", help_heading = "Networking")]
     pub media_port: u16,
-
-    /// Static public IP advertised in WebRTC ICE candidates
-    ///
-    /// Use when running behind a known static IP or port-forwarded router; skips STUN discovery when set.
-    ///
-    /// Values: IPv4 or IPv6 address (e.g. "203.0.113.10"). Leave unset to auto-discover via stun_server.
-    #[arg(long, env = "TIWI_PUBLIC_IP", value_name = "IP")]
-    pub public_ip: Option<IpAddr>,
-
-    /// STUN server used for public IP discovery
-    ///
-    /// Queried to discover your external IP for WebRTC ICE candidates. Ignored when public_ip is set.
-    ///
-    /// Values: "host:port" (e.g. "stun.l.google.com:19302", "stun.cloudflare.com:3478").
-    #[default("stun.l.google.com:19302".to_string())]
-    #[arg(long)]
-    pub stun_server: String,
-
-    /// MQTT over WebSocket broker URL for viewer signaling
-    ///
-    /// Public or self-hosted MQTT broker used to exchange encrypted WebRTC SDP offers/answers with viewers.
-    ///
-    /// Values: "ws://..." or "wss://..." URL.
-    #[default("wss://broker.emqx.io:8084/mqtt".to_string())]
-    #[arg(long, env = "TIWI_MQTT_URL")]
-    pub mqtt_url: String,
-
-    /// Base viewer URL used for the shareable watch link
-    ///
-    /// Printed at startup as "<viewer_url>#<token>". Point this to your own hosted viewer if self-hosting.
-    ///
-    /// Values: "http://..." or "https://..." URL.
-    #[default("https://qualterz.github.io/tiwi/".to_string())]
-    #[arg(long)]
-    pub viewer_url: String,
-
-    /// Stream token used in the shareable watch link
-    ///
-    /// Shared secret identifying your stream and encrypting signaling. Passing --token or TIWI_TOKEN overrides for one session without editing config.toml.
-    ///
-    /// Values: non-empty URL-safe string. Leave empty ("") to auto-generate and save a random token on first run.
-    #[arg(long, env = "TIWI_TOKEN")]
-    pub token: String,
-
-    /// Optional Bearer token required for WHIP ingest requests
-    ///
-    /// When set, broadcasters must send "Authorization: Bearer <token>" on WHIP POST/DELETE requests. Recommended if bind is not loopback.
-    ///
-    /// Values: non-empty string. Leave unset to allow unauthenticated WHIP ingest.
-    #[arg(long, env = "TIWI_WHIP_TOKEN", value_name = "TOKEN")]
-    pub whip_token: Option<String>,
 
     /// Maximum simultaneous viewers
     ///
-    /// Rejects new viewer connections once this many viewers are connected.
+    /// tiwi rejects new viewers once the connected count reaches this limit.
     ///
     /// Values: 0 (unlimited) or positive integer (e.g. 10).
     #[default(0)]
-    #[arg(long)]
+    #[arg(long, help_heading = "Relay & Limits")]
     pub max_peers: usize,
 
-    /// Maximum total viewer egress bitrate in Mbps
+    /// Maximum total viewer upload bitrate in Mbps
     ///
-    /// Caps combined outbound bandwidth across all viewers to avoid saturating your upload link.
+    /// Caps total upload bandwidth across all viewers so the stream does not saturate your upload link.
     ///
     /// Values: 0.0 (unlimited) or positive float in Mbps (e.g. 25.0).
     #[default(0.0)]
-    #[arg(long, alias = "max-uplink")]
+    #[arg(long, alias = "max-uplink", help_heading = "Relay & Limits")]
     pub max_uplink_mbps: f64,
 
-    /// RTP retransmission (NACK/RTX) for video
+    /// Save daemon logs and stream stats to disk
     ///
-    /// Resends lost video packets requested by viewers; disable to reduce latency and bandwidth overhead on poor links.
-    ///
-    /// Values: true (enabled) or false (disabled).
-    #[default(true)]
-    #[arg(long, action = clap::ArgAction::Set)]
-    pub rtx: bool,
-
-    /// Ingest media silence timeout in seconds
-    ///
-    /// Closes the active WHIP session if no media packets arrive from the broadcaster for this long.
-    ///
-    /// Values: 0 (disabled) or positive integer in seconds (e.g. 15).
-    #[default(15)]
-    #[arg(long)]
-    pub ingest_timeout_secs: u64,
-
-    /// Save daemon logs and per-session stream stats to disk
-    ///
-    /// Writes a plain-text .log file and a compressed .metrics.jsonl.gz stats file per run to logs_dir, keeping the 20 most recent of each. Set to false for stdout-only logging (e.g. under systemd).
+    /// Each run writes a plain-text .log file and a compressed .metrics.jsonl.gz stats file to logs_dir. tiwi keeps the 20 newest files of each type. Set false to log to stdout only (e.g. under systemd).
     ///
     /// Values: true (enabled) or false (stdout-only).
     #[default(true)]
-    #[arg(long, action = clap::ArgAction::Set)]
+    #[arg(long, action = clap::ArgAction::Set, help_heading = "Logging")]
     pub logs: bool,
 
     /// Folder where daemon logs and stream stats are saved
     ///
-    /// Stores plain-text .log files and compressed .metrics.jsonl.gz stats (viewer count, bitrate, latency, packet loss) when logs = true.
+    /// When logs is true, tiwi writes .log files and .metrics.jsonl.gz stats (viewer count, bitrate, latency, packet loss) here.
     ///
     /// Values: folder path (e.g. "C:/logs/tiwi" or "/var/log/tiwi"). Leave unset or "" to use the OS local app data folder (tiwi/logs).
-    #[arg(long, env = "TIWI_LOGS_DIR", value_name = "PATH")]
+    #[arg(
+        long,
+        env = "TIWI_LOGS_DIR",
+        value_name = "PATH",
+        help_heading = "Logging"
+    )]
     pub logs_dir: Option<PathBuf>,
+
+    /// Base viewer URL for the watch link
+    ///
+    /// tiwi prints "<viewer_url>#<token>" at startup. If you host your own viewer, set its URL here.
+    ///
+    /// Values: "http://..." or "https://..." URL.
+    #[default("https://qualterz.github.io/tiwi/".to_string())]
+    #[arg(long, help_heading = "Infrastructure")]
+    pub viewer_url: String,
+
+    /// MQTT over WebSocket broker URL for viewer signaling
+    ///
+    /// tiwi uses this MQTT broker to exchange encrypted WebRTC SDP offers and answers with viewers.
+    ///
+    /// Values: "ws://..." or "wss://..." URL.
+    #[default("wss://broker.emqx.io:8084/mqtt".to_string())]
+    #[arg(long, env = "TIWI_MQTT_URL", help_heading = "Infrastructure")]
+    pub mqtt_url: String,
+
+    /// STUN server for public IP discovery
+    ///
+    /// tiwi queries this server to find your public IP for WebRTC ICE candidates. If you set public_ip, tiwi ignores this setting.
+    ///
+    /// Values: "host:port" (e.g. "stun.l.google.com:19302", "stun.cloudflare.com:3478").
+    #[default("stun.l.google.com:19302".to_string())]
+    #[arg(long, help_heading = "Infrastructure")]
+    pub stun_server: String,
 
     #[arg(skip)]
     #[serde(skip)]
@@ -207,7 +204,7 @@ impl Config {
         // 3. Resolve stream token
         if let Some(token) = cli_token {
             cfg.token = token;
-        } else if cli.new_token || cfg.token.is_empty() {
+        } else if cli.regenerate_token || cfg.token.is_empty() {
             let new_token = generate_token();
             let save_path = cfg
                 .config_path
@@ -263,10 +260,19 @@ impl Config {
              #   3. User config directory (e.g. %APPDATA%\\tiwi\\config.toml, ~/.config/tiwi/config.toml)\n\
              #\n\
              # Precedence: defaults < config.toml < CLI flags / environment variables.\n\
-             # Optional settings are commented out; uncomment a line to enable them.\n",
+             # Optional settings are commented out. Uncomment a line to enable one.\n",
         );
 
+        let mut current_heading: Option<&str> = None;
         for arg in cmd.get_arguments() {
+            let heading = arg.get_help_heading();
+            if heading != current_heading {
+                current_heading = heading;
+                if let Some(h) = heading {
+                    let _ = write!(out, "\n# --- {h} ---\n");
+                }
+            }
+
             let key = arg.get_id().as_str();
             out.push('\n');
 
@@ -370,8 +376,6 @@ mod tests {
         assert_eq!(cfg.whip_token, expected.whip_token);
         assert_eq!(cfg.max_peers, expected.max_peers);
         assert_eq!(cfg.max_uplink_mbps, expected.max_uplink_mbps);
-        assert_eq!(cfg.rtx, expected.rtx);
-        assert_eq!(cfg.ingest_timeout_secs, expected.ingest_timeout_secs);
         assert_eq!(cfg.logs, expected.logs);
         assert_eq!(cfg.logs_dir, expected.logs_dir);
     }

@@ -33,8 +33,8 @@ use crate::signal::{SignalEvent, ViewerOffer};
 use crate::whip::{WhipAccepted, WhipCommand, WhipError};
 
 const VIEWER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
-const PLI_COOLDOWN_RTX: Duration = Duration::from_secs(1);
-const PLI_COOLDOWN_NO_RTX: Duration = Duration::from_millis(500);
+const INGEST_SILENCE_TIMEOUT: Duration = Duration::from_secs(15);
+const PLI_COOLDOWN: Duration = Duration::from_secs(1);
 const PLI_CONNECT_RETRY: Duration = Duration::from_millis(500);
 const STUN_REFRESH_AGE: Duration = Duration::from_secs(20);
 const METRICS_INTERVAL: Duration = Duration::from_secs(1);
@@ -231,11 +231,7 @@ pub async fn run(
     let mut udp_buf = vec![0u8; 2048];
     let mut next_session_seq: u64 = 1;
     let mut pli_retry_at: Option<Instant> = None;
-    let pli_cooldown = if config.rtx {
-        PLI_COOLDOWN_RTX
-    } else {
-        PLI_COOLDOWN_NO_RTX
-    };
+    let pli_cooldown = PLI_COOLDOWN;
 
     loop {
         let now = Instant::now();
@@ -441,13 +437,12 @@ pub async fn run(
                 }
                 if !ing.rtc.is_alive() {
                     ingest_dead = true;
-                } else if config.ingest_timeout_secs > 0
-                    && let Some(last) = ing.last_media_at
-                    && now.duration_since(last) >= Duration::from_secs(config.ingest_timeout_secs)
+                } else if let Some(last) = ing.last_media_at
+                    && now.duration_since(last) >= INGEST_SILENCE_TIMEOUT
                 {
                     warn!(
                         session = %ing.id,
-                        timeout_secs = config.ingest_timeout_secs,
+                        timeout_secs = INGEST_SILENCE_TIMEOUT.as_secs(),
                         "WHIP ingest media silence timeout"
                     );
                     ingest_dead = true;

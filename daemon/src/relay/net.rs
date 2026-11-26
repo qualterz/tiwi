@@ -169,7 +169,7 @@ pub async fn gather_all_candidates(
     };
 
     let public_ip = config.public_ip;
-    let rtx_enabled = config.rtx;
+    let rtx_enabled = true;
     let stun_label = config.stun_server.clone();
     let count = sockets.len();
 
