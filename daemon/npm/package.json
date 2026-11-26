@@ -1,0 +1,20 @@
+{
+  "name": "@qualterz/tiwi",
+  "description": "Zero-infrastructure peer-to-peer live streaming daemon",
+  "type": "module",
+  "bin": {
+    "tiwi": "bin/tiwi.js"
+  },
+  "files": [
+    "bin"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/qualterz/tiwi.git",
+    "directory": "daemon/npm"
+  },
+  "homepage": "https://github.com/qualterz/tiwi"
+}

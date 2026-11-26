@@ -33,3 +33,7 @@ str0m = { version = "0.26", default-features = false, features = ["wincrypto"] }
 
 [target.'cfg(not(windows))'.dependencies]
 str0m = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
+
+[profile.release]
+strip = true
+lto = "thin"
