@@ -163,9 +163,8 @@ pub struct MetricsWriter {
 }
 
 impl MetricsWriter {
-    pub fn open(dir: &Path) -> io::Result<Self> {
+    pub fn open(dir: &Path, ts: &str) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
-        let ts = format_utc_filename_ts(SystemTime::now());
         let raw_path = dir.join(format!("{ts}.metrics.jsonl"));
         let path = std::path::absolute(&raw_path).unwrap_or(raw_path);
         let file = File::create(&path)?;

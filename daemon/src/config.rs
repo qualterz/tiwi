@@ -177,7 +177,7 @@ impl Config {
         // Take CLI token before merging so it stays session-only and never touches disk.
         let cli_token = cli.opts.token.take().filter(|t| !t.is_empty());
 
-        // 2. Layer precedence: defaults <- config.toml <- CLI / env
+        // 2. Layer precedence: defaults < config.toml < env < CLI
         let mut cfg = if let Some(ref path) = discovered {
             let raw = fs::read_to_string(path)
                 .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
@@ -259,7 +259,7 @@ impl Config {
              #   2. config.toml next to the tiwi executable (portable mode)\n\
              #   3. User config directory (e.g. %APPDATA%\\tiwi\\config.toml, ~/.config/tiwi/config.toml)\n\
              #\n\
-             # Precedence: defaults < config.toml < CLI flags / environment variables.\n\
+             # Precedence: defaults < config.toml < environment variables < CLI flags.\n\
              # Optional settings are commented out. Uncomment a line to enable one.\n",
         );
 

@@ -113,6 +113,7 @@ struct ShardHandle {
 
 pub async fn run(
     config: Config,
+    mut metrics_writer: Option<MetricsWriter>,
     mut whip_rx: mpsc::Receiver<WhipCommand>,
     mut offer_rx: mpsc::Receiver<ViewerOffer>,
     signal_tx: mpsc::Sender<SignalEvent>,
@@ -166,17 +167,6 @@ pub async fn run(
         .await
         .into_iter();
     let (socket, ingest_bound) = gathered.next().expect("ingest socket");
-
-    let mut metrics_writer =
-        config
-            .resolved_logs_dir()
-            .and_then(|dir| match MetricsWriter::open(&dir) {
-                Ok(w) => Some(w),
-                Err(e) => {
-                    warn!(dir = %dir.display(), err = %e, "Could not open metrics file");
-                    None
-                }
-            });
 
     let dtls_cert = str0m_crypto::from_feature_flags()
         .dtls_provider

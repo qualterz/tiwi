@@ -22,9 +22,8 @@ use crate::config::Config;
 
 const MAX_LOG_FILES: usize = 20;
 
-fn open_log_file(dir: &Path) -> std::io::Result<(PathBuf, File)> {
+fn open_log_file(dir: &Path, ts: &str) -> std::io::Result<(PathBuf, File)> {
     fs::create_dir_all(dir)?;
-    let ts = relay::metrics::format_utc_filename_ts(SystemTime::now());
     let raw_path = dir.join(format!("{ts}.log"));
     let path = std::path::absolute(&raw_path).unwrap_or(raw_path);
     let file = File::create(&path)?;
@@ -57,11 +56,13 @@ async fn main() {
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
 
+    let run_ts = relay::metrics::format_utc_filename_ts(SystemTime::now());
+    let logs_dir = cfg.resolved_logs_dir();
     let mut log_file_err = None;
     let mut log_file_path = None;
-    let file_layer = cfg
-        .resolved_logs_dir()
-        .and_then(|dir| match open_log_file(&dir) {
+    let file_layer = logs_dir
+        .as_deref()
+        .and_then(|dir| match open_log_file(dir, &run_ts) {
             Ok((path, file)) => {
                 log_file_path = Some(path);
                 Some(
@@ -72,7 +73,7 @@ async fn main() {
                 )
             }
             Err(e) => {
-                log_file_err = Some((dir, e));
+                log_file_err = Some((dir.to_path_buf(), e));
                 None
             }
         });
@@ -83,6 +84,9 @@ async fn main() {
         .with(file_layer)
         .init();
 
+    if let Some(path) = &cfg.config_path {
+        info!(config = %path.display(), "Loaded configuration");
+    }
     if let Some((dir, err)) = log_file_err {
         warn!(dir = %dir.display(), err = %err, "Could not open log file");
     }
@@ -95,10 +99,6 @@ async fn main() {
             bind = %cfg.bind,
             "WHIP endpoint is exposed on a non-loopback address without whip_token; set whip_token in config.toml or --whip-token to protect ingest"
         );
-    }
-
-    if let Some(path) = &cfg.config_path {
-        info!(config = %path.display(), "Loaded configuration");
     }
 
     let bind_addr = SocketAddr::new(cfg.bind, cfg.port);
@@ -116,6 +116,16 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    let metrics_writer = logs_dir.as_deref().and_then(|dir| {
+        match relay::metrics::MetricsWriter::open(dir, &run_ts) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                warn!(dir = %dir.display(), err = %e, "Could not open metrics file");
+                None
+            }
+        }
+    });
 
     info!(
         whip = %format!("http://{}:{}/whip", cfg.bind, cfg.port),
@@ -141,6 +151,7 @@ async fn main() {
                 .expect("failed to build media runtime");
             rt.block_on(relay::run(
                 media_cfg,
+                metrics_writer,
                 whip_rx,
                 offer_rx,
                 signal_tx,
