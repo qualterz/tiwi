@@ -381,7 +381,9 @@ impl ShardCounters {
         let rtt = (rtt_us > 0).then(|| Duration::from_micros(rtt_us));
         let rtt_delta = (rtt_us > 0).then(|| Duration::from_micros(delta_us));
         let loss = (connected > 0).then(|| loss_bps as f32 / 10_000.0);
-        (bytes, pkts, drops, rtt, rtt_delta, loss, connected, congested)
+        (
+            bytes, pkts, drops, rtt, rtt_delta, loss, connected, congested,
+        )
     }
 
     pub fn reset(&self) {
@@ -471,8 +473,7 @@ impl RelayMetrics {
         connected_viewers: usize,
         congested_viewers: usize,
     ) -> Option<bool> {
-        let is_congested_now =
-            connected_viewers >= 2 && congested_viewers * 2 > connected_viewers;
+        let is_congested_now = connected_viewers >= 2 && congested_viewers * 2 > connected_viewers;
 
         if is_congested_now {
             self.clean_since = None;

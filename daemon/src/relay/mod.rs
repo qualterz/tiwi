@@ -162,18 +162,21 @@ pub async fn run(
         }
     }
 
-    let mut gathered = gather_all_candidates(all_sockets, &config).await.into_iter();
+    let mut gathered = gather_all_candidates(all_sockets, &config)
+        .await
+        .into_iter();
     let (socket, ingest_bound) = gathered.next().expect("ingest socket");
 
-    let mut metrics_writer = config.resolved_metrics_dir().and_then(|dir| {
-        match MetricsWriter::open(&dir) {
-            Ok(w) => Some(w),
-            Err(e) => {
-                warn!(dir = %dir.display(), err = %e, "Could not open metrics file");
-                None
-            }
-        }
-    });
+    let mut metrics_writer =
+        config
+            .resolved_metrics_dir()
+            .and_then(|dir| match MetricsWriter::open(&dir) {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    warn!(dir = %dir.display(), err = %e, "Could not open metrics file");
+                    None
+                }
+            });
 
     let dtls_cert = str0m_crypto::from_feature_flags()
         .dtls_provider
@@ -1636,9 +1639,11 @@ fn drain_viewer(
                     want_pli = true;
                 }
                 Event::PeerStats(stats) => {
-                    v.last_rtt = stats
-                        .rtt
-                        .or_else(|| stats.selected_candidate_pair.and_then(|p| p.current_round_trip_time));
+                    v.last_rtt = stats.rtt.or_else(|| {
+                        stats
+                            .selected_candidate_pair
+                            .and_then(|p| p.current_round_trip_time)
+                    });
                     v.last_loss = stats.egress_loss_fraction;
                     if let Some(r) = v.last_rtt {
                         v.min_rtt = Some(v.min_rtt.map_or(r, |m| m.min(r)));
@@ -1695,7 +1700,9 @@ fn sync_shard_stats(viewers: &HashMap<String, ViewerSession>, counters: &ShardCo
     let congested = live()
         .filter(|v| is_viewer_congested(v.last_rtt, v.min_rtt, v.last_loss))
         .count();
-    counters.connected_viewers.store(connected, Ordering::Relaxed);
+    counters
+        .connected_viewers
+        .store(connected, Ordering::Relaxed);
     counters.set_peer_stats(max_rtt, max_rtt_delta, max_loss, congested);
 }
 
@@ -1772,7 +1779,11 @@ fn register_offer_av1_formats(cfg: &mut CodecConfig, sdp: &str) {
     }
 
     for (profile, level_idx, tier) in fmtps {
-        let norm = (profile.unwrap_or(0), level_idx.unwrap_or(5), tier.unwrap_or(0));
+        let norm = (
+            profile.unwrap_or(0),
+            level_idx.unwrap_or(5),
+            tier.unwrap_or(0),
+        );
         let already_exists = cfg.params().iter().any(|p| {
             let s = p.spec();
             s.codec == Codec::Av1
@@ -2119,7 +2130,10 @@ mod tests {
             &pli_tx,
         );
 
-        assert!(viewers.is_empty(), "closed viewer must be reaped immediately");
+        assert!(
+            viewers.is_empty(),
+            "closed viewer must be reaped immediately"
+        );
         assert_eq!(counters.viewers.load(Ordering::Relaxed), 0);
         assert_eq!(counters.connected_viewers.load(Ordering::Relaxed), 0);
         assert_eq!(

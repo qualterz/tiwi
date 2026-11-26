@@ -10,8 +10,7 @@ use tracing::warn;
 
 use crate::cli::Cli;
 
-#[derive(ClapSerde)]
-#[derive(Debug, Clone)]
+#[derive(ClapSerde, Debug, Clone)]
 pub struct Config {
     /// HTTP bind address for WHIP ingest
     #[default(IpAddr::V4(Ipv4Addr::LOCALHOST))]

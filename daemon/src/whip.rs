@@ -125,14 +125,19 @@ async fn handle_offer(
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("application/sdp"),
             );
-            if let Ok(loc) = HeaderValue::from_str(&format!("/whip/session/{}", accepted.session_id))
+            if let Ok(loc) =
+                HeaderValue::from_str(&format!("/whip/session/{}", accepted.session_id))
             {
                 resp_headers.insert(header::LOCATION, loc);
             }
             (StatusCode::CREATED, resp_headers, accepted.answer_sdp).into_response()
         }
         Ok(Err(WhipError::BadRequest(msg))) => (StatusCode::BAD_REQUEST, msg).into_response(),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Media engine dropped reply").into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Media engine dropped reply",
+        )
+            .into_response(),
     }
 }
 
@@ -161,6 +166,10 @@ async fn handle_delete(
     match reply_rx.await {
         Ok(true) => (StatusCode::OK, cors_headers()).into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "Session not found").into_response(),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Media engine dropped reply").into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Media engine dropped reply",
+        )
+            .into_response(),
     }
 }

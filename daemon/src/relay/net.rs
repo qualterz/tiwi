@@ -263,8 +263,7 @@ pub async fn gather_all_candidates(
         });
     }
 
-    let mut ordered: Vec<Option<(UdpSocket, BoundCandidates)>> =
-        (0..count).map(|_| None).collect();
+    let mut ordered: Vec<Option<(UdpSocket, BoundCandidates)>> = (0..count).map(|_| None).collect();
     while let Some(res) = set.join_next().await {
         if let Ok((idx, socket, info)) = res {
             ordered[idx] = Some((socket, info));
