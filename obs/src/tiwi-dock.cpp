@@ -888,18 +888,18 @@ void TiwiDock::showFirstRunDialog() {
     QWidget *parent = static_cast<QWidget *>(obs_frontend_get_main_window());
     QMessageBox box(parent ? parent : this);
     box.setIcon(QMessageBox::Question);
-    box.setWindowTitle("Tiwi Setup");
-    box.setText("Configure OBS streaming settings for Tiwi?");
+    box.setWindowTitle("Tiwi setup");
+    box.setText("Update OBS streaming settings for Tiwi?");
     box.setInformativeText(
         QString(
             "Tiwi uses your OBS streaming settings (Settings -> Output -> Streaming).\n\n"
-            "Would you like to update your current OBS profile to recommended defaults (%1, 4000 kbps CBR, low latency)?\n\n"
-            "You can adjust these anytime in OBS Settings -> Output."
+            "This updates your current OBS profile to %1, 4000 kbps CBR, and low latency.\n\n"
+            "You can change these settings at any time in OBS Settings -> Output."
         )
             .arg(rec.displayName)
     );
-    QPushButton *applyBtn = box.addButton("Apply Recommended Defaults", QMessageBox::AcceptRole);
-    QPushButton *keepBtn = box.addButton("Keep Current Settings", QMessageBox::RejectRole);
+    QPushButton *applyBtn = box.addButton("Apply recommended defaults", QMessageBox::AcceptRole);
+    QPushButton *keepBtn = box.addButton("Keep current settings", QMessageBox::RejectRole);
     box.setDefaultButton(applyBtn);
     box.setEscapeButton(keepBtn);
     box.exec();
