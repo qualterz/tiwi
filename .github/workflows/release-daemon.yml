@@ -114,33 +114,28 @@ jobs:
           cargo test --manifest-path daemon/Cargo.toml
           cargo test --manifest-path obs/rust/Cargo.toml
 
-      - name: Build daemon (Windows / Linux)
-        if: runner.os != 'macOS'
+      - name: Build daemon
         shell: bash
         run: |
-          cargo build --manifest-path daemon/Cargo.toml --release
           mkdir -p dist/bin
           if [ "${{ runner.os }}" = "Windows" ]; then
+            cargo build --manifest-path daemon/Cargo.toml --release
             ./target/release/tiwi.exe --version
             ./target/release/tiwi.exe --help
             cp target/release/tiwi.exe dist/bin/tiwi-windows-x64.exe
-          else
+          elif [ "${{ runner.os }}" = "Linux" ]; then
+            cargo build --manifest-path daemon/Cargo.toml --release
             ./target/release/tiwi --version
             ./target/release/tiwi --help
             cp target/release/tiwi dist/bin/tiwi-linux-x64
+          else
+            cargo build --manifest-path daemon/Cargo.toml --release --target aarch64-apple-darwin
+            cargo build --manifest-path daemon/Cargo.toml --release --target x86_64-apple-darwin
+            ./target/aarch64-apple-darwin/release/tiwi --version
+            ./target/aarch64-apple-darwin/release/tiwi --help
+            cp target/aarch64-apple-darwin/release/tiwi dist/bin/tiwi-macos-arm64
+            cp target/x86_64-apple-darwin/release/tiwi dist/bin/tiwi-macos-x64
           fi
-
-      - name: Build daemon (macOS arm64 & x64)
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          cargo build --manifest-path daemon/Cargo.toml --release --target aarch64-apple-darwin
-          cargo build --manifest-path daemon/Cargo.toml --release --target x86_64-apple-darwin
-          ./target/aarch64-apple-darwin/release/tiwi --version
-          ./target/aarch64-apple-darwin/release/tiwi --help
-          mkdir -p dist/bin
-          cp target/aarch64-apple-darwin/release/tiwi dist/bin/tiwi-macos-arm64
-          cp target/x86_64-apple-darwin/release/tiwi dist/bin/tiwi-macos-x64
 
       - name: Configure and build OBS plugin
         working-directory: obs
@@ -148,30 +143,23 @@ jobs:
           cmake --preset ${{ matrix.preset }}
           cmake --build --preset ${{ matrix.preset }}
 
-      - name: Package Windows OBS plugin (OBS 33 flat layout)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist/obs/tiwi-obs/data | Out-Null
-          Copy-Item obs/build_x64/RelWithDebInfo/tiwi-obs.dll dist/obs/tiwi-obs/
-          Copy-Item -Recurse obs/data/* dist/obs/tiwi-obs/data/
-          Compress-Archive -Path dist/obs/tiwi-obs -DestinationPath "dist/$env:OBS_ARCHIVE"
-
-      - name: Package Linux OBS plugin
-        if: runner.os == 'Linux'
+      - name: Package OBS plugin
         shell: bash
         run: |
-          mkdir -p dist/obs/tiwi-obs/bin/64bit dist/obs/tiwi-obs/data
-          cp obs/build_x86_64/tiwi-obs.so dist/obs/tiwi-obs/bin/64bit/
-          cp -r obs/data/. dist/obs/tiwi-obs/data/
-          tar -czf "dist/${OBS_ARCHIVE}" -C dist/obs tiwi-obs
-
-      - name: Package macOS OBS plugin bundle
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          mkdir -p dist
-          tar -czf "dist/${OBS_ARCHIVE}" -C obs/build_macos/RelWithDebInfo tiwi-obs.plugin
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            mkdir -p dist/obs/tiwi-obs/data
+            cp obs/build_x64/RelWithDebInfo/tiwi-obs.dll dist/obs/tiwi-obs/
+            cp -r obs/data/. dist/obs/tiwi-obs/data/
+            pwsh -NoProfile -Command "Compress-Archive -Path dist/obs/tiwi-obs -DestinationPath dist/${OBS_ARCHIVE}"
+          elif [ "${{ runner.os }}" = "Linux" ]; then
+            mkdir -p dist/obs/tiwi-obs/bin/64bit dist/obs/tiwi-obs/data
+            cp obs/build_x86_64/tiwi-obs.so dist/obs/tiwi-obs/bin/64bit/
+            cp -r obs/data/. dist/obs/tiwi-obs/data/
+            tar -czf "dist/${OBS_ARCHIVE}" -C dist/obs tiwi-obs
+          else
+            mkdir -p dist
+            tar -czf "dist/${OBS_ARCHIVE}" -C obs/build_macos/RelWithDebInfo tiwi-obs.plugin
+          fi
 
       - uses: actions/upload-artifact@v4
         with:

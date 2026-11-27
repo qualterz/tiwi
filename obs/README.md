@@ -26,7 +26,7 @@ cmake --build --preset windows-x64
 
 Output: `obs/build_x64/RelWithDebInfo/tiwi-obs.dll`
 
-Install (OBS 33+ flat layout):
+Install:
 
 - `C:\ProgramData\obs-studio\plugins\tiwi-obs\tiwi-obs.dll`
 - `C:\ProgramData\obs-studio\plugins\tiwi-obs\data\locale\en-US.ini`
