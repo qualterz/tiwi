@@ -17,7 +17,7 @@ pub use relay::DirectCommand;
 pub use relay::metrics::{MetricsSnapshot, MetricsWriter, format_utc_filename_ts, prune_old_files};
 pub use relay::packetize::{DirectVideoConfig, EncodedFrame, VideoCodec};
 
-pub const DEFAULT_VIEWER_URL: &str = "https://qualterz.github.io/tiwi/watch/";
+pub const DEFAULT_VIEWER_URL: &str = "https://qualterz.github.io/tiwi/";
 pub const DEFAULT_MQTT_URL: &str = "wss://broker.emqx.io:8084/mqtt";
 pub const DEFAULT_STUN_SERVER: &str = "stun.l.google.com:19302";
 

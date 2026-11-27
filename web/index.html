@@ -5,19 +5,15 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="dark" />
     <link rel="icon" type="image/svg+xml" href="./logo.svg" />
-    <title>Tiwi — Zero-infrastructure peer-to-peer live streaming</title>
-    <meta
-      name="description"
-      content="Stream directly from OBS Studio to browsers over WebRTC with no servers to host."
-    />
+    <title>Tiwi Stream</title>
     <script>
-      if (location.hash.length > 1) {
-        location.replace(new URL("watch/" + location.hash, location.href).href);
+      if (location.hash.length <= 1) {
+        location.replace(new URL("home/", location.href).href);
       }
     </script>
   </head>
   <body class="bg-zinc-950 text-zinc-100 antialiased">
     <div id="root"></div>
-    <script type="module" src="./src/landing/main.tsx"></script>
+    <script type="module" src="./src/viewer/main.tsx"></script>
   </body>
 </html>

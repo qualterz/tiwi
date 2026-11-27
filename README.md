@@ -18,7 +18,7 @@ The native OBS Studio 33 plugin embeds the Rust WebRTC relay directly into OBS a
   ```
 - **Manual install:** Download the archive from [GitHub Releases](https://github.com/qualterz/tiwi/releases) and extract it to the OBS plugins directory (`C:\ProgramData\obs-studio\plugins\` on Windows, `~/.config/obs-studio/plugins/` on Linux, or `~/Library/Application Support/obs-studio/plugins/` on macOS).
 
-Open OBS Studio, click **Start Streaming** in the **Tiwi** dock (or via **Docks → Tiwi**), then click **Copy Link** to share the watch URL (`https://qualterz.github.io/tiwi/watch/#<token>`).
+Open OBS Studio, click **Start Streaming** in the **Tiwi** dock (or via **Docks → Tiwi**), then click **Copy Link** to share the watch URL (`https://qualterz.github.io/tiwi/#<token>`).
 
 ### Standalone daemon (WHIP)
 

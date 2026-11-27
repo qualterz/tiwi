@@ -3,7 +3,7 @@ import { defineConfig, type Plugin } from "vite";
 import solidPlugin from "vite-plugin-solid";
 import tailwindcss from "@tailwindcss/vite";
 
-function redirectWatchSlash(): Plugin {
+function redirectHomeSlash(): Plugin {
   const middleware = (
     req: { url?: string },
     res: {
@@ -13,9 +13,9 @@ function redirectWatchSlash(): Plugin {
     },
     next: () => void,
   ) => {
-    if (req.url === "/watch" || req.url?.startsWith("/watch?")) {
+    if (req.url === "/home" || req.url?.startsWith("/home?")) {
       res.statusCode = 302;
-      res.setHeader("Location", req.url.replace(/^\/watch/, "/watch/"));
+      res.setHeader("Location", req.url.replace(/^\/home/, "/home/"));
       res.end();
       return;
     }
@@ -23,7 +23,7 @@ function redirectWatchSlash(): Plugin {
   };
 
   return {
-    name: "redirect-watch-slash",
+    name: "redirect-home-slash",
     configureServer(server) {
       server.middlewares.use(middleware);
     },
@@ -36,12 +36,12 @@ function redirectWatchSlash(): Plugin {
 export default defineConfig({
   appType: "mpa",
   base: "./",
-  plugins: [solidPlugin(), tailwindcss(), redirectWatchSlash()],
+  plugins: [solidPlugin(), tailwindcss(), redirectHomeSlash()],
   build: {
     rollupOptions: {
       input: {
         main: fileURLToPath(new URL("./index.html", import.meta.url)),
-        watch: fileURLToPath(new URL("./watch/index.html", import.meta.url)),
+        home: fileURLToPath(new URL("./home/index.html", import.meta.url)),
       },
     },
   },
