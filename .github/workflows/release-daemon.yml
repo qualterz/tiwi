@@ -142,7 +142,7 @@ jobs:
             dotnet tool install --global wix --version 5.*
             export PATH="$HOME/.dotnet/tools:$PATH"
             MSI_VERSION="${VERSION%%-*}"
-            wix build obs/installer/tiwi-obs.wxs -arch x64 -d Version="$MSI_VERSION" -d StageDir="staging/obs/tiwi-obs" -o "dist/tiwi-obs-windows-x64.msi"
+            wix build obs/installer/tiwi-obs.wxs -arch x64 -pdbtype none -d Version="$MSI_VERSION" -d StageDir="staging/obs/tiwi-obs" -o "dist/tiwi-obs-windows-x64.msi"
           elif [ "${{ runner.os }}" = "Linux" ]; then
             mkdir -p staging/obs/tiwi-obs/bin/64bit staging/obs/tiwi-obs/data
             cp obs/build_x86_64/tiwi-obs.so staging/obs/tiwi-obs/bin/64bit/
