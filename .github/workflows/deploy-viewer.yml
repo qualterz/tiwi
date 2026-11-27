@@ -25,12 +25,16 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v5
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: viewer/package-lock.json
       - working-directory: viewer
         run: |
-          bun install --frozen-lockfile
-          bun run typecheck
-          bun run build
+          npm ci
+          npm run typecheck
+          npm run build
       - uses: actions/upload-pages-artifact@v5
         with:
           path: viewer/dist

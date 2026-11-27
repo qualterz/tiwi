@@ -90,12 +90,12 @@ cargo run --manifest-path daemon/Cargo.toml
 # OBS plugin Rust core tests
 cargo test --manifest-path obs/rust/Cargo.toml
 
-# Viewer (requires Bun)
+# Viewer (requires Node.js)
 cd viewer
-bun install
-bun run dev        # local dev server on :3000
-bun run typecheck
-bun run build
+npm install
+npm run dev        # local dev server on :3000
+npm run typecheck
+npm run build
 
 # Pre-commit formatting hook
 git config core.hooksPath .githooks
