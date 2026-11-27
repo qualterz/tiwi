@@ -18,26 +18,21 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: oven-sh/setup-bun@v2
-      - run: bun install --frozen-lockfile
-        working-directory: viewer
-      - run: bun run build
-        working-directory: viewer
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v4
-        with:
-          path: viewer/dist
-
   deploy:
-    needs: build
     runs-on: ubuntu-latest
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+      - working-directory: viewer
+        run: |
+          bun install --frozen-lockfile
+          bun run typecheck
+          bun run build
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: viewer/dist
       - id: deployment
         uses: actions/deploy-pages@v4
