@@ -1,0 +1,56 @@
+.landing-heading {
+  text-wrap: balance;
+}
+
+.landing-copy {
+  text-wrap: pretty;
+}
+
+.os-tab {
+  position: relative;
+}
+
+.os-tab[aria-selected="true"]::after {
+  content: "";
+  position: absolute;
+  inset: auto 0 0;
+  border-block-end: 2px solid var(--control-fg);
+}
+
+.copy-icon-check {
+  display: none;
+}
+
+.copy-btn[data-copied] .copy-icon-copy {
+  display: none;
+}
+
+.copy-btn[data-copied] .copy-icon-check {
+  display: block;
+}
+
+.copy-tip {
+  opacity: 0;
+  pointer-events: none;
+  padding: 5px 8px;
+  background: #27272a;
+  border: 1px solid var(--control-muted);
+  color: var(--control-fg);
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  line-height: 1;
+  transition: opacity 0.15s ease-out;
+}
+
+.copy-btn[data-copied] + .copy-tip,
+.copy-btn[data-failed] + .copy-tip {
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .copy-tip {
+    transition: opacity 0.1s linear;
+  }
+}

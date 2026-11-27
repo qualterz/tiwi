@@ -1,5 +1,5 @@
 {
-  "name": "@tiwi/viewer",
+  "name": "@tiwi/web",
   "private": true,
   "type": "module",
   "scripts": {

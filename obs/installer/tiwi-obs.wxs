@@ -1,0 +1,37 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="Tiwi for OBS Studio"
+    Manufacturer="qualterz"
+    Version="$(var.Version)"
+    UpgradeCode="6D5F4A2B-8C19-4F3A-9E71-2B4C8D6E1F05"
+    Scope="perMachine"
+    InstallerVersion="500"
+    Compressed="yes"
+  >
+    <MajorUpgrade
+      AllowSameVersionUpgrades="yes"
+      DowngradeErrorMessage="A newer version of Tiwi for OBS Studio is already installed."
+    />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/qualterz/tiwi" />
+
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="ObsStudioFolder" Name="obs-studio">
+        <Directory Id="ObsPluginsFolder" Name="plugins">
+          <Directory Id="INSTALLFOLDER" Name="tiwi-obs">
+            <Directory Id="DataFolder" Name="data" />
+          </Directory>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="Tiwi for OBS Studio" Level="1">
+      <Component Id="PluginBinary" Directory="INSTALLFOLDER">
+        <File Source="$(var.StageDir)\tiwi-obs.dll" KeyPath="yes" />
+      </Component>
+      <Files Directory="DataFolder" Include="$(var.StageDir)\data\**" />
+    </Feature>
+  </Package>
+</Wix>

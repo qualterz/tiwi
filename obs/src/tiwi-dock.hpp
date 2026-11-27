@@ -23,6 +23,9 @@ public:
     void onFrontendEvent(enum obs_frontend_event event);
     void shutdown();
 
+protected:
+    void changeEvent(QEvent *event) override;
+
 private slots:
     void onToggleStream();
     void onCopyLink();
@@ -40,11 +43,16 @@ private:
     void stopStandaloneStream();
     void releaseOutput();
     void updateUiState();
+    void updateStatusBarMinWidths();
+    void showFirstRunDialog();
+    void showError(const QString &msg);
+    void clearError();
 
     std::string token_;
-    std::string viewerUrl_ = "https://qualterz.github.io/tiwi/";
-    std::string mqttUrl_ = "wss://broker.emqx.io:8084/mqtt";
-    std::string stunServer_ = "stun.l.google.com:19302";
+    std::string viewerUrl_;
+    std::string mqttUrl_;
+    std::string stunServer_;
+    bool setupCompleted_ = false;
 
     TiwiEngine *engine_ = nullptr;
     obs_output_t *output_ = nullptr;
@@ -61,6 +69,7 @@ private:
     QLabel *outIconLabel_ = nullptr;
     QLabel *outLabel_ = nullptr;
     QLabel *rttLabel_ = nullptr;
+    QLabel *errorLabel_ = nullptr;
     QLineEdit *tokenEdit_ = nullptr;
     QToolButton *regenBtn_ = nullptr;
     QPushButton *toggleBtn_ = nullptr;

@@ -1,11 +1,12 @@
-name: Deploy Viewer
+name: Deploy Web
 
 on:
   push:
     branches: [main]
     paths:
-      - "viewer/**"
-      - ".github/workflows/deploy-viewer.yml"
+      - "web/**"
+      - "obs/installer/**"
+      - ".github/workflows/deploy-web.yml"
   workflow_dispatch:
 
 permissions:
@@ -29,14 +30,18 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: viewer/package-lock.json
-      - working-directory: viewer
+          cache-dependency-path: web/package-lock.json
+      - working-directory: web
         run: |
           npm ci
           npm run typecheck
           npm run build
+      - name: Stage installer scripts
+        run: |
+          cp obs/installer/install.sh web/dist/install.sh
+          cp obs/installer/install.ps1 web/dist/install.ps1
       - uses: actions/upload-pages-artifact@v5
         with:
-          path: viewer/dist
+          path: web/dist
       - id: deployment
         uses: actions/deploy-pages@v5

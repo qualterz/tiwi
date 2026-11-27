@@ -9,6 +9,7 @@ use clap::Args as _;
 use clap_serde_derive::ClapSerde;
 use rand::RngCore;
 use serde::Serialize;
+use tiwi_daemon::{DEFAULT_MQTT_URL, DEFAULT_STUN_SERVER, DEFAULT_VIEWER_URL};
 use tracing::warn;
 
 use crate::cli::Cli;
@@ -121,7 +122,7 @@ pub struct Config {
     /// tiwi prints "<viewer_url>#<token>" at startup. If you host your own viewer, set its URL here.
     ///
     /// Values: "http://..." or "https://..." URL.
-    #[default("https://qualterz.github.io/tiwi/".to_string())]
+    #[default(DEFAULT_VIEWER_URL.to_string())]
     #[arg(long, help_heading = "Infrastructure")]
     pub viewer_url: String,
 
@@ -130,7 +131,7 @@ pub struct Config {
     /// tiwi uses this MQTT broker to exchange encrypted WebRTC SDP offers and answers with viewers.
     ///
     /// Values: "ws://..." or "wss://..." URL.
-    #[default("wss://broker.emqx.io:8084/mqtt".to_string())]
+    #[default(DEFAULT_MQTT_URL.to_string())]
     #[arg(long, env = "TIWI_MQTT_URL", help_heading = "Infrastructure")]
     pub mqtt_url: String,
 
@@ -139,7 +140,7 @@ pub struct Config {
     /// tiwi queries this server to find your public IP for WebRTC ICE candidates. If you set public_ip, tiwi ignores this setting.
     ///
     /// Values: "host:port" (e.g. "stun.l.google.com:19302", "stun.cloudflare.com:3478").
-    #[default("stun.l.google.com:19302".to_string())]
+    #[default(DEFAULT_STUN_SERVER.to_string())]
     #[arg(long, help_heading = "Infrastructure")]
     pub stun_server: String,
 

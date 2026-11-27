@@ -1,32 +1,15 @@
 // @ts-expect-error @carbon/icons ships untyped ESM files
 import playFilledIcon from "@carbon/icons/es/play--filled--alt/16.js";
 import { createEffect, createSignal, For, onCleanup, onMount } from "solid-js";
-import { Dynamic } from "solid-js/web";
+import { render } from "solid-js/web";
+import "../base.css";
+import { CarbonIcon } from "../carbon-icon.tsx";
+import "./viewer.css";
 import {
   startViewer,
   type ViewerController,
   type ViewerState,
 } from "./viewer.ts";
-
-interface CarbonIconDescriptor {
-  attrs: Record<string, string | number>;
-  content: Array<{ elem: string; attrs: Record<string, string | number> }>;
-}
-
-function CarbonIcon(props: { icon: CarbonIconDescriptor; class?: string }) {
-  return (
-    <svg
-      {...props.icon.attrs}
-      class={props.class}
-      fill="currentColor"
-      aria-hidden="true"
-    >
-      <For each={props.icon.content}>
-        {(el) => <Dynamic component={el.elem} {...el.attrs} />}
-      </For>
-    </svg>
-  );
-}
 
 const HAS_FINE_POINTER = window.matchMedia(
   "(hover: hover) and (pointer: fine)",
@@ -693,3 +676,5 @@ export default function App() {
     </main>
   );
 }
+
+render(() => <App />, document.getElementById("root")!);

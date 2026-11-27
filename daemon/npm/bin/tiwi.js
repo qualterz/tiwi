@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -42,15 +43,48 @@ function cacheRoot() {
   return join(process.env.XDG_CACHE_HOME || join(homedir(), ".cache"), "tiwi", "bin");
 }
 
+function findChecksum(sumsText, filename) {
+  for (const line of sumsText.split(/\r?\n/)) {
+    const match = line.match(/^\s*([0-9a-fA-F]{64})\s+\*?(.+?)\s*$/);
+    if (match && match[2] === filename) {
+      return match[1].toLowerCase();
+    }
+  }
+  return null;
+}
+
 const binDir = join(cacheRoot(), `v${version}`);
 const binPath = join(binDir, target.bin);
 
 if (!existsSync(binPath)) {
-  const url = `https://github.com/qualterz/tiwi/releases/download/v${version}/${asset}`;
+  const baseUrl = `https://github.com/qualterz/tiwi/releases/download/v${version}`;
+  const archiveUrl = `${baseUrl}/${asset}`;
+  const sumsUrl = `${baseUrl}/SHA256SUMS.txt`;
+
   console.error(`Downloading tiwi v${version} (${key})...`);
-  const res = await fetch(url);
-  if (!res.ok) {
-    console.error(`Failed to download ${url}: HTTP ${res.status} ${res.statusText}`);
+  const [archiveRes, sumsRes] = await Promise.all([fetch(archiveUrl), fetch(sumsUrl)]);
+  if (!archiveRes.ok) {
+    console.error(`Failed to download ${archiveUrl}: HTTP ${archiveRes.status} ${archiveRes.statusText}`);
+    process.exit(1);
+  }
+  if (!sumsRes.ok) {
+    console.error(`Failed to download ${sumsUrl}: HTTP ${sumsRes.status} ${sumsRes.statusText}`);
+    process.exit(1);
+  }
+
+  const [archiveBuf, sumsText] = await Promise.all([
+    archiveRes.arrayBuffer().then((ab) => Buffer.from(ab)),
+    sumsRes.text(),
+  ]);
+
+  const expectedHash = findChecksum(sumsText, asset);
+  if (!expectedHash) {
+    console.error(`Could not find checksum for ${asset} in SHA256SUMS.txt.`);
+    process.exit(1);
+  }
+  const actualHash = createHash("sha256").update(archiveBuf).digest("hex");
+  if (actualHash !== expectedHash) {
+    console.error(`SHA256 verification failed for ${asset} (expected ${expectedHash}, got ${actualHash}).`);
     process.exit(1);
   }
 
@@ -58,15 +92,23 @@ if (!existsSync(binPath)) {
   const tmpDir = mkdtempSync(join(binDir, ".tmp-"));
   try {
     const archivePath = join(tmpDir, asset);
-    writeFileSync(archivePath, Buffer.from(await res.arrayBuffer()));
+    writeFileSync(archivePath, archiveBuf);
 
-    const tar = spawnSync("tar", ["-xf", archivePath, "-C", tmpDir], { stdio: "inherit" });
+    const tarBin =
+      process.platform === "win32"
+        ? join(process.env.SystemRoot || "C:\\Windows", "System32", "tar.exe")
+        : "tar";
+    const tar = spawnSync(tarBin, ["-xf", archivePath, "-C", tmpDir], { stdio: "inherit" });
     if (tar.error || tar.status !== 0) {
       console.error(`Failed to extract ${asset}${tar.error ? `: ${tar.error.message}` : ""}`);
       process.exit(1);
     }
 
     const extracted = join(tmpDir, target.bin);
+    if (!existsSync(extracted)) {
+      console.error(`Extracted archive does not contain ${target.bin}.`);
+      process.exit(1);
+    }
     if (process.platform !== "win32") {
       chmodSync(extracted, 0o755);
     }
