@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" shape-rendering="crispEdges">
+  <style>
+    .t { fill: #ffffff; }
+    @media (prefers-color-scheme: light) {
+      .t { fill: #09090b; }
+    }
+  </style>
+  <g class="t">
+    <rect x="2" y="3" width="9" height="2" />
+    <rect x="5" y="5" width="3" height="8" />
+  </g>
+  <rect x="11" y="10" width="3" height="3" fill="#fb2c36" />
+</svg>
