@@ -51,7 +51,10 @@ pub fn router(tx: mpsc::Sender<WhipCommand>, whip_token: Option<String>) -> Rout
         .with_state(state)
 }
 
-fn check_auth(headers: &HeaderMap, expected: Option<&str>) -> Result<(), Response> {
+fn check_auth(
+    headers: &HeaderMap,
+    expected: Option<&str>,
+) -> Result<(), (StatusCode, &'static str)> {
     let Some(secret) = expected else {
         return Ok(());
     };
@@ -63,7 +66,7 @@ fn check_auth(headers: &HeaderMap, expected: Option<&str>) -> Result<(), Respons
     if provided == Some(secret) {
         Ok(())
     } else {
-        Err((StatusCode::UNAUTHORIZED, "Unauthorized").into_response())
+        Err((StatusCode::UNAUTHORIZED, "Unauthorized"))
     }
 }
 
@@ -98,7 +101,7 @@ async fn handle_offer(
     body: String,
 ) -> Response {
     if let Err(resp) = check_auth(&headers, state.whip_token.as_deref()) {
-        return resp;
+        return resp.into_response();
     }
 
     if body.trim().is_empty() {
@@ -147,7 +150,7 @@ async fn handle_delete(
     Path(session_id): Path<String>,
 ) -> Response {
     if let Err(resp) = check_auth(&headers, state.whip_token.as_deref()) {
-        return resp;
+        return resp.into_response();
     }
 
     let (reply_tx, reply_rx) = oneshot::channel();

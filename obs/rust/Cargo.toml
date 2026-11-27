@@ -1,0 +1,17 @@
+[package]
+name = "tiwi-obs"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "tiwi_obs"
+crate-type = ["staticlib"]
+
+[dependencies]
+tiwi-daemon = { path = "../../daemon", default-features = false }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+strip = true
+lto = "thin"

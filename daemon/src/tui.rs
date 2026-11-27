@@ -8,7 +8,7 @@ use crossterm::terminal::{self, Clear, ClearType};
 use crossterm::{execute, queue};
 use tokio::sync::watch;
 
-use crate::relay::metrics::MetricsSnapshot;
+use tiwi_daemon::MetricsSnapshot;
 
 const RTT_SPIKE_THRESHOLD_MS: u64 = 40;
 

@@ -1,5 +1,6 @@
-pub(crate) mod metrics;
+pub mod metrics;
 mod net;
+pub mod packetize;
 
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -13,10 +14,15 @@ use str0m::change::SdpOffer;
 use str0m::config::DtlsCert;
 use str0m::crypto as str0m_crypto;
 use str0m::format::{Codec, CodecConfig, FormatParams, PayloadParams};
-use str0m::media::{Frequency, KeyframeRequestKind, MediaKind, Mid, Pt};
+#[cfg(feature = "whip")]
+use str0m::media::KeyframeRequestKind;
+use str0m::media::{Frequency, MediaKind, Mid, Pt};
 use str0m::net::{Protocol, Receive};
-use str0m::rtp::{RtpWrite, SeqNo, Ssrc};
+#[cfg(feature = "whip")]
+use str0m::rtp::Ssrc;
+use str0m::rtp::{RtpWrite, SeqNo};
 use str0m::{Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
+#[cfg(feature = "whip")]
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, error, info, trace, warn};
@@ -24,17 +30,32 @@ use tracing::{debug, error, info, trace, warn};
 use self::metrics::{
     MetricsRollup, MetricsSnapshot, MetricsWriter, RelayMetrics, ShardCounters, is_viewer_congested,
 };
+#[cfg(feature = "whip")]
+use self::net::bind_ingest_udp;
 use self::net::{
-    BoundCandidates, bind_ingest_udp, bind_shard_udp, from_socket_addr, gather_all_candidates,
+    BoundCandidates, bind_shard_udp, from_socket_addr, gather_all_candidates,
     refresh_srflx_on_idle, to_socket_addr,
 };
-use crate::config::Config;
+use self::packetize::{DirectVideoConfig, EncodedFrame, FramePacketizer};
+use crate::RelayConfig;
 use crate::signal::{SignalEvent, ViewerOffer};
+#[cfg(feature = "whip")]
 use crate::whip::{WhipAccepted, WhipCommand, WhipError};
 
+/// Commands accepted by the direct-frame relay ingest (`run_direct`).
+#[derive(Debug)]
+pub enum DirectCommand {
+    Start { video: DirectVideoConfig },
+    Frame(EncodedFrame),
+    Stop,
+}
+
 const VIEWER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+#[cfg(feature = "whip")]
 const INGEST_SILENCE_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(feature = "whip")]
 const PLI_COOLDOWN: Duration = Duration::from_secs(1);
+#[cfg(feature = "whip")]
 const PLI_CONNECT_RETRY: Duration = Duration::from_millis(500);
 const STUN_REFRESH_AGE: Duration = Duration::from_secs(20);
 const METRICS_INTERVAL: Duration = Duration::from_secs(1);
@@ -48,6 +69,7 @@ const MAX_UDP_BATCH: usize = 64;
 const MAX_SHARD_BATCH: usize = 64;
 const SHARD_UDP_POLL_CAP: Duration = Duration::from_millis(2);
 
+#[cfg(feature = "whip")]
 struct IngestSession {
     id: String,
     rtc: Rtc,
@@ -84,12 +106,12 @@ struct ViewerSession {
     rtx_enabled: bool,
 }
 
-struct SharedRtp {
-    is_video: bool,
-    timestamp: u32,
-    wall_time: Instant,
-    marker: bool,
-    payload: Arc<[u8]>,
+pub(crate) struct SharedRtp {
+    pub(crate) is_video: bool,
+    pub(crate) timestamp: u32,
+    pub(crate) wall_time: Instant,
+    pub(crate) marker: bool,
+    pub(crate) payload: Arc<[u8]>,
 }
 
 enum ShardMsg {
@@ -111,8 +133,346 @@ struct ShardHandle {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+fn compute_shard_count(max_peers: usize) -> usize {
+    let mut shard_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    if max_peers > 0 {
+        shard_count = shard_count.min(max_peers);
+    }
+    shard_count.clamp(1, 32)
+}
+
+fn spawn_egress_shards(
+    gathered: impl Iterator<Item = (tokio::net::UdpSocket, BoundCandidates)>,
+    shard_count: usize,
+    pli_tx: &mpsc::Sender<()>,
+    dtls_cert: &Option<DtlsCert>,
+) -> Option<Vec<ShardHandle>> {
+    let mut shards: Vec<ShardHandle> = Vec::with_capacity(shard_count);
+    for (shard_id, (shard_tokio_sock, shard_bound)) in gathered.enumerate() {
+        let shard_socket = match shard_tokio_sock.into_std() {
+            Ok(s) => s,
+            Err(e) => {
+                error!(shard = shard_id, err = %e, "Failed to convert shard UDP socket");
+                return None;
+            }
+        };
+        let (tx, rx) = std_mpsc::sync_channel::<ShardMsg>(SHARD_CHANNEL_CAP);
+        let counters = Arc::new(ShardCounters::new());
+        let shard_counters = Arc::clone(&counters);
+        let shard_pli_tx = pli_tx.clone();
+        let shard_cert = dtls_cert.clone();
+        let handle = std::thread::Builder::new()
+            .name(format!("tiwi-egress-{shard_id}"))
+            .spawn(move || {
+                run_egress_shard(
+                    shard_id,
+                    rx,
+                    shard_socket,
+                    shard_bound,
+                    shard_counters,
+                    shard_pli_tx,
+                    shard_cert,
+                );
+            })
+            .expect("failed to spawn egress shard thread");
+        shards.push(ShardHandle {
+            tx,
+            counters,
+            handle: Some(handle),
+        });
+    }
+    Some(shards)
+}
+
+fn shutdown_shards(shards: &mut [ShardHandle], metrics_writer: &mut Option<MetricsWriter>) {
+    for shard in shards.iter_mut() {
+        let _ = shard.tx.send(ShardMsg::Shutdown);
+    }
+    for shard in shards.iter_mut() {
+        if let Some(h) = shard.handle.take() {
+            let _ = h.join();
+        }
+    }
+    if let Some(writer) = metrics_writer.take() {
+        writer.finish();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tick_metrics_interval(
+    now: Instant,
+    codec: String,
+    shards: &[ShardHandle],
+    metrics: &mut RelayMetrics,
+    metrics_writer: &mut Option<MetricsWriter>,
+    status_tx: &watch::Sender<Option<MetricsSnapshot>>,
+    metrics_rollup: &mut MetricsRollup,
+) {
+    let elapsed = now.duration_since(metrics.last_tick);
+    metrics.last_tick = now;
+
+    let mut total_viewers = 0usize;
+    let mut total_out_bytes = 0u64;
+    let mut total_out_pkts = 0u64;
+    let mut total_shard_drops = 0u64;
+    let mut total_connected = 0usize;
+    let mut total_congested = 0usize;
+    let mut max_rtt: Option<Duration> = None;
+    let mut max_rtt_delta: Option<Duration> = None;
+    let mut max_loss: Option<f32> = None;
+
+    for shard in shards {
+        total_viewers += shard.counters.viewers.load(Ordering::Relaxed);
+        let (bytes, pkts, drops, rtt, rtt_delta, loss, connected, congested) =
+            shard.counters.take_interval();
+        total_out_bytes += bytes;
+        total_out_pkts += pkts;
+        total_shard_drops += drops;
+        total_connected += connected;
+        total_congested += congested;
+        max_rtt = match (max_rtt, rtt) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        max_rtt_delta = match (max_rtt_delta, rtt_delta) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        max_loss = match (max_loss, loss) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+    }
+
+    if let Some(congested) = metrics.update_congestion(now, total_connected, total_congested) {
+        warn!(congested, "Uplink congestion state changed");
+        for shard in shards {
+            let _ = shard.tx.try_send(ShardMsg::SetCongested(congested));
+        }
+    }
+
+    let snap = metrics.take_snapshot(
+        elapsed,
+        codec,
+        total_viewers,
+        total_out_bytes,
+        total_out_pkts,
+        total_shard_drops,
+        max_rtt,
+        max_rtt_delta,
+        max_loss,
+    );
+
+    if let Some(writer) = metrics_writer.as_mut() {
+        writer.write(&snap);
+    }
+    status_tx.send_replace(Some(snap.clone()));
+
+    if let Some(rollup) = metrics_rollup.push(&snap) {
+        debug!(
+            codec = %rollup.codec,
+            viewers = rollup.viewers,
+            in_kbps = format_args!("{:.0}", rollup.in_kbps),
+            out_kbps = format_args!("{:.0}", rollup.out_kbps),
+            in_pps = rollup.in_pps,
+            out_pps = rollup.out_pps,
+            rtt_ms = rollup.rtt_ms,
+            rtt_delta_ms = rollup.rtt_delta_ms,
+            loss_pct = format_args!("{:.1}", rollup.loss_pct),
+            pli = rollup.pli,
+            udp_drops = rollup.udp_drops,
+            offers_rejected = rollup.offers_rejected,
+            congested = rollup.congested,
+            "Stream metrics"
+        );
+    }
+}
+
+fn fanout_shared_rtp(pkt: SharedRtp, shards: &[ShardHandle]) {
+    let mut pkt = Some(pkt);
+    let mut shared: Option<Arc<SharedRtp>> = None;
+    for shard in shards {
+        if shard.counters.connected_viewers.load(Ordering::Relaxed) == 0 {
+            continue;
+        }
+        let pkt_arc = shared.get_or_insert_with(|| Arc::new(pkt.take().expect("shared rtp")));
+        if let Err(TrySendError::Full(_)) = shard.tx.try_send(ShardMsg::Rtp(Arc::clone(pkt_arc))) {
+            shard.counters.record_udp_drop();
+        }
+    }
+}
+
+/// Runs the relay with direct encoded frames pushed from an embedded producer (e.g. OBS plugin),
+/// bypassing WHIP HTTP/DTLS ingest while reusing the exact same sharded WebRTC egress engine.
+pub async fn run_direct(
+    config: RelayConfig,
+    mut metrics_writer: Option<MetricsWriter>,
+    status_tx: watch::Sender<Option<MetricsSnapshot>>,
+    mut direct_rx: mpsc::Receiver<DirectCommand>,
+    mut offer_rx: mpsc::Receiver<ViewerOffer>,
+    signal_tx: mpsc::Sender<SignalEvent>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let shard_count = compute_shard_count(config.max_peers);
+    let mut shard_sockets = Vec::with_capacity(shard_count);
+
+    for shard_id in 0..shard_count {
+        let port = if config.media_port == 0 {
+            0
+        } else {
+            match config.media_port.checked_add(shard_id as u16) {
+                Some(p) => p,
+                None => {
+                    error!(
+                        media_port = config.media_port,
+                        shard = shard_id,
+                        "Media port range overflow"
+                    );
+                    return;
+                }
+            }
+        };
+        match bind_shard_udp(port) {
+            Ok(s) => shard_sockets.push(s),
+            Err(e) => {
+                error!(port, shard = shard_id, err = %e, "Failed to bind shard UDP socket");
+                return;
+            }
+        }
+    }
+
+    let gathered = gather_all_candidates(shard_sockets, &config).await;
+    let dtls_cert = str0m_crypto::from_feature_flags()
+        .dtls_provider
+        .generate_certificate();
+
+    let (pli_tx, mut pli_rx) = mpsc::channel::<()>(64);
+    let Some(mut shards) =
+        spawn_egress_shards(gathered.into_iter(), shard_count, &pli_tx, &dtls_cert)
+    else {
+        return;
+    };
+
+    info!(shards = shard_count, "Direct media relay ready");
+
+    let mut packetizer: Option<FramePacketizer> = None;
+    let mut metrics = RelayMetrics::new(Instant::now());
+    let mut metrics_rollup = MetricsRollup::new(STDOUT_ROLLUP_TICKS);
+    let mut rtp_scratch: Vec<SharedRtp> = Vec::with_capacity(16);
+
+    loop {
+        let now = Instant::now();
+        let next_tick = metrics.last_tick + METRICS_INTERVAL;
+        let sleep_dur = next_tick
+            .saturating_duration_since(now)
+            .min(Duration::from_millis(250));
+
+        tokio::select! {
+            biased;
+
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    debug!("Direct media relay shutting down");
+                    if packetizer.take().is_some() {
+                        for shard in &shards {
+                            let _ = shard.tx.send(ShardMsg::ClearViewers);
+                        }
+                        metrics.reset_ingest();
+                        let _ = signal_tx.try_send(SignalEvent::StreamStop);
+                    }
+                    shutdown_shards(&mut shards, &mut metrics_writer);
+                    break;
+                }
+            }
+
+            Some(cmd) = direct_rx.recv() => {
+                match cmd {
+                    DirectCommand::Start { video } => {
+                        if packetizer.is_some() {
+                            for shard in &shards {
+                                let _ = shard.tx.send(ShardMsg::ClearViewers);
+                            }
+                            metrics.reset_ingest();
+                        }
+                        let p = FramePacketizer::new(&video);
+                        let (codec, _) = p.video_spec();
+                        info!(codec = %codec, "Direct stream started");
+                        packetizer = Some(p);
+                        metrics.last_tick = Instant::now();
+                        metrics_rollup = MetricsRollup::new(STDOUT_ROLLUP_TICKS);
+                        let _ = signal_tx.try_send(SignalEvent::StreamStart);
+                    }
+                    DirectCommand::Frame(frame) => {
+                        if let Some(p) = packetizer.as_mut() {
+                            let wall_time = Instant::now();
+                            metrics.record_in(frame.data.len());
+                            p.packetize(&frame, wall_time, &mut rtp_scratch);
+                            for pkt in rtp_scratch.drain(..) {
+                                fanout_shared_rtp(pkt, &shards);
+                            }
+                        }
+                    }
+                    DirectCommand::Stop => {
+                        if packetizer.take().is_some() {
+                            info!("Direct stream stopped");
+                            for shard in &shards {
+                                let _ = shard.tx.send(ShardMsg::ClearViewers);
+                            }
+                            metrics.reset_ingest();
+                            let _ = signal_tx.try_send(SignalEvent::StreamStop);
+                        }
+                    }
+                }
+            }
+
+            Some(()) = pli_rx.recv() => {
+                // Drain PLI notifications; direct OBS encoders rely on configured keyint_sec.
+                while pli_rx.try_recv().is_ok() {}
+                for s in &shards {
+                    s.counters.force_pli.store(false, Ordering::Relaxed);
+                }
+            }
+
+            Some(offer) = offer_rx.recv() => {
+                let video_spec = packetizer.as_ref().map(FramePacketizer::video_spec);
+                dispatch_viewer_offer_for(
+                    offer,
+                    &config,
+                    packetizer.is_some(),
+                    video_spec,
+                    &shards,
+                    &mut metrics,
+                );
+            }
+
+            _ = tokio::time::sleep(sleep_dur) => {}
+        }
+
+        let now = Instant::now();
+        if let Some(p) = packetizer.as_ref()
+            && now.duration_since(metrics.last_tick) >= METRICS_INTERVAL
+        {
+            let codec = p.video_spec().0.to_string();
+            tick_metrics_interval(
+                now,
+                codec,
+                &shards,
+                &mut metrics,
+                &mut metrics_writer,
+                &status_tx,
+                &mut metrics_rollup,
+            );
+        } else if packetizer.is_none() && status_tx.borrow().is_some() {
+            status_tx.send_replace(None);
+        }
+    }
+}
+
+#[cfg(feature = "whip")]
 pub async fn run(
-    config: Config,
+    config: RelayConfig,
     mut metrics_writer: Option<MetricsWriter>,
     status_tx: watch::Sender<Option<MetricsSnapshot>>,
     mut whip_rx: mpsc::Receiver<WhipCommand>,
@@ -120,13 +480,7 @@ pub async fn run(
     signal_tx: mpsc::Sender<SignalEvent>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    let mut shard_count = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(2);
-    if config.max_peers > 0 {
-        shard_count = shard_count.min(config.max_peers);
-    }
-    let shard_count = shard_count.clamp(1, 32);
+    let shard_count = compute_shard_count(config.max_peers);
 
     let ingest_socket = match bind_ingest_udp(config.media_port) {
         Ok(s) => s,
@@ -327,8 +681,7 @@ pub async fn run(
                         ingest_bound.is_dual_stack,
                         &mut metrics,
                         &signal_tx,
-                        force,
-                        pli_cooldown,
+                        (!force).then_some(pli_cooldown),
                     );
                 }
             }
@@ -405,8 +758,7 @@ pub async fn run(
                     ingest_bound.is_dual_stack,
                     &mut metrics,
                     &signal_tx,
-                    true,
-                    pli_cooldown,
+                    None,
                 );
             }
         }
@@ -545,6 +897,7 @@ pub async fn run(
     }
 }
 
+#[cfg(feature = "whip")]
 #[allow(clippy::too_many_arguments)]
 fn handle_ingest_udp(
     buf: &[u8],
@@ -586,6 +939,7 @@ fn local_dest_for(source: SocketAddr, bound: &BoundCandidates) -> SocketAddr {
     }
 }
 
+#[cfg(feature = "whip")]
 fn compute_ingest_deadline(
     now: Instant,
     ingest: Option<&IngestSession>,
@@ -599,6 +953,7 @@ fn compute_ingest_deadline(
     earliest
 }
 
+#[cfg(feature = "whip")]
 #[allow(clippy::too_many_arguments)]
 fn handle_whip_offer(
     sdp: String,
@@ -685,18 +1040,32 @@ fn handle_whip_offer(
     })
 }
 
+#[cfg(feature = "whip")]
 fn dispatch_viewer_offer(
     offer: ViewerOffer,
-    config: &Config,
+    config: &RelayConfig,
     ingest: Option<&IngestSession>,
     shards: &[ShardHandle],
     metrics: &mut RelayMetrics,
 ) {
-    let Some(ing) = ingest.filter(|i| i.connected) else {
+    let connected = ingest.is_some_and(|i| i.connected);
+    let video_spec = ingest.and_then(|i| i.video_spec);
+    dispatch_viewer_offer_for(offer, config, connected, video_spec, shards, metrics);
+}
+
+fn dispatch_viewer_offer_for(
+    offer: ViewerOffer,
+    config: &RelayConfig,
+    stream_connected: bool,
+    video_spec: Option<(Codec, FormatParams)>,
+    shards: &[ShardHandle],
+    metrics: &mut RelayMetrics,
+) {
+    if !stream_connected {
         metrics.record_offer_rejected();
         let _ = offer.reply.send(Err("No active stream".to_string()));
         return;
-    };
+    }
 
     if metrics.congested {
         metrics.record_offer_rejected();
@@ -742,7 +1111,7 @@ fn dispatch_viewer_offer(
     let msg = ShardMsg::AddViewer {
         viewer_id: offer.viewer_id,
         sdp: offer.sdp,
-        video_spec: ing.video_spec,
+        video_spec,
         reply: offer.reply,
     };
 
@@ -760,6 +1129,7 @@ fn dispatch_viewer_offer(
     }
 }
 
+#[cfg(feature = "whip")]
 fn drain_ingest(
     ing: &mut IngestSession,
     shards: &[ShardHandle],
@@ -900,6 +1270,7 @@ fn drain_ingest(
     }
 }
 
+#[cfg(feature = "whip")]
 fn request_ingest_keyframe(
     ing: &mut IngestSession,
     shards: &[ShardHandle],
@@ -907,13 +1278,12 @@ fn request_ingest_keyframe(
     is_dual_stack: bool,
     metrics: &mut RelayMetrics,
     signal_tx: &mpsc::Sender<SignalEvent>,
-    force: bool,
-    cooldown: Duration,
+    cooldown: Option<Duration>,
 ) {
     let now = Instant::now();
-    if !force
+    if let Some(cd) = cooldown
         && let Some(last) = ing.last_pli_at
-        && now.duration_since(last) < cooldown
+        && now.duration_since(last) < cd
     {
         return;
     }
@@ -941,6 +1311,7 @@ fn request_ingest_keyframe(
     }
 }
 
+#[cfg(feature = "whip")]
 fn teardown_ingest(
     ingest: &mut Option<IngestSession>,
     shards: &[ShardHandle],

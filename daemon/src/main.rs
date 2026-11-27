@@ -1,9 +1,6 @@
 mod cli;
 mod config;
-mod relay;
-mod signal;
 mod tui;
-mod whip;
 
 use std::fs::{self, File};
 use std::io::IsTerminal;
@@ -13,6 +10,7 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 use clap::Parser;
+use tiwi_daemon::{RelayConfig, relay, signal, whip};
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -170,7 +168,17 @@ async fn main() {
     });
 
     // Dedicated OS thread running a single-threaded tokio reactor for str0m media I/O.
-    let media_cfg = cfg.clone();
+    let media_cfg = RelayConfig {
+        token: cfg.token.clone(),
+        viewer_url: cfg.viewer_url.clone(),
+        mqtt_url: cfg.mqtt_url.clone(),
+        stun_server: cfg.stun_server.clone(),
+        public_ip: cfg.public_ip,
+        media_port: cfg.media_port,
+        max_peers: cfg.max_peers,
+        max_uplink_mbps: cfg.max_uplink_mbps,
+        logs_dir: cfg.resolved_logs_dir(),
+    };
     let media_shutdown = shutdown_rx.clone();
     let media_handle = std::thread::Builder::new()
         .name("tiwi-media".to_string())

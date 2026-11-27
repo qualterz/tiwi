@@ -8,11 +8,13 @@ use tokio::net::UdpSocket;
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
-use crate::config::Config;
+use crate::RelayConfig;
 
 // Ingest receives OBS media (high RX, tiny RTCP/STUN TX).
 // 16 MB matches Bun's buffer sizing to avoid Windows UDP overflows during keyframe bursts.
+#[cfg(feature = "whip")]
 const INGEST_RECV_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(feature = "whip")]
 const INGEST_SEND_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 // Each egress shard handles viewer media TX (high TX) and viewer STUN/DTLS/RTCP RX (low RX).
@@ -20,6 +22,7 @@ const SHARD_RECV_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 const SHARD_SEND_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 
 pub struct BoundCandidates {
+    #[allow(dead_code)]
     pub local_port: u16,
     pub loopback_addr: SocketAddr,
     pub host_addr: SocketAddr,
@@ -31,6 +34,7 @@ pub struct BoundCandidates {
     pub candidates: Vec<Candidate>,
 }
 
+#[cfg(feature = "whip")]
 pub fn bind_ingest_udp(port: u16) -> std::io::Result<(UdpSocket, bool)> {
     let (std_udp, is_dual_stack) =
         bind_udp_socket(port, INGEST_RECV_BUFFER_BYTES, INGEST_SEND_BUFFER_BYTES)?;
@@ -148,7 +152,7 @@ fn disable_udp_connreset(sock: &Socket) {
 /// (single LAN/IPv6 route lookup, single STUN DNS resolution, concurrent STUN probes).
 pub async fn gather_all_candidates(
     sockets: Vec<(UdpSocket, bool)>,
-    config: &Config,
+    config: &RelayConfig,
 ) -> Vec<(UdpSocket, BoundCandidates)> {
     let lan_ip = discover_lan_ip();
     let v6_ip = discover_ipv6_ip();

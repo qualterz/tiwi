@@ -243,7 +243,7 @@ fn prune_old_metrics(dir: &Path, max_files: usize) {
     });
 }
 
-pub(crate) fn prune_old_files(dir: &Path, max_files: usize, matches: impl Fn(&str) -> bool) {
+pub fn prune_old_files(dir: &Path, max_files: usize, matches: impl Fn(&str) -> bool) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -269,7 +269,7 @@ fn unix_ms(now: SystemTime) -> u64 {
 }
 
 /// Formats a UTC `SystemTime` as `YYYY-MM-DDTHH-MM-SSZ` (safe on Windows and Unix filenames).
-pub(crate) fn format_utc_filename_ts(now: SystemTime) -> String {
+pub fn format_utc_filename_ts(now: SystemTime) -> String {
     let secs = now
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -401,6 +401,12 @@ impl ShardCounters {
         self.max_rtt_us.store(0, Ordering::Relaxed);
         self.max_rtt_delta_us.store(0, Ordering::Relaxed);
         self.max_loss_bps.store(0, Ordering::Relaxed);
+    }
+}
+
+impl Default for ShardCounters {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

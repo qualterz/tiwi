@@ -6,6 +6,10 @@ out
 dist
 *.tgz
 /daemon/target
+/obs/rust/target
+/obs/.deps
+/obs/build
+/obs/build_*
 
 # code coverage
 coverage
