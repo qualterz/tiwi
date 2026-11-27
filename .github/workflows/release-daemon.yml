@@ -53,19 +53,20 @@ jobs:
           - os: windows-latest
             preset: windows-x64
             rust_targets: x86_64-pc-windows-msvc
-            obs_archive: tiwi-obs-windows-x64.zip
+            obs_suffix: windows-x64.zip
           - os: ubuntu-latest
             preset: ubuntu-x86_64
             rust_targets: x86_64-unknown-linux-gnu
-            obs_archive: tiwi-obs-linux-x64.tar.gz
+            obs_suffix: linux-x64.tar.gz
           - os: macos-latest
             preset: macos
             rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
-            obs_archive: tiwi-obs-macos-universal.tar.gz
+            obs_suffix: macos-universal.tar.gz
     runs-on: ${{ matrix.os }}
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       TIWI_VERSION: ${{ needs.prepare.outputs.tag }}
+      OBS_ARCHIVE: tiwi-obs-${{ needs.prepare.outputs.version }}-${{ matrix.obs_suffix }}
       MACOSX_DEPLOYMENT_TARGET: "12.0"
     steps:
       - uses: actions/checkout@v5
@@ -154,7 +155,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist/obs/tiwi-obs/data | Out-Null
           Copy-Item obs/build_x64/RelWithDebInfo/tiwi-obs.dll dist/obs/tiwi-obs/
           Copy-Item -Recurse obs/data/* dist/obs/tiwi-obs/data/
-          Compress-Archive -Path dist/obs/tiwi-obs -DestinationPath dist/${{ matrix.obs_archive }}
+          Compress-Archive -Path dist/obs/tiwi-obs -DestinationPath "dist/$env:OBS_ARCHIVE"
 
       - name: Package Linux OBS plugin
         if: runner.os == 'Linux'
@@ -163,21 +164,21 @@ jobs:
           mkdir -p dist/obs/tiwi-obs/bin/64bit dist/obs/tiwi-obs/data
           cp obs/build_x86_64/tiwi-obs.so dist/obs/tiwi-obs/bin/64bit/
           cp -r obs/data/. dist/obs/tiwi-obs/data/
-          tar -czf "dist/${{ matrix.obs_archive }}" -C dist/obs tiwi-obs
+          tar -czf "dist/${OBS_ARCHIVE}" -C dist/obs tiwi-obs
 
       - name: Package macOS OBS plugin bundle
         if: runner.os == 'macOS'
         shell: bash
         run: |
           mkdir -p dist
-          tar -czf "dist/${{ matrix.obs_archive }}" -C obs/build_macos/RelWithDebInfo tiwi-obs.plugin
+          tar -czf "dist/${OBS_ARCHIVE}" -C obs/build_macos/RelWithDebInfo tiwi-obs.plugin
 
       - uses: actions/upload-artifact@v4
         with:
           name: build-${{ matrix.preset }}
           path: |
             dist/bin/*
-            dist/${{ matrix.obs_archive }}
+            dist/tiwi-obs-${{ needs.prepare.outputs.version }}-${{ matrix.obs_suffix }}
           retention-days: 3
 
   release:
@@ -191,6 +192,8 @@ jobs:
           path: artifacts/
 
       - name: Generate default config and package archives
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           chmod +x \
             artifacts/build-ubuntu-x86_64/bin/tiwi-linux-x64 \
@@ -205,10 +208,10 @@ jobs:
           cp artifacts/build-macos/bin/tiwi-macos-arm64 staging/mac-arm64/tiwi
           cp artifacts/build-macos/bin/tiwi-macos-x64 staging/mac-x64/tiwi
 
-          zip -j release/tiwi-windows-x64.zip staging/win/tiwi.exe config.toml
-          tar -czf release/tiwi-linux-x64.tar.gz -C staging/linux tiwi -C "$PWD" config.toml
-          tar -czf release/tiwi-macos-arm64.tar.gz -C staging/mac-arm64 tiwi -C "$PWD" config.toml
-          tar -czf release/tiwi-macos-x64.tar.gz -C staging/mac-x64 tiwi -C "$PWD" config.toml
+          zip -j "release/tiwi-${VERSION}-windows-x64.zip" staging/win/tiwi.exe config.toml
+          tar -czf "release/tiwi-${VERSION}-linux-x64.tar.gz" -C staging/linux tiwi -C "$PWD" config.toml
+          tar -czf "release/tiwi-${VERSION}-macos-arm64.tar.gz" -C staging/mac-arm64 tiwi -C "$PWD" config.toml
+          tar -czf "release/tiwi-${VERSION}-macos-x64.tar.gz" -C staging/mac-x64 tiwi -C "$PWD" config.toml
 
           cp artifacts/build-*/tiwi-obs-* release/
 

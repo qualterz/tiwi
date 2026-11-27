@@ -15,10 +15,10 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const TARGETS = {
-  "win32-x64": { asset: "tiwi-windows-x64.zip", bin: "tiwi.exe" },
-  "linux-x64": { asset: "tiwi-linux-x64.tar.gz", bin: "tiwi" },
-  "darwin-arm64": { asset: "tiwi-macos-arm64.tar.gz", bin: "tiwi" },
-  "darwin-x64": { asset: "tiwi-macos-x64.tar.gz", bin: "tiwi" },
+  "win32-x64": { suffix: "windows-x64.zip", bin: "tiwi.exe" },
+  "linux-x64": { suffix: "linux-x64.tar.gz", bin: "tiwi" },
+  "darwin-arm64": { suffix: "macos-arm64.tar.gz", bin: "tiwi" },
+  "darwin-x64": { suffix: "macos-x64.tar.gz", bin: "tiwi" },
 };
 
 const key = `${process.platform}-${process.arch}`;
@@ -30,6 +30,7 @@ if (!target) {
 
 const pkgPath = join(dirname(fileURLToPath(import.meta.url)), "..", "package.json");
 const { version } = JSON.parse(readFileSync(pkgPath, "utf8"));
+const asset = `tiwi-${version}-${target.suffix}`;
 
 function cacheRoot() {
   if (process.platform === "win32") {
@@ -45,7 +46,7 @@ const binDir = join(cacheRoot(), `v${version}`);
 const binPath = join(binDir, target.bin);
 
 if (!existsSync(binPath)) {
-  const url = `https://github.com/qualterz/tiwi/releases/download/v${version}/${target.asset}`;
+  const url = `https://github.com/qualterz/tiwi/releases/download/v${version}/${asset}`;
   console.error(`Downloading tiwi v${version} (${key})...`);
   const res = await fetch(url);
   if (!res.ok) {
@@ -56,12 +57,12 @@ if (!existsSync(binPath)) {
   mkdirSync(binDir, { recursive: true });
   const tmpDir = mkdtempSync(join(binDir, ".tmp-"));
   try {
-    const archivePath = join(tmpDir, target.asset);
+    const archivePath = join(tmpDir, asset);
     writeFileSync(archivePath, Buffer.from(await res.arrayBuffer()));
 
     const tar = spawnSync("tar", ["-xf", archivePath, "-C", tmpDir], { stdio: "inherit" });
     if (tar.error || tar.status !== 0) {
-      console.error(`Failed to extract ${target.asset}${tar.error ? `: ${tar.error.message}` : ""}`);
+      console.error(`Failed to extract ${asset}${tar.error ? `: ${tar.error.message}` : ""}`);
       process.exit(1);
     }
 
