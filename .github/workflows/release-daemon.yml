@@ -12,7 +12,7 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-daemon
@@ -25,18 +25,13 @@ jobs:
       tag: ${{ steps.meta.outputs.tag }}
       version: ${{ steps.meta.outputs.version }}
     steps:
-      - uses: actions/checkout@v5
       - id: meta
-        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VERSION="${{ inputs.version }}"
-            VERSION="${VERSION#v}"
-            TAG="v${VERSION}"
-          else
-            TAG="${GITHUB_REF_NAME}"
-            VERSION="${TAG#v}"
-          fi
+          RAW="${INPUT_VERSION:-$GITHUB_REF_NAME}"
+          VERSION="${RAW#v}"
+          TAG="v${VERSION}"
           if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
             echo "Version must be semver X.Y.Z (got: $VERSION)" >&2
             exit 1
@@ -66,8 +61,10 @@ jobs:
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       TIWI_VERSION: ${{ needs.prepare.outputs.tag }}
+      VERSION: ${{ needs.prepare.outputs.version }}
       OBS_ARCHIVE: tiwi-obs-${{ needs.prepare.outputs.version }}-${{ matrix.obs_suffix }}
-      MACOSX_DEPLOYMENT_TARGET: "12.0"
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+      COPYFILE_DISABLE: "1"
     steps:
       - uses: actions/checkout@v5
 
@@ -78,8 +75,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
-            daemon -> target
-            obs/rust -> target
+            daemon -> ../target
+            obs/rust -> ../../target
           key: ${{ matrix.preset }}
 
       - name: Install Linux OBS & Qt6 dependencies
@@ -96,45 +93,36 @@ jobs:
           path: obs/.deps
           key: obs-deps-${{ matrix.preset }}-${{ hashFiles('obs/buildspec.json') }}
 
-      - name: Stamp version
-        shell: bash
-        env:
-          VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          perl -0777 -i -pe 's/^version = ".*?"/version = "$ENV{VERSION}"/m' daemon/Cargo.toml obs/rust/Cargo.toml
-          node -e '
-            const fs = require("fs");
-            const spec = JSON.parse(fs.readFileSync("obs/buildspec.json", "utf8"));
-            spec.version = process.env.VERSION;
-            fs.writeFileSync("obs/buildspec.json", JSON.stringify(spec, null, 2) + "\n");
-          '
-
       - name: Run unit tests
         run: |
           cargo test --manifest-path daemon/Cargo.toml
           cargo test --manifest-path obs/rust/Cargo.toml
 
-      - name: Build daemon
+      - name: Build and package daemon
         shell: bash
         run: |
-          mkdir -p dist/bin
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            cargo build --manifest-path daemon/Cargo.toml --release
-            ./target/release/tiwi.exe --version
-            ./target/release/tiwi.exe --help
-            cp target/release/tiwi.exe dist/bin/tiwi-windows-x64.exe
-          elif [ "${{ runner.os }}" = "Linux" ]; then
-            cargo build --manifest-path daemon/Cargo.toml --release
-            ./target/release/tiwi --version
-            ./target/release/tiwi --help
-            cp target/release/tiwi dist/bin/tiwi-linux-x64
-          else
+          mkdir -p dist
+          if [ "${{ runner.os }}" = "macOS" ]; then
             cargo build --manifest-path daemon/Cargo.toml --release --target aarch64-apple-darwin
             cargo build --manifest-path daemon/Cargo.toml --release --target x86_64-apple-darwin
             ./target/aarch64-apple-darwin/release/tiwi --version
             ./target/aarch64-apple-darwin/release/tiwi --help
-            cp target/aarch64-apple-darwin/release/tiwi dist/bin/tiwi-macos-arm64
-            cp target/x86_64-apple-darwin/release/tiwi dist/bin/tiwi-macos-x64
+            ./target/aarch64-apple-darwin/release/tiwi --default-config > config.toml
+            tar -czf "dist/tiwi-${VERSION}-macos-arm64.tar.gz" -C target/aarch64-apple-darwin/release tiwi -C "$PWD" config.toml
+            tar -czf "dist/tiwi-${VERSION}-macos-x64.tar.gz" -C target/x86_64-apple-darwin/release tiwi -C "$PWD" config.toml
+          else
+            cargo build --manifest-path daemon/Cargo.toml --release
+            if [ "${{ runner.os }}" = "Windows" ]; then
+              ./target/release/tiwi.exe --version
+              ./target/release/tiwi.exe --help
+              ./target/release/tiwi.exe --default-config > config.toml
+              pwsh -NoProfile -Command "Compress-Archive -Path target/release/tiwi.exe, config.toml -DestinationPath dist/tiwi-${VERSION}-windows-x64.zip"
+            else
+              ./target/release/tiwi --version
+              ./target/release/tiwi --help
+              ./target/release/tiwi --default-config > config.toml
+              tar -czf "dist/tiwi-${VERSION}-linux-x64.tar.gz" -C target/release tiwi -C "$PWD" config.toml
+            fi
           fi
 
       - name: Configure and build OBS plugin
@@ -147,61 +135,36 @@ jobs:
         shell: bash
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
-            mkdir -p dist/obs/tiwi-obs/data
-            cp obs/build_x64/RelWithDebInfo/tiwi-obs.dll dist/obs/tiwi-obs/
-            cp -r obs/data/. dist/obs/tiwi-obs/data/
-            pwsh -NoProfile -Command "Compress-Archive -Path dist/obs/tiwi-obs -DestinationPath dist/${OBS_ARCHIVE}"
+            mkdir -p staging/obs/tiwi-obs/data
+            cp obs/build_x64/RelWithDebInfo/tiwi-obs.dll staging/obs/tiwi-obs/
+            cp -r obs/data/. staging/obs/tiwi-obs/data/
+            pwsh -NoProfile -Command "Compress-Archive -Path staging/obs/tiwi-obs -DestinationPath dist/${OBS_ARCHIVE}"
           elif [ "${{ runner.os }}" = "Linux" ]; then
-            mkdir -p dist/obs/tiwi-obs/bin/64bit dist/obs/tiwi-obs/data
-            cp obs/build_x86_64/tiwi-obs.so dist/obs/tiwi-obs/bin/64bit/
-            cp -r obs/data/. dist/obs/tiwi-obs/data/
-            tar -czf "dist/${OBS_ARCHIVE}" -C dist/obs tiwi-obs
+            mkdir -p staging/obs/tiwi-obs/bin/64bit staging/obs/tiwi-obs/data
+            cp obs/build_x86_64/tiwi-obs.so staging/obs/tiwi-obs/bin/64bit/
+            cp -r obs/data/. staging/obs/tiwi-obs/data/
+            tar -czf "dist/${OBS_ARCHIVE}" -C staging/obs tiwi-obs
           else
-            mkdir -p dist
             tar -czf "dist/${OBS_ARCHIVE}" -C obs/build_macos/RelWithDebInfo tiwi-obs.plugin
           fi
 
       - uses: actions/upload-artifact@v4
         with:
           name: build-${{ matrix.preset }}
-          path: |
-            dist/bin/*
-            dist/tiwi-obs-${{ needs.prepare.outputs.version }}-${{ matrix.obs_suffix }}
+          path: dist/
           retention-days: 3
 
   release:
     needs: [prepare, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v5
       - uses: actions/download-artifact@v4
         with:
           pattern: build-*
-          path: artifacts/
-
-      - name: Generate default config and package archives
-        env:
-          VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          chmod +x \
-            artifacts/build-ubuntu-x86_64/bin/tiwi-linux-x64 \
-            artifacts/build-macos/bin/tiwi-macos-arm64 \
-            artifacts/build-macos/bin/tiwi-macos-x64
-
-          ./artifacts/build-ubuntu-x86_64/bin/tiwi-linux-x64 --default-config > config.toml
-
-          mkdir -p release staging/win staging/linux staging/mac-arm64 staging/mac-x64
-          cp artifacts/build-windows-x64/bin/tiwi-windows-x64.exe staging/win/tiwi.exe
-          cp artifacts/build-ubuntu-x86_64/bin/tiwi-linux-x64 staging/linux/tiwi
-          cp artifacts/build-macos/bin/tiwi-macos-arm64 staging/mac-arm64/tiwi
-          cp artifacts/build-macos/bin/tiwi-macos-x64 staging/mac-x64/tiwi
-
-          zip -j "release/tiwi-${VERSION}-windows-x64.zip" staging/win/tiwi.exe config.toml
-          tar -czf "release/tiwi-${VERSION}-linux-x64.tar.gz" -C staging/linux tiwi -C "$PWD" config.toml
-          tar -czf "release/tiwi-${VERSION}-macos-arm64.tar.gz" -C staging/mac-arm64 tiwi -C "$PWD" config.toml
-          tar -czf "release/tiwi-${VERSION}-macos-x64.tar.gz" -C staging/mac-x64 tiwi -C "$PWD" config.toml
-
-          cp artifacts/build-*/tiwi-obs-* release/
+          merge-multiple: true
+          path: release
 
       - name: Generate SHA256SUMS.txt
         working-directory: release
@@ -210,9 +173,11 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           gh release create "${{ needs.prepare.outputs.tag }}" \
             release/* \
+            --target "${{ github.sha }}" \
             --title "Tiwi ${{ needs.prepare.outputs.tag }}" \
             --generate-notes
 
@@ -234,10 +199,5 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           npm install -g npm@latest
-          node -e '
-            const fs = require("fs");
-            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
-            pkg.version = process.env.VERSION;
-            fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
-          '
+          npm pkg set version="$VERSION"
           npm stage publish --provenance --access public

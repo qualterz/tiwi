@@ -2,11 +2,16 @@ cmake_minimum_required(VERSION 3.28...3.30)
 
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/buildspec.json" _buildspec)
 string(JSON _name GET "${_buildspec}" name)
-string(JSON _version GET "${_buildspec}" version)
+if(DEFINED ENV{TIWI_VERSION} AND NOT "$ENV{TIWI_VERSION}" STREQUAL "")
+  string(REGEX REPLACE "^v" "" _version "$ENV{TIWI_VERSION}")
+else()
+  string(JSON _version GET "${_buildspec}" version)
+endif()
+string(REGEX REPLACE "-.*$" "" _cmake_version "${_version}")
 string(JSON _author GET "${_buildspec}" author)
 string(JSON _macos_bundle_id GET "${_buildspec}" platformConfig macos bundleId)
 
-project(${_name} VERSION ${_version} LANGUAGES C CXX)
+project(${_name} VERSION ${_cmake_version} LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -124,18 +129,30 @@ function(_setup_obs_deps)
   )
     set(obs_src "${deps_dir}/${obs_dest}")
     set(obs_bld "${obs_src}/build_${arch}")
-    if(WIN32)
-      set(obs_gen_args -G "${CMAKE_GENERATOR}" -A "${arch}" -DCMAKE_ENABLE_SCRIPTING=OFF)
-    elseif(APPLE)
-      set(obs_gen_args -G Xcode "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64" "-DCMAKE_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}")
-    endif()
-    message(STATUS "Building OBS ${obs_ver} (${arch}) libobs & obs-frontend-api...")
-    execute_process(
-      COMMAND "${CMAKE_COMMAND}" --fresh -S "${obs_src}" -B "${obs_bld}" ${obs_gen_args}
-        -DOBS_CMAKE_VERSION=3.0.0 -DENABLE_PLUGINS=OFF -DENABLE_FRONTEND=OFF
-        -DOBS_VERSION_OVERRIDE=${obs_ver} "-DCMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}"
-      COMMAND_ERROR_IS_FATAL ANY
+    set(obs_common_args
+      --fresh -S "${obs_src}" -B "${obs_bld}"
+      -DOBS_CMAKE_VERSION=3.0.0 -DENABLE_CORE_MODULES=OFF -DENABLE_FRONTEND=OFF
+      -DENABLE_SCRIPTING=OFF -DCMAKE_COMPILE_WARNING_AS_ERROR=OFF
+      -DOBS_VERSION_OVERRIDE=${obs_ver}
     )
+    message(STATUS "Building OBS ${obs_ver} (${arch}) libobs & obs-frontend-api...")
+    if(WIN32)
+      execute_process(
+        COMMAND "${CMAKE_COMMAND}" ${obs_common_args}
+          -G "${CMAKE_GENERATOR}" -A "${arch}"
+          "-DCMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}"
+        COMMAND_ERROR_IS_FATAL ANY
+      )
+    elseif(APPLE)
+      execute_process(
+        COMMAND "${CMAKE_COMMAND}" ${obs_common_args}
+          -G Xcode
+          "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64"
+          "-DCMAKE_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}"
+          "-DCMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}"
+        COMMAND_ERROR_IS_FATAL ANY
+      )
+    endif()
     execute_process(
       COMMAND "${CMAKE_COMMAND}" --build "${obs_bld}" --target obs-frontend-api --config Release --parallel
       COMMAND_ERROR_IS_FATAL ANY
