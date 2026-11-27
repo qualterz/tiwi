@@ -139,10 +139,12 @@ jobs:
             cp obs/build_x64/RelWithDebInfo/tiwi-obs.dll staging/obs/tiwi-obs/
             cp -r obs/data/. staging/obs/tiwi-obs/data/
             pwsh -NoProfile -Command "Compress-Archive -Path staging/obs/tiwi-obs -DestinationPath dist/${OBS_ARCHIVE}"
-            dotnet tool install --global wix --version 5.*
+            WIX_VERSION="5.0.2"
+            dotnet tool install --global wix --version "$WIX_VERSION"
             export PATH="$HOME/.dotnet/tools:$PATH"
+            wix extension add -g "WixToolset.UI.wixext/${WIX_VERSION}"
             MSI_VERSION="${VERSION%%-*}"
-            wix build obs/installer/tiwi-obs.wxs -arch x64 -pdbtype none -d Version="$MSI_VERSION" -d StageDir="staging/obs/tiwi-obs" -o "dist/tiwi-obs-windows-x64.msi"
+            wix build obs/installer/tiwi-obs.wxs -arch x64 -pdbtype none -ext WixToolset.UI.wixext -d Version="$MSI_VERSION" -d StageDir="staging/obs/tiwi-obs" -o "dist/tiwi-obs-windows-x64.msi"
           elif [ "${{ runner.os }}" = "Linux" ]; then
             mkdir -p staging/obs/tiwi-obs/bin/64bit staging/obs/tiwi-obs/data
             cp obs/build_x86_64/tiwi-obs.so staging/obs/tiwi-obs/bin/64bit/
