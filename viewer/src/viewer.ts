@@ -227,7 +227,6 @@ export function startViewer(
       for (const track of stream.getTracks()) {
         track.stop();
       }
-      videoEl.srcObject = null;
     }
     if (!activePc) return;
     const pc = activePc;
@@ -245,8 +244,8 @@ export function startViewer(
     gen++;
     clearTimers();
     closeMqtt();
-    closePc();
     videoEl.pause();
+    closePc();
     transition("paused");
   };
 
