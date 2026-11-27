@@ -7,8 +7,7 @@
     "build": "vite build",
     "typecheck": "bun check",
     "format": "prettier --write . --ignore-path ../.gitignore",
-    "format:check": "prettier --check . --ignore-path ../.gitignore",
-    "prepare": "git config core.hooksPath .githooks"
+    "format:check": "prettier --check . --ignore-path ../.gitignore"
   },
   "dependencies": {
     "@carbon/icons": "^11.92.0",

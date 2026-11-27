@@ -1,6 +1,8 @@
 #!/bin/sh
 set -e
 
-git diff --cached --name-only --diff-filter=ACMR -z -- ':!daemon/' ':!*.wxs' | xargs -0 -r bun viewer/node_modules/prettier/bin/prettier.cjs --write --ignore-unknown --config viewer/package.json --ignore-path .gitignore --
+if [ -f viewer/node_modules/prettier/bin/prettier.cjs ]; then
+  git diff --cached --name-only --diff-filter=ACMR -z -- ':!daemon/' | xargs -0 -r bun viewer/node_modules/prettier/bin/prettier.cjs --write --ignore-unknown --config viewer/package.json --ignore-path .gitignore --
+fi
 git diff --cached --name-only --diff-filter=ACMR -z -- '*.rs' | xargs -0 -r rustfmt --edition 2024 --
 git diff --cached --name-only --diff-filter=ACMR -z | xargs -0 -r git add --
