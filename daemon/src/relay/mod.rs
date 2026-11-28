@@ -2,7 +2,7 @@ pub mod metrics;
 mod net;
 pub mod packetize;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -62,8 +62,14 @@ const METRICS_INTERVAL: Duration = Duration::from_secs(1);
 const STDOUT_ROLLUP_TICKS: usize = 5;
 const RTX_CACHE_PACKETS: usize = 2048;
 const RTX_CACHE_AGE: Duration = Duration::from_secs(3);
-const RTX_RATIO_CAP: f32 = 0.15;
-const RTX_CONGESTED_RATIO_CAP: f32 = 0.05;
+const RTX_RATIO_CAP: f32 = 0.20;
+const RTX_CONGESTED_RATIO_CAP: f32 = 0.10;
+const PACER_BYPASS_MAX_BYTES: usize = 256;
+const PACER_BURST_BYTES: f64 = 4.0 * 1024.0;
+const PACER_MIN_RATE_BPS: f64 = 15_000_000.0 / 8.0;
+const PACER_MAX_RATE_BPS: f64 = 80_000_000.0 / 8.0;
+const PACER_RATE_MULTIPLIER: f64 = 2.5;
+const PACER_MAX_QUEUE: usize = 512;
 const SHARD_CHANNEL_CAP: usize = 2048;
 const MAX_UDP_BATCH: usize = 64;
 const MAX_SHARD_BATCH: usize = 64;
@@ -104,6 +110,127 @@ struct ViewerSession {
     min_rtt: Option<Duration>,
     last_loss: Option<f32>,
     rtx_enabled: bool,
+    pacer: UdpPacer,
+}
+
+/// Per-viewer leaky-bucket UDP pacer that spreads large video/keyframe bursts over
+/// milliseconds while letting small control/audio packets (`<= 256 B`) bypass immediately.
+struct UdpPacer {
+    queue: VecDeque<(SocketAddr, Vec<u8>)>,
+    tokens: f64,
+    last_refill: Instant,
+    rate_bps: f64,
+    window_start: Instant,
+    window_bytes: usize,
+}
+
+impl UdpPacer {
+    fn new(now: Instant) -> Self {
+        Self {
+            queue: VecDeque::new(),
+            tokens: PACER_BURST_BYTES,
+            last_refill: now,
+            rate_bps: PACER_MIN_RATE_BPS,
+            window_start: now,
+            window_bytes: 0,
+        }
+    }
+
+    fn refill(&mut self, now: Instant) {
+        let dt = now
+            .saturating_duration_since(self.last_refill)
+            .as_secs_f64();
+        self.last_refill = now;
+        self.tokens = (self.tokens + dt * self.rate_bps).min(PACER_BURST_BYTES);
+    }
+
+    fn record_rate(&mut self, now: Instant, bytes: usize) {
+        self.window_bytes += bytes;
+        let elapsed = now
+            .saturating_duration_since(self.window_start)
+            .as_secs_f64();
+        if elapsed >= 0.5 {
+            let observed_bps = self.window_bytes as f64 / elapsed;
+            let target = (observed_bps * PACER_RATE_MULTIPLIER)
+                .clamp(PACER_MIN_RATE_BPS, PACER_MAX_RATE_BPS);
+            self.rate_bps = if target > self.rate_bps {
+                target
+            } else {
+                0.5 * self.rate_bps + 0.5 * target
+            };
+            self.window_start = now;
+            self.window_bytes = 0;
+        }
+    }
+
+    fn send_or_enqueue(
+        &mut self,
+        now: Instant,
+        dest: SocketAddr,
+        payload: &[u8],
+        socket: &std::net::UdpSocket,
+        is_dual_stack: bool,
+        counters: &ShardCounters,
+    ) {
+        if payload.len() <= PACER_BYPASS_MAX_BYTES {
+            if let Err(e) = socket.send_to(payload, to_socket_addr(dest, is_dual_stack)) {
+                counters.record_udp_drop();
+                trace!(err = %e, "Viewer UDP send_to error");
+            }
+            return;
+        }
+
+        self.record_rate(now, payload.len());
+        self.refill(now);
+
+        let cost = payload.len() as f64;
+        if self.queue.is_empty() && self.tokens >= cost {
+            self.tokens -= cost;
+            if let Err(e) = socket.send_to(payload, to_socket_addr(dest, is_dual_stack)) {
+                counters.record_udp_drop();
+                trace!(err = %e, "Viewer UDP send_to error");
+            }
+            return;
+        }
+
+        if self.queue.len() >= PACER_MAX_QUEUE {
+            self.queue.pop_front();
+            counters.record_udp_drop();
+        }
+        self.queue.push_back((dest, payload.to_vec()));
+        self.flush(now, socket, is_dual_stack, counters);
+    }
+
+    fn flush(
+        &mut self,
+        now: Instant,
+        socket: &std::net::UdpSocket,
+        is_dual_stack: bool,
+        counters: &ShardCounters,
+    ) {
+        if self.queue.is_empty() {
+            return;
+        }
+        self.refill(now);
+        while let Some((_, data)) = self.queue.front() {
+            let cost = data.len() as f64;
+            if self.tokens < cost {
+                break;
+            }
+            self.tokens -= cost;
+            let (dest, data) = self.queue.pop_front().unwrap();
+            if let Err(e) = socket.send_to(&data, to_socket_addr(dest, is_dual_stack)) {
+                counters.record_udp_drop();
+                trace!(err = %e, "Viewer UDP send_to error");
+            }
+        }
+    }
+
+    fn next_deadline(&self, now: Instant) -> Option<Instant> {
+        let (_, data) = self.queue.front()?;
+        let deficit = (data.len() as f64 - self.tokens).max(0.0);
+        Some(now + Duration::from_secs_f64(deficit / self.rate_bps))
+    }
 }
 
 pub(crate) struct SharedRtp {
@@ -1501,13 +1628,16 @@ fn tick_and_reap_viewers(
     let mut stats_dirty = false;
 
     for (id, v) in viewers.iter_mut() {
-        if v.rtc.is_alive() && now >= v.next_timeout {
-            if let Err(e) = v.rtc.handle_input(Input::Timeout(now)) {
-                debug!(viewer = %id, err = %e, "Viewer timeout error");
+        if v.rtc.is_alive() {
+            v.pacer.flush(now, socket, is_dual_stack, counters);
+            if now >= v.next_timeout {
+                if let Err(e) = v.rtc.handle_input(Input::Timeout(now)) {
+                    debug!(viewer = %id, err = %e, "Viewer timeout error");
+                }
+                let (pli, dirty) = drain_viewer(v, socket, is_dual_stack, counters);
+                want_pli |= pli;
+                stats_dirty |= dirty;
             }
-            let (pli, dirty) = drain_viewer(v, socket, is_dual_stack, counters);
-            want_pli |= pli;
-            stats_dirty |= dirty;
         }
 
         if !v.rtc.is_alive() {
@@ -1863,6 +1993,7 @@ fn build_viewer_session(
         min_rtt: None,
         last_loss: None,
         rtx_enabled: bound.rtx_enabled,
+        pacer: UdpPacer::new(now),
     };
 
     let _ = viewer.rtc.handle_input(Input::Timeout(now));
@@ -1959,12 +2090,14 @@ fn drain_viewer(
                 break;
             }
             Ok(Output::Transmit(t)) => {
-                if let Err(e) =
-                    socket.send_to(&t.contents, to_socket_addr(t.destination, is_dual_stack))
-                {
-                    counters.record_udp_drop();
-                    trace!(viewer = %v.id, err = %e, "Viewer UDP send_to error");
-                }
+                v.pacer.send_or_enqueue(
+                    Instant::now(),
+                    t.destination,
+                    &t.contents,
+                    socket,
+                    is_dual_stack,
+                    counters,
+                );
             }
             Ok(Output::Event(ev)) => match ev {
                 Event::Connected => {
@@ -2039,6 +2172,9 @@ fn compute_shard_deadline(now: Instant, viewers: &HashMap<String, ViewerSession>
     let mut earliest = now + Duration::from_millis(50);
     for v in viewers.values() {
         earliest = earliest.min(v.next_timeout);
+        if let Some(pacer_due) = v.pacer.next_deadline(now) {
+            earliest = earliest.min(pacer_due);
+        }
         if !v.connected {
             earliest = earliest.min(v.created_at + VIEWER_HANDSHAKE_TIMEOUT);
         }
@@ -2501,5 +2637,289 @@ mod tests {
             Some("v-newer"),
             "reaping old viewer must not clobber newer viewer's addr mapping"
         );
+    }
+
+    #[test]
+    fn egress_burst_policer_profile() {
+        use std::sync::atomic::AtomicBool;
+        use str0m::media::Direction;
+
+        // 1. Bind sender (Tiwi shard) and receiver (simulated browser) UDP sockets on loopback.
+        let (sender_sock, bound) = test_bound_and_socket();
+        let recv_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        recv_sock.set_nonblocking(true).unwrap();
+        let recv_addr = recv_sock.local_addr().unwrap();
+
+        // 2. Create a real str0m browser-like receiver that generates an H.264 recvonly SDP offer.
+        let mut client = RtcConfig::new().set_rtp_mode(true).build(Instant::now());
+        client.add_local_candidate(Candidate::host(recv_addr, "udp").unwrap());
+        let mut change = client.sdp_api();
+        change.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
+        change.add_media(MediaKind::Audio, Direction::RecvOnly, None, None, None);
+        let (offer, pending) = change.apply().unwrap();
+
+        let counters = ShardCounters::new();
+        let (viewer, answer_sdp) = build_viewer_session(
+            "v-burst".to_string(),
+            offer.to_sdp_string(),
+            Some((Codec::H264, FormatParams::default())),
+            &bound,
+            None,
+            &sender_sock,
+            &counters,
+        )
+        .expect("viewer session should build");
+
+        let answer = str0m::change::SdpAnswer::from_sdp_string(&answer_sdp).unwrap();
+        client.sdp_api().accept_answer(pending, answer).unwrap();
+
+        let mut viewers = HashMap::new();
+        viewers.insert("v-burst".to_string(), viewer);
+        let mut addr_to_viewer = HashMap::new();
+        let (pli_tx, _pli_rx) = mpsc::channel(16);
+        let mut s_buf = [0u8; 2048];
+        let mut c_buf = [0u8; 2048];
+
+        // 3. Drive ICE + DTLS handshake to completion.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let now = Instant::now();
+            while let Ok(out) = client.poll_output() {
+                match out {
+                    Output::Timeout(_) => break,
+                    Output::Transmit(t) => {
+                        let _ = recv_sock.send_to(&t.contents, t.destination);
+                    }
+                    Output::Event(_) => {}
+                }
+            }
+            let _ = client.handle_input(Input::Timeout(now));
+            while let Ok((n, src)) = recv_sock.recv_from(&mut c_buf) {
+                if let Ok(r) = Receive::new(Protocol::Udp, src, recv_addr, &c_buf[..n]) {
+                    let _ = client.handle_input(Input::Receive(Instant::now(), r));
+                }
+            }
+            drain_shard_udp(
+                &sender_sock,
+                &mut s_buf,
+                &bound,
+                &mut viewers,
+                &mut addr_to_viewer,
+                &counters,
+                &pli_tx,
+            );
+            tick_and_reap_viewers(
+                Instant::now(),
+                &mut viewers,
+                &mut addr_to_viewer,
+                &sender_sock,
+                false,
+                &counters,
+                &pli_tx,
+            );
+            if viewers.get("v-burst").is_some_and(|v| v.connected) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            viewers.get("v-burst").is_some_and(|v| v.connected),
+            "viewer failed to connect over loopback"
+        );
+
+        // Drain any post-handshake STUN/DTLS packets.
+        while recv_sock.recv_from(&mut c_buf).is_ok() {}
+
+        // Helper: spawn a receiver thread that timestamps every arriving UDP datagram.
+        let mut measure_stream =
+            |label: &str,
+             keyframe_bytes: usize,
+             pframe_bytes: usize,
+             viewers: &mut HashMap<String, ViewerSession>| {
+                let stop = Arc::new(AtomicBool::new(false));
+                let stop_rx = Arc::clone(&stop);
+                let rx_sock = recv_sock.try_clone().unwrap();
+                rx_sock.set_nonblocking(false).unwrap();
+                rx_sock
+                    .set_read_timeout(Some(Duration::from_millis(50)))
+                    .unwrap();
+
+                let rx_handle = std::thread::spawn(move || {
+                    let mut arrivals: Vec<(Instant, usize)> = Vec::with_capacity(2048);
+                    let mut buf = [0u8; 2048];
+                    while !stop_rx.load(Ordering::Relaxed) {
+                        match rx_sock.recv_from(&mut buf) {
+                            Ok((n, _)) => arrivals.push((Instant::now(), n)),
+                            Err(_) => continue,
+                        }
+                    }
+                    arrivals
+                });
+
+                // Minimal Annex-B SPS + PPS + IDR / non-IDR NALUs.
+                let sps_pps: Vec<u8> = vec![
+                    0, 0, 0, 1, 0x67, 0x64, 0x00, 0x28, 0xAC, 0xD9, // SPS
+                    0, 0, 0, 1, 0x68, 0xEB, 0xEC, 0xB2, // PPS
+                ];
+                let mut packetizer = FramePacketizer::new(&DirectVideoConfig {
+                    codec: packetize::VideoCodec::H264,
+                    extra_data: sps_pps,
+                });
+                let mut rtp_out = Vec::new();
+
+                // Send 1 second of 60fps video: frame 0 is a keyframe, frames 1..60 are P-frames.
+                let frame_interval = Duration::from_micros(16_667);
+                let stream_start = Instant::now();
+                for frame_idx in 0..60u64 {
+                    let target = stream_start + frame_interval * frame_idx as u32;
+                    while Instant::now() < target {
+                        let now = Instant::now();
+                        tick_and_reap_viewers(
+                            now,
+                            viewers,
+                            &mut addr_to_viewer,
+                            &sender_sock,
+                            false,
+                            &counters,
+                            &pli_tx,
+                        );
+                        let next = compute_shard_deadline(now, viewers).min(target);
+                        if let Some(wait) = next.checked_duration_since(Instant::now()) {
+                            std::thread::sleep(wait.min(Duration::from_millis(1)));
+                        }
+                    }
+                    let is_kf = frame_idx == 0;
+                    let size = if is_kf { keyframe_bytes } else { pframe_bytes };
+                    let mut data = vec![0xAAu8; size + 5];
+                    data[0] = 0;
+                    data[1] = 0;
+                    data[2] = 0;
+                    data[3] = 1;
+                    data[4] = if is_kf { 0x65 } else { 0x41 };
+
+                    let frame = EncodedFrame {
+                        is_video: true,
+                        is_keyframe: is_kf,
+                        pts: frame_idx as i64,
+                        timebase_num: 1,
+                        timebase_den: 60,
+                        data,
+                    };
+                    packetizer.packetize(&frame, Instant::now(), &mut rtp_out);
+                    for pkt in &rtp_out {
+                        fanout_rtp_shard(
+                            pkt,
+                            viewers,
+                            false,
+                            &sender_sock,
+                            false,
+                            &counters,
+                            &pli_tx,
+                        );
+                    }
+                    tick_and_reap_viewers(
+                        Instant::now(),
+                        viewers,
+                        &mut addr_to_viewer,
+                        &sender_sock,
+                        false,
+                        &counters,
+                        &pli_tx,
+                    );
+                }
+
+                // Drain any remaining paced packets after the last frame.
+                let drain_until = Instant::now() + Duration::from_millis(80);
+                while Instant::now() < drain_until {
+                    tick_and_reap_viewers(
+                        Instant::now(),
+                        viewers,
+                        &mut addr_to_viewer,
+                        &sender_sock,
+                        false,
+                        &counters,
+                        &pli_tx,
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+
+                let (_, out_pkts, udp_drops, ..) = counters.take_interval();
+                stop.store(true, Ordering::Relaxed);
+                let arrivals = rx_handle.join().unwrap();
+
+                // Analyze peak 1ms burst rate and token-bucket policer drop rates.
+                let mut max_1ms_bytes = 0usize;
+                let mut left = 0usize;
+                let mut window_bytes = 0usize;
+                for right in 0..arrivals.len() {
+                    window_bytes += arrivals[right].1;
+                    while arrivals[right].0.duration_since(arrivals[left].0)
+                        > Duration::from_millis(1)
+                    {
+                        window_bytes -= arrivals[left].1;
+                        left += 1;
+                    }
+                    max_1ms_bytes = max_1ms_bytes.max(window_bytes);
+                }
+                let peak_1ms_mbps = (max_1ms_bytes as f64 * 8.0) / 1_000.0; // bytes per 1ms -> Mbps
+
+                // Evaluate token-bucket policers (rate_mbps, burst_kb).
+                let eval_policer = |rate_mbps: f64, burst_kb: usize| -> (usize, f64) {
+                    let cap = (burst_kb * 1024) as f64;
+                    let rate_bps = rate_mbps * 1_000_000.0 / 8.0;
+                    let mut tokens = cap;
+                    let mut last_t = arrivals.first().map(|a| a.0).unwrap_or_else(Instant::now);
+                    let mut dropped = 0usize;
+                    for &(t, len) in &arrivals {
+                        let dt = t.saturating_duration_since(last_t).as_secs_f64();
+                        last_t = t;
+                        tokens = (tokens + dt * rate_bps).min(cap);
+                        let wire_len = (len + 28) as f64; // + IP/UDP headers
+                        if tokens >= wire_len {
+                            tokens -= wire_len;
+                        } else {
+                            dropped += 1;
+                        }
+                    }
+                    let pct = if arrivals.is_empty() {
+                        0.0
+                    } else {
+                        dropped as f64 * 100.0 / arrivals.len() as f64
+                    };
+                    (dropped, pct)
+                };
+
+                let (d300_16, _) = eval_policer(300.0, 16);
+                let (d50_16, _) = eval_policer(50.0, 16);
+                let (d20_16, _) = eval_policer(20.0, 16);
+
+                assert_eq!(udp_drops, 0, "[{label}] expected zero UDP drops");
+                assert!(
+                    arrivals.len() >= out_pkts as usize,
+                    "[{label}] expected all {out_pkts} packets to arrive, got {}",
+                    arrivals.len()
+                );
+                assert!(
+                    max_1ms_bytes <= 12 * 1024,
+                    "[{label}] peak 1ms burst too high: {peak_1ms_mbps:.1}Mbps ({max_1ms_bytes}B)"
+                );
+                assert_eq!(
+                    d300_16, 0,
+                    "[{label}] paced stream must not drop on 300M/16KB policer"
+                );
+                assert_eq!(
+                    d50_16, 0,
+                    "[{label}] paced stream must not drop on 50M/16KB policer"
+                );
+                assert_eq!(
+                    d20_16, 0,
+                    "[{label}] paced stream must not drop on 20M/16KB policer"
+                );
+            };
+
+        // 500 kbps @ 60fps: ~8 KB keyframe, ~950 B P-frames
+        measure_stream("500kbps-60fps", 8_000, 950, &mut viewers);
+        // 4000 kbps @ 60fps: ~50 KB keyframe, ~7.5 KB P-frames
+        measure_stream("4000kbps-60fps", 50_000, 7_500, &mut viewers);
     }
 }
