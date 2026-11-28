@@ -1,19 +1,26 @@
 #![allow(clippy::missing_safety_doc)]
 
 use std::ffi::{CStr, CString, c_char, c_int};
+use std::fs::{self, File};
 use std::io;
 use std::net::IpAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::slice;
-use std::sync::{Once, RwLock};
+use std::sync::{Mutex, Once, RwLock};
+use std::time::SystemTime;
 
 use tiwi_daemon::{
-    DirectEngine, DirectVideoConfig, EncodedFrame, RelayConfig, VideoCodec, generate_token,
+    DirectEngine, DirectVideoConfig, EncodedFrame, RelayConfig, VideoCodec, default_logs_dir,
+    format_utc_filename_ts, generate_token, prune_old_files,
 };
 use tracing::{Level, Metadata};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+
+const MAX_LOG_FILES: usize = 20;
 
 pub type TiwiLogCallback = Option<unsafe extern "C" fn(level: c_int, message: *const c_char)>;
 
@@ -78,18 +85,64 @@ impl<'a> MakeWriter<'a> for ObsLogMakeWriter {
     }
 }
 
+fn open_log_file(dir: &Path, ts: &str) -> io::Result<(PathBuf, File)> {
+    fs::create_dir_all(dir)?;
+    let raw_path = dir.join(format!("{ts}.log"));
+    let path = std::path::absolute(&raw_path).unwrap_or(raw_path);
+    let file = File::create(&path)?;
+    prune_old_files(dir, MAX_LOG_FILES, |n| n.ends_with(".log"));
+    Ok((path, file))
+}
+
 fn init_tracing() {
     INIT_TRACING.call_once(|| {
         let filter = EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| EnvFilter::new("tiwi_daemon=info,tiwi_obs=info"));
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(filter)
+
+        let obs_layer = tracing_subscriber::fmt::layer()
             .with_ansi(false)
             .without_time()
             .with_level(false)
             .with_target(false)
-            .with_writer(ObsLogMakeWriter)
+            .with_writer(ObsLogMakeWriter);
+
+        let mut log_file_path = None;
+        let mut log_file_err = None;
+        let file_layer = if cfg!(test) {
+            None
+        } else {
+            default_logs_dir().and_then(|dir| {
+                let ts = format_utc_filename_ts(SystemTime::now());
+                match open_log_file(&dir, &ts) {
+                    Ok((path, file)) => {
+                        log_file_path = Some(path);
+                        Some(
+                            tracing_subscriber::fmt::layer()
+                                .with_ansi(false)
+                                .with_target(false)
+                                .with_writer(Mutex::new(file)),
+                        )
+                    }
+                    Err(e) => {
+                        log_file_err = Some((dir, e));
+                        None
+                    }
+                }
+            })
+        };
+
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(obs_layer)
+            .with(file_layer)
             .try_init();
+
+        if let Some((dir, err)) = log_file_err {
+            tracing::warn!(dir = %dir.display(), err = %err, "Could not open log file");
+        }
+        if let Some(path) = log_file_path {
+            tracing::info!(path = %path.display(), "Log file");
+        }
     });
 }
 
@@ -191,7 +244,10 @@ pub unsafe extern "C" fn tiwi_engine_create(cfg: *const TiwiConfig) -> *mut Tiwi
     catch_unwind(AssertUnwindSafe(|| {
         init_tracing();
 
-        let mut relay_cfg = RelayConfig::default();
+        let mut relay_cfg = RelayConfig {
+            logs_dir: default_logs_dir(),
+            ..RelayConfig::default()
+        };
         if !cfg.is_null() {
             let c = unsafe { &*cfg };
             if let Some(token) = unsafe { opt_cstr(c.token) } {
@@ -379,7 +435,27 @@ mod tests {
     }
 
     #[test]
+    fn open_log_file_creates_and_prunes() {
+        let dir = std::env::temp_dir().join(format!("tiwi-obs-log-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        let (path, _file) = open_log_file(&dir, "2026-01-01T00-00-00Z").unwrap();
+        assert!(path.exists());
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("2026-01-01T00-00-00Z.log")
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn ffi_engine_lifecycle_start_push_stop() {
+        let logs_dir =
+            std::env::temp_dir().join(format!("tiwi-obs-metrics-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&logs_dir);
+        let logs_cstr = CString::new(logs_dir.to_str().unwrap()).unwrap();
+
         let token = CString::new("test-token-123").unwrap();
         let mqtt = CString::new("ws://127.0.0.1:1/mqtt").unwrap();
         let stun = CString::new("").unwrap();
@@ -389,7 +465,7 @@ mod tests {
             mqtt_url: mqtt.as_ptr(),
             stun_server: stun.as_ptr(),
             public_ip: std::ptr::null(),
-            logs_dir: std::ptr::null(),
+            logs_dir: logs_cstr.as_ptr(),
             media_port: 0,
             max_peers: 2,
             max_uplink_mbps: 0.0,
@@ -426,5 +502,7 @@ mod tests {
         assert!(unsafe { tiwi_engine_get_metrics(engine, &mut metrics) });
         assert!(unsafe { tiwi_engine_stop_stream(engine) });
         unsafe { tiwi_engine_destroy(engine) };
+        assert!(logs_dir.exists());
+        let _ = fs::remove_dir_all(&logs_dir);
     }
 }

@@ -238,9 +238,7 @@ impl Config {
         if !self.logs {
             return None;
         }
-        self.logs_dir
-            .clone()
-            .or_else(|| dirs::data_local_dir().map(|d| d.join("tiwi").join("logs")))
+        self.logs_dir.clone().or_else(tiwi_daemon::default_logs_dir)
     }
 
     /// Generates a documented default `config.toml` directly from `Config` metadata and defaults.

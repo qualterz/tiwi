@@ -58,6 +58,10 @@ impl RelayConfig {
     }
 }
 
+pub fn default_logs_dir() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|d| d.join("tiwi").join("logs"))
+}
+
 pub fn generate_token() -> String {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
